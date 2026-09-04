@@ -20,7 +20,7 @@ def wrap_deg(a: Numeric) -> Numeric:
     return 180.0 - np.mod(180.0 - np.asarray(a, dtype=float), 360.0)
 
 
-def dihedral_deg(p0, p1, p2, p3) -> float:
+def dihedral_deg(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
     """Signed IUPAC dihedral angle p0-p1-p2-p3 in degrees, wrapped to (-180, 180].
 
     Uses the numerically stable atan2 formulation. Unit-agnostic.
