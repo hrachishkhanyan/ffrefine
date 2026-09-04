@@ -18,6 +18,27 @@ def test_phase_180_shifts_curve():
     assert out == pytest.approx(expected)
 
 
+def test_phi0_sign_matters():
+    """phi0=90 breaks the +/- symmetry that phi0 in {0, 180} cannot see.
+
+    cos(n*phi - phi0) and cos(n*phi + phi0) coincide whenever phi0 is 0 or
+    180 degrees (cosine is even about those points), which is why neither
+    test_single_term_matches_formula (phi0=0) nor test_phase_180_shifts_curve
+    (phi0=180) can catch a sign flip on the phi0 term. At phi0=90 the two
+    forms diverge, so this pins down which one dihedral_energy implements.
+
+    V = k * [1 + cos(n*phi - phi0)], k=1.5, n=3, phi0=90:
+      phi=30:  n*phi - phi0 =  90 - 90 =    0 deg -> cos =  1 -> V = 1.5*2 = 3.0
+      phi=-30: n*phi - phi0 = -90 - 90 = -180 deg -> cos = -1 -> V = 1.5*0 = 0.0
+    (the wrong-sign form cos(n*phi + phi0) gives exactly the swapped values,
+    0.0 and 3.0, at these two angles).
+    """
+    phi = np.array([30.0, -30.0])
+    out = analytic.dihedral_energy([90.0, 1.5, 3], phi)
+    expected = np.array([3.0, 0.0])
+    assert out == pytest.approx(expected)
+
+
 def test_energy_is_periodic_over_360():
     phi = np.linspace(-180.0, 180.0, 37)
     a = analytic.dihedral_energy([0.0, 1.0, 3], phi)
