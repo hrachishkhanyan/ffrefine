@@ -93,9 +93,9 @@ def _rewrite_dihedrals(
 def write_zeroed_topology(topology: Topology, quad: Quad, out_path: str | Path) -> list[Dihedral]:
     """Write a copy of the topology with every member of T set to zero.
 
-    Each removed quadruplet becomes a single explicit line
+    Each distinct quadruplet in T becomes a single explicit output line
     ``i j k l 9 0.000 0.000 1``; a target originally written as several
-    funct-9 lines (multiple multiplicities) collapses to one zero line.
+    funct-9 lines (multiple multiplicities) collapses to that one zero line.
     Explicit parameters suppress the [ dihedraltypes ] lookup -- a claim the
     section 4.5 self-check verifies at runtime rather than trusting.
 
@@ -107,14 +107,20 @@ def write_zeroed_topology(topology: Topology, quad: Quad, out_path: str | Path) 
         out_path: destination; the input is never modified.
 
     Returns:
-        One Dihedral entry per distinct quadruplet that was removed (i.e. one
-        per zero line written), for the self-consistency check.
+        Every removed *term-line* of T, in topology order -- i.e. exactly
+        ``collect_torsion_set(topology, quad)``, with duplicates for a
+        multi-line funct-9 torsion **not** collapsed. This is one entry per
+        removed term-line (10 for the butane fixture), not one per distinct
+        quadruplet (9): the section 4.5 self-consistency check needs the
+        analytic sum of every original term -- including both multiplicities
+        of a split torsion -- to match GROMACS's ``E_full - E_zeroed``, and
+        dropping either term-line of such a split would silently omit its
+        contribution from that sum. The *output file* still gets only one
+        collapsed null line per quadruplet; only this returned list is
+        per-term-line.
     """
     tset = collect_torsion_set(topology, quad)
-    removed: dict[_EntryKey, Dihedral] = {}
-    for d in tset:
-        removed[_entry_key(d)] = d
-    targets = set(removed.keys())
+    targets = {_entry_key(d) for d in tset}
     replacement = {
         key: [
             _format_line(
@@ -125,7 +131,7 @@ def write_zeroed_topology(topology: Topology, quad: Quad, out_path: str | Path) 
     }
     lines = _rewrite_dihedrals(topology, targets, replacement)
     Path(out_path).write_text("\n".join(lines) + "\n")
-    return list(removed.values())
+    return tset
 
 
 def write_refit_topology(

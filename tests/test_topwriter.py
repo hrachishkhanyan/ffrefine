@@ -5,11 +5,23 @@ from ffrefine.io.topwriter import make_system_top, write_refit_topology, write_z
 from ffrefine.mm.torsionset import collect_torsion_set
 
 
-def test_zeroed_topology_removes_all_nine(tmp_path, butane_itp):
+def test_zeroed_topology_returns_all_ten_removed_term_lines(tmp_path, butane_itp):
+    """Spec section 4.5: the analytic self-check needs every removed term-line,
+    not one per quadruplet -- dropping either half of the target's two
+    funct-9 lines would silently omit its contribution from that sum.
+    """
     t = read_topology(butane_itp)
     out = tmp_path / "zeroed.itp"
     removed = write_zeroed_topology(t, (1, 5, 8, 11), out)
-    assert len(removed) == 9
+    assert len(removed) == 10
+
+    distinct_quads = {min((d.ai, d.aj, d.ak, d.al), (d.al, d.ak, d.aj, d.ai)) for d in removed}
+    assert len(distinct_quads) == 9
+
+    target = [d for d in removed if (d.ai, d.aj, d.ak, d.al) in ((1, 5, 8, 11), (11, 8, 5, 1))]
+    assert {int(d.params[2]) for d in target} == {2, 3}
+    assert {round(d.params[1], 5) for d in target} == {0.58576, 0.41840}
+
     z = read_topology(out)
     tset = collect_torsion_set(z, (1, 5, 8, 11))
     assert len(tset) == 9
