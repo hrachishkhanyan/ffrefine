@@ -1,8 +1,12 @@
 """GROMACS single-point energy engine (spec section 4.4).
 
-Energies are obtained with ``gmx mdrun -rerun`` over a multi-model PDB and
-extracted with ``gmx energy``.  Terms are always selected by name: the menu
-numbering differs between GROMACS versions (spec section 9.9).
+Energies are obtained with ``gmx mdrun -rerun`` over a multi-frame GROMOS-96
+(.g96) trajectory and extracted with ``gmx energy``.  Terms are always
+selected by name: the menu numbering differs between GROMACS versions (spec
+section 9.9).  G96, not PDB, because PDB's fixed-width Angstrom fields only
+keep 3 decimal places (~1e-4 nm); the section 4.5 self-consistency check
+needs finer coordinate precision than that to be meaningful (Task 13 fix
+round 1, ruling R22) -- see :func:`_write_g96_trajectory`.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import numpy as np
 
 from ..config import Binaries
 from ..errors import ExternalToolError
-from ..io.structure import ANGSTROM_TO_NM, Structure, write_multimodel_pdb
+from ..io.structure import ANGSTROM_TO_NM, Structure
 from ..runner import run_command
 
 log = logging.getLogger("ffrefine")
@@ -151,6 +155,13 @@ def single_point_energies(
     Tries the vacuum zero-cutoff mdp first and falls back to a large box with
     3 nm cutoffs if the installed GROMACS rejects it (spec section 4.4).
 
+    The rerun trajectory is a GROMOS-96 (.g96) file (see
+    :func:`_write_g96_trajectory`), not PDB: PDB's fixed ``%8.3f`` Angstrom
+    fields quantize coordinates to ~1e-4 nm, which is coarse enough to matter
+    to the section 4.5 self-consistency check (ruling R22, Task 13 fix
+    round 1). G96 stores nanometre coordinates at ``%15.9f``, eliminating
+    that error.
+
     Args:
         binaries: resolved binary paths; ``gmx`` is required.
         topology_path: a .top that grompp can process.
@@ -173,8 +184,12 @@ def single_point_energies(
     frames = np.asarray(frames, dtype=float)
     nframes = frames.shape[0]
 
-    traj = workdir / f"{log_stem}_traj.pdb"
-    write_multimodel_pdb(traj, structure, frames)
+    # Box is embedded per-frame in the g96 file itself (see
+    # _write_g96_trajectory), unlike the PDB approach this replaced, which
+    # needed a CRYST1 record injected after the fact once the fallback path
+    # was known (see the now-unused _inject_pdb_box, kept for reference).
+    traj = workdir / f"{log_stem}_traj.g96"
+    _write_g96_trajectory(traj, structure, frames, FALLBACK_BOX_NM)
 
     used_fallback = False
     succeeded_stem = None
@@ -241,12 +256,6 @@ def single_point_energies(
     log.info(
         "GROMACS single point using %s path", "large-box fallback" if used_fallback else "vacuum"
     )
-
-    if used_fallback:
-        # mdrun -rerun reads the box for every frame from the trajectory file
-        # itself, once; a multi-model PDB from write_multimodel_pdb carries no
-        # CRYST1 record, so the pbc=xyz fallback needs one injected here.
-        _inject_pdb_box(traj, FALLBACK_BOX_NM)
 
     run_command(
         [
@@ -354,8 +363,14 @@ def _inject_pdb_box(path: Path, box_nm: float) -> None:
     ``pbc = xyz`` makes mdrun abort with "does not contain a box, while pbc
     is used" (confirmed against GROMACS 2025.4).
 
+    Unused since Task 13 fix round 1 (ruling R22): ``single_point_energies``
+    now writes a .g96 trajectory (:func:`_write_g96_trajectory`), which
+    carries a ``BOX`` block in every frame directly, making this after-the-fact
+    injection unnecessary. Kept, rather than deleted, per that ruling.
+
     Args:
-        path: multi-model PDB written by :func:`write_multimodel_pdb`.
+        path: multi-model PDB written by
+            :func:`ffrefine.io.structure.write_multimodel_pdb`.
         box_nm: cubic box edge length in nanometres.
     """
     edge_angstrom = box_nm / ANGSTROM_TO_NM
@@ -366,6 +381,58 @@ def _inject_pdb_box(path: Path, box_nm: float) -> None:
     lines = path.read_text().splitlines()
     lines.insert(1, cryst)  # after TITLE, before the first MODEL
     path.write_text("\n".join(lines) + "\n", newline="\n")
+
+
+def _write_g96_trajectory(
+    path: str | Path, structure: Structure, frames: np.ndarray, box_nm: float
+) -> None:
+    """Write a multi-frame GROMOS-96 (.g96) trajectory for ``mdrun -rerun``.
+
+    G96 stores coordinates directly in nanometres at ``%15.9f`` -- about
+    1e-9 nm per atom, versus the ~1e-4 nm a PDB ATOM record's fixed
+    ``%8.3f`` Angstrom fields keep. That difference matters: the section 4.5
+    self-consistency check compares GROMACS's output against an independent
+    analytic reference to 1e-3 kJ/mol, and PDB's coordinate quantization
+    alone was large enough to fail that gate regardless of whether the
+    topology edit was correct (Task 13 fix round 1, ruling R22).
+
+    Confirmed empirically against GROMACS 2025.4: a bare concatenation of
+    ``TITLE``/``POSITION``/``BOX`` blocks per frame (no ``TIMESTEP`` block,
+    and only one leading ``TITLE``) is accepted by ``mdrun -rerun``, which
+    reads every frame in order. The per-atom line layout
+    (``%5d %-5s %-5s%7d%15.9f%15.9f%15.9f``) matches byte-for-byte what
+    ``gmx editconf`` itself produces when converting a .gro to .g96.
+
+    This is private to the energy engine and independent of
+    :func:`ffrefine.io.structure.write_multimodel_pdb`, which remains the
+    package's public, user-facing multi-model structure writer.
+
+    Args:
+        path: output file.
+        structure: supplies atom names, residue names and residue ids.
+        frames: shape (nframes, natoms, 3) in nm.
+        box_nm: cubic box edge length written into every frame's BOX block.
+
+    Raises:
+        ValueError: if ``frames`` is not shaped (nframes, natoms, 3).
+    """
+    frames = np.asarray(frames, dtype=float)
+    if frames.ndim != 3 or frames.shape[1] != structure.natoms:
+        raise ValueError(f"frames shape {frames.shape} incompatible with {structure.natoms} atoms")
+    lines = ["TITLE", structure.title or "ffrefine scan", "END"]
+    for frame in frames:
+        lines.append("POSITION")
+        for i in range(structure.natoms):
+            x, y, z = frame[i]
+            lines.append(
+                f"{structure.resids[i]:5d} {structure.resnames[i]:<5s} "
+                f"{structure.names[i]:<5s}{i + 1:7d}{x:15.9f}{y:15.9f}{z:15.9f}"
+            )
+        lines.append("END")
+        lines.append("BOX")
+        lines.append(f"{box_nm:15.9f}{box_nm:15.9f}{box_nm:15.9f}")
+        lines.append("END")
+    Path(path).write_text("\n".join(lines) + "\n", newline="\n")
 
 
 def _write_conf_gro(

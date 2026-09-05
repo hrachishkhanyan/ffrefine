@@ -51,6 +51,29 @@ def test_round_trip_refit_recovers_original_parameters(
     from ffrefine.mm.analytic import torsion_set_energy
 
     reference = torsion_set_energy(removed, frames)
+
+    # Spec section 7.1 is literally about the *coefficients* ("the recovered
+    # coefficients must match the originals"), not only the reconstructed
+    # energy curve -- pin those down directly (Task 13 fix round 1, ruling
+    # R22). "The originals" here means the coefficients an exact, noiseless
+    # fit of the analytic reference itself would recover, not a hand-summed
+    # total of the nine members' force constants: a single-phi cosine
+    # decomposition of nine dihedral terms at slightly different geometric
+    # phases does not reduce to the naive sum of their amplitudes unless
+    # those phases align exactly, which this fixture's real (non-ideal)
+    # geometry does not guarantee. Confirmed empirically: fitting the exact
+    # reference curve (zero noise, no GROMACS involved) reproduces itself to
+    # rmse ~4e-15, so its own fitted k/delta_deg is the correct ground truth.
+    truth = fit_cosine_series(phi, reference, [1, 2, 3, 4, 6])
+    np.testing.assert_array_equal(r.mults, truth.mults)
+    np.testing.assert_allclose(r.k, truth.k, atol=1e-4)
+    # delta_deg is only meaningful where the amplitude is not numerically
+    # zero: fit_cosine_series assigns 0 or 180 by the sign of a near-zero
+    # coefficient, which is arbitrary noise for the mults (1, 4, 6 here) this
+    # torsion set does not actually contain.
+    significant = truth.k > 1e-3
+    np.testing.assert_allclose(r.delta_deg[significant], truth.delta_deg[significant], atol=1e-2)
+
     reference = reference - reference.min()
     predicted = r.predicted - r.predicted.min()
     assert np.max(np.abs(predicted - reference)) < 1e-6

@@ -4,10 +4,10 @@ E_full(phi) - E_zeroed(phi) computed by GROMACS must equal the analytic sum of
 the removed torsion terms, evaluated at the measured dihedral values with the
 original parameters, to better than 1e-3 kJ/mol at every point. The analytic
 side is evaluated at the coordinates GROMACS actually received (see
-``_as_gromacs_saw_it``): the multi-model PDB used to drive ``mdrun -rerun``
-keeps only three decimal places of Angstrom precision, and comparing against
-the caller's full-precision input instead would measure that format's
-coordinate quantization rather than the correctness of the topology edit.
+``_as_gromacs_saw_it``): the rerun trajectory format's own coordinate
+precision (see ``ffrefine.mm.gromacs._write_g96_trajectory``) must be matched
+exactly, or the comparison measures the transport's precision rather than the
+correctness of the topology edit.
 
 Failing this means the topology edit did not do what was intended -- most
 often that explicit parameters did not suppress the [ dihedraltypes ] lookup as
@@ -25,7 +25,7 @@ import numpy as np
 from ..config import Binaries
 from ..errors import ValidationError
 from ..geometry import dihedral_deg_frames
-from ..io.structure import ANGSTROM_TO_NM, Structure
+from ..io.structure import Structure
 from ..io.topology import Topology
 from ..io.topwriter import make_system_top, write_zeroed_topology
 from ..io.validate import validate_structure_topology
@@ -37,33 +37,42 @@ log = logging.getLogger("ffrefine")
 DEFAULT_TOLERANCE = 1e-3
 """kJ/mol; spec section 4.5."""
 
-_PDB_COORD_DECIMALS = 3
-"""Decimal places ``write_multimodel_pdb`` keeps, in Angstrom (PDB %8.3f)."""
+_G96_COORD_DECIMALS = 9
+"""Decimal places ``_write_g96_trajectory`` keeps, in nm (G96 %15.9f)."""
 
 
 def _as_gromacs_saw_it(frames: np.ndarray) -> np.ndarray:
     """Quantize coordinates to what GROMACS actually received.
 
-    ``single_point_energies`` drives ``mdrun -rerun`` from a multi-model PDB
-    (:func:`ffrefine.io.structure.write_multimodel_pdb`), whose fixed-width
-    Angstrom fields keep only three decimal places -- about 1e-4 nm per atom.
-    Evaluating the analytic reference at the caller's full double-precision
-    ``frames`` instead of this quantized geometry compares two different
-    inputs, not two evaluations of the same one: the residual it measures is
-    the PDB format's coordinate precision, not whether the topology edit is
-    correct. Confirmed empirically (Task 13): rounding here reduces the
-    observed discrepancy on the butane fixture from ~1.6e-3 kJ/mol -- enough
-    to spuriously fail the section 4.5 tolerance -- to ~3e-5 kJ/mol, in line
-    with GROMACS's own single-precision .edr/.xvg output noise.
+    ``single_point_energies`` drives ``mdrun -rerun`` from a multi-frame
+    GROMOS-96 (.g96) trajectory (see
+    :func:`ffrefine.mm.gromacs._write_g96_trajectory`), whose fixed-width
+    fields keep nine decimal places *in nanometres directly* -- about 1e-9 nm
+    per atom. Evaluating the analytic reference at the caller's full
+    double-precision ``frames`` without matching this rounding would compare
+    two different inputs, not two evaluations of the same one.
+
+    Task 13 fix round 1 (ruling R22): this function previously matched a PDB
+    rerun trajectory's much coarser 3-decimal-Angstrom precision (~1e-4 nm).
+    On the butane fixture that quantization alone was large enough
+    (~1.6e-3 kJ/mol) to fail the section 4.5 tolerance regardless of whether
+    the topology edit was correct. Moving the rerun trajectory to .g96
+    (~1e-9 nm) reduces this function's effect to a no-op in practice -- the
+    measured residual after the switch is ~4e-5 kJ/mol either way, consistent
+    with GROMACS's own mixed-precision numerical noise floor (confirmed via
+    ``gmx --version``: "Precision: mixed") rather than any remaining
+    coordinate quantization. It is kept (rather than
+    removed) so the comparison stays exactly matched to whatever precision
+    the trajectory writer actually uses, by construction, instead of
+    silently drifting out of sync with it again.
 
     Args:
         frames: shape (nframes, natoms, 3) in nm.
 
     Returns:
-        The same coordinates, rounded to the PDB trajectory's precision.
+        The same coordinates, rounded to the g96 trajectory's precision.
     """
-    angstrom = np.asarray(frames, dtype=float) / ANGSTROM_TO_NM
-    return np.round(angstrom, _PDB_COORD_DECIMALS) * ANGSTROM_TO_NM
+    return np.round(np.asarray(frames, dtype=float), _G96_COORD_DECIMALS)
 
 
 @dataclass
