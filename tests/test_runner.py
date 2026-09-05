@@ -18,6 +18,20 @@ def test_run_command_logs_full_command_line(tmp_path):
     assert "print(1)" in logged
 
 
+def test_run_command_pipes_stdin(tmp_path):
+    code = "import sys; print(sys.stdin.read().strip())"
+    r = runner.run_command([sys.executable, "-c", code], tmp_path, "fed", stdin="hello-stdin\n")
+    assert "hello-stdin" in r.stdout
+    assert "hello-stdin" in (tmp_path / "fed.stdout").read_text()
+
+
+def test_run_command_logs_stdin_in_cmd_file(tmp_path):
+    code = "import sys; sys.stdin.read()"
+    runner.run_command([sys.executable, "-c", code], tmp_path, "fed2", stdin="secret-selection\n")
+    logged = (tmp_path / "fed2.cmd").read_text()
+    assert "secret-selection" in logged
+
+
 def test_run_command_raises_with_output_tail(tmp_path):
     code = "import sys; sys.stderr.write('BOOM detail line\\n'); sys.exit(3)"
     with pytest.raises(ExternalToolError, match="BOOM detail line"):

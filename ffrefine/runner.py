@@ -27,6 +27,7 @@ def run_command(
     log_stem: str,
     extra_env: dict[str, str] | None = None,
     check: bool = True,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run an external command, logging it and capturing its output.
 
@@ -36,6 +37,9 @@ def run_command(
         log_stem: base name for the .cmd/.stdout/.stderr log files.
         extra_env: environment variables layered on top of os.environ.
         check: raise on a nonzero exit status.
+        stdin: text piped to the process's stdin (e.g. an interactive tool's
+            menu selection); logged alongside argv so the invocation stays
+            reproducible from the .cmd file alone.
 
     Returns:
         The completed process, with ``stdout`` and ``stderr`` populated.
@@ -47,15 +51,21 @@ def run_command(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     printable = " ".join(shlex.quote(a) for a in argv)
-    log.info("running in %s: %s", workdir, printable)
-    (workdir / f"{log_stem}.cmd").write_text(printable + "\n")
+    if stdin is None:
+        log.info("running in %s: %s", workdir, printable)
+        (workdir / f"{log_stem}.cmd").write_text(printable + "\n")
+    else:
+        log.info("running in %s: %s <<< %r", workdir, printable, stdin)
+        (workdir / f"{log_stem}.cmd").write_text(f"{printable}\n<<< {stdin!r}\n")
 
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
 
     try:
-        proc = subprocess.run(argv, cwd=str(workdir), env=env, capture_output=True, text=True)
+        proc = subprocess.run(
+            argv, cwd=str(workdir), env=env, capture_output=True, text=True, input=stdin
+        )
     except OSError as exc:
         raise ExternalToolError(f"could not execute {argv[0]!r}: {exc}") from exc
 

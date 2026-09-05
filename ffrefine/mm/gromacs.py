@@ -8,7 +8,6 @@ numbering differs between GROMACS versions (spec section 9.9).
 from __future__ import annotations
 
 import logging
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -178,13 +177,20 @@ def single_point_energies(
     write_multimodel_pdb(traj, structure, frames)
 
     used_fallback = False
+    succeeded_stem = None
     for attempt, fallback in enumerate((False, True)):
-        mdp = workdir / f"{log_stem}.mdp"
+        # Each attempt gets its own mdp/conf/log filenames: if the vacuum
+        # attempt fails and the fallback succeeds, the vacuum attempt's own
+        # grompp logs must stay on disk (spec section 8 -- every external
+        # command's output is captured), not be overwritten by the retry.
+        attempt_stem = f"{log_stem}_{'fallback' if fallback else 'vacuum'}"
+        mdp = workdir / f"{attempt_stem}.mdp"
         write_mdp(mdp, fallback=fallback)
 
-        conf = workdir / f"{log_stem}_conf.gro"
+        conf = workdir / f"{attempt_stem}_conf.gro"
         _write_conf_gro(conf, structure, frames[0], box=_box_line(fallback))
 
+        grompp_stem = f"{attempt_stem}_grompp"
         try:
             run_command(
                 [
@@ -197,21 +203,22 @@ def single_point_energies(
                     "-p",
                     str(Path(topology_path).resolve()),
                     "-o",
-                    f"{log_stem}.tpr",
+                    f"{attempt_stem}.tpr",
                     "-maxwarn",
                     "5",
                 ],
                 workdir,
-                f"{log_stem}_grompp",
+                grompp_stem,
             )
         except ExternalToolError:
             # Read the full grompp logs rather than the exception's truncated
             # tail: the Verlet-scheme rejection of a zero-cutoff vacuum mdp
             # emits several ERROR blocks (cutoff radius, pbc, nstlist), and
             # the one mentioning cutoffs is often pushed out of the tail.
-            stdout = (workdir / f"{log_stem}_grompp.stdout").read_text()
-            stderr = (workdir / f"{log_stem}_grompp.stderr").read_text()
-            text = (stdout + stderr).lower()
+            # Guarded with exists(): a bad gmx path raises ExternalToolError
+            # from run_command's own OSError branch before any log file is
+            # written, and that must not become an unrelated crash here.
+            text = _grompp_log_text(workdir, grompp_stem).lower()
             cutoff_problem = any(
                 t in text for t in ("rlist", "cut-off", "cutoff", "rvdw", "rcoulomb")
             )
@@ -223,7 +230,12 @@ def single_point_energies(
                 )
                 continue
             raise
+        # -maxwarn lets grompp proceed past warnings instead of aborting;
+        # echo them to our own log so a suppressed warning (e.g. the net
+        # charge or atom-name-mismatch notice) is never silently invisible.
+        _log_grompp_warnings(_grompp_log_text(workdir, grompp_stem))
         used_fallback = fallback
+        succeeded_stem = attempt_stem
         break
 
     log.info(
@@ -241,7 +253,7 @@ def single_point_energies(
             gmx,
             "mdrun",
             "-s",
-            f"{log_stem}.tpr",
+            f"{succeeded_stem}.tpr",
             "-rerun",
             traj.name,
             "-e",
@@ -262,7 +274,12 @@ def single_point_energies(
     # parsed .xvg legend keeps the original name with a space -- confirmed
     # empirically against GROMACS 2025.4.  Blank line ends the selection.
     selection = "\n".join(t.replace(" ", "-") for t in terms) + "\n\n"
-    _feed_stdin_energy(gmx, workdir, log_stem, selection)
+    run_command(
+        [gmx, "energy", "-f", f"{log_stem}.edr", "-o", f"{log_stem}.xvg"],
+        workdir,
+        f"{log_stem}_energy",
+        stdin=selection,
+    )
 
     names, data = parse_energy_xvg(workdir / f"{log_stem}.xvg")
     if data.shape[0] != nframes:
@@ -281,25 +298,52 @@ def single_point_energies(
     )
 
 
-def _feed_stdin_energy(gmx: str, workdir: Path, log_stem: str, selection: str) -> None:
-    """Run ``gmx energy`` with the term names piped to stdin."""
-    argv = [gmx, "energy", "-f", f"{log_stem}.edr", "-o", f"{log_stem}.xvg"]
-    printable = " ".join(argv)
-    log.info("running in %s: %s <<< %r", workdir, printable, selection)
-    (workdir / f"{log_stem}_energy.cmd").write_text(
-        printable + f"\n<<< {selection!r}\n", newline="\n"
-    )
-    proc = subprocess.run(argv, cwd=str(workdir), input=selection, capture_output=True, text=True)
-    (workdir / f"{log_stem}_energy.stdout").write_text(proc.stdout or "", newline="\n")
-    (workdir / f"{log_stem}_energy.stderr").write_text(proc.stderr or "", newline="\n")
-    if proc.returncode != 0:
-        tail = "\n".join(((proc.stdout or "") + (proc.stderr or "")).splitlines()[-30:])
-        raise ExternalToolError(
-            f"gmx energy failed with exit code {proc.returncode}:\n"
-            f"  {printable}\n"
-            f"  workdir: {workdir}\n"
-            f"--- last 30 lines of output ---\n{tail}"
-        )
+def _grompp_log_text(workdir: Path, stem: str) -> str:
+    """Read the stdout+stderr ``run_command`` already captured for ``stem``.
+
+    Guarded with ``exists()``: when ``gmx`` itself cannot be executed (e.g. a
+    bad ``--gmx-bin`` override), ``run_command`` raises before writing any log
+    file at all, and that must not turn into an unrelated ``FileNotFoundError``
+    here.
+
+    Args:
+        workdir: stage directory passed to ``run_command``.
+        stem: the ``log_stem`` used for that ``run_command`` call.
+
+    Returns:
+        The concatenated stdout and stderr text, or ``""`` if neither exists.
+    """
+    stdout_path = workdir / f"{stem}.stdout"
+    stderr_path = workdir / f"{stem}.stderr"
+    stdout = stdout_path.read_text() if stdout_path.exists() else ""
+    stderr = stderr_path.read_text() if stderr_path.exists() else ""
+    return stdout + stderr
+
+
+def _log_grompp_warnings(text: str) -> None:
+    """Echo grompp's own WARNING blocks to the ffrefine log.
+
+    ``-maxwarn`` lets grompp proceed past warnings (e.g. a net charge or an
+    atom-name mismatch) instead of aborting; a warning grompp printed and we
+    chose to suppress must still surface somewhere other than a raw log file
+    on disk.  Log only -- never raise, this runs after a successful grompp.
+
+    Args:
+        text: grompp's combined stdout+stderr, as returned by
+            :func:`_grompp_log_text`.
+    """
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("WARNING"):
+            block = [lines[i]]
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                block.append(lines[i])
+                i += 1
+            log.warning("grompp: %s", " ".join(s.strip() for s in block))
+        else:
+            i += 1
 
 
 def _inject_pdb_box(path: Path, box_nm: float) -> None:

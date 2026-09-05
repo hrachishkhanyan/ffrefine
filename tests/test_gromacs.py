@@ -82,6 +82,20 @@ def test_single_point_runs_on_butane(tmp_path, butane_pdb, butane_itp, gmx_bin):
     # identical frames must give identical energies
     assert result.potential()[0] == pytest.approx(result.potential()[1], abs=1e-6)
 
+    # Butane has no impropers, so "Improper Dih." is the only requested term
+    # legitimately absent; anything else missing would mean a silent
+    # stdin-name mismatch (spec section 9.9) dropped a term into a
+    # log.warning instead of failing loudly.
+    assert set(gromacs.DEFAULT_TERMS) - set(result.terms) == {"Improper Dih."}
+
+    # Potential must equal the sum of its components. This also catches a
+    # legend/column misalignment in parse_energy_xvg and a Potential that is
+    # wrong by a constant offset -- exactly what Tasks 13 and 21 inherit.
+    # Verified empirically against GROMACS 2025.4: the residual is ~1e-6
+    # kJ/mol, consistent with the .edr's single-precision storage.
+    component_sum = sum(v for k, v in result.terms.items() if k != "Potential")
+    assert component_sum == pytest.approx(result.potential(), abs=1e-3)
+
 
 @pytest.mark.needs_gmx
 def test_frame_count_matches_input(tmp_path, butane_pdb, butane_itp, gmx_bin):
