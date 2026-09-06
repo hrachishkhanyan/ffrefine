@@ -147,13 +147,25 @@ def stage_is_current(outdir: str | Path, stage: str, input_hash: str) -> bool:
     """Decide whether a stage can be skipped under ``--resume``.
 
     Returns ``True`` only when the stage's manifest exists, parses as a JSON
-    object, and its recorded ``input_hash`` matches ``input_hash`` exactly.
-    Every other case -- the outdir or stage directory not existing, no
-    manifest having been written yet, a manifest that fails to parse (e.g.
-    truncated by a killed run), or a manifest whose hash differs -- returns
-    ``False``. This function never raises on a bad manifest; a corrupt or
-    unreadable manifest is treated the same as a missing one, so a damaged
-    run always gets recomputed rather than silently trusted.
+    object, its ``input_hash`` field is a string, and that string matches
+    ``input_hash`` exactly. Every other case -- the outdir or stage directory
+    not existing, no manifest having been written yet, a manifest that fails
+    to parse (e.g. truncated by a killed run), a manifest whose ``input_hash``
+    is missing or explicitly ``null``, or a manifest whose hash differs --
+    returns ``False``. This function never raises on a bad manifest; a
+    corrupt or unreadable manifest is treated the same as a missing one, so a
+    damaged run always gets recomputed rather than silently trusted.
+
+    The requirement that the recorded ``input_hash`` be a string (not merely
+    equal to the caller's value) is deliberate: without it, a manifest with
+    no recorded hash compared against a caller-supplied ``None`` would
+    degenerate to ``None == None`` and report a stale stage as current, which
+    is exactly the dangerous direction of error this predicate exists to
+    avoid. A caller is expected to always pass the ``str`` produced by
+    :func:`hash_inputs`; this function does not separately reject a
+    non-``str`` ``input_hash`` argument, since the string-typed check on the
+    *recorded* side already makes that case safe (it can only ever compare
+    unequal, never spuriously equal).
 
     Args:
         outdir: the run's top-level output directory.
@@ -179,7 +191,14 @@ def stage_is_current(outdir: str | Path, stage: str, input_hash: str) -> bool:
         return False
     if not isinstance(data, dict):
         return False
-    return data.get("input_hash") == input_hash
+    recorded = data.get("input_hash")
+    if not isinstance(recorded, str):
+        # Missing key, or explicit null: treat exactly like a corrupt manifest
+        # rather than comparing. Without this guard, a manifest with no
+        # recorded hash compared against a caller-supplied ``None`` would
+        # degenerate to ``None == None`` and report a stale stage as current.
+        return False
+    return recorded == input_hash
 
 
 def setup_logging(outdir: str | Path, verbose: bool = False) -> None:

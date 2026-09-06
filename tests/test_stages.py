@@ -152,6 +152,30 @@ def test_stage_is_current_rejects_unknown_stage(tmp_path):
         stages.stage_is_current(tmp_path, "bogus", "abc123")
 
 
+def test_stage_not_current_when_manifest_missing_input_hash_key(tmp_path):
+    # A well-formed dict manifest that simply never recorded an input_hash.
+    d = stages.stage_dir(tmp_path, "fit")
+    (d / "manifest.json").write_text(json.dumps({"stage": "fit", "metadata": {}}))
+    assert not stages.stage_is_current(tmp_path, "fit", "abc123")
+
+
+def test_stage_not_current_when_manifest_missing_input_hash_and_query_is_none(tmp_path):
+    # Regression: data.get("input_hash") == input_hash must not degenerate to
+    # None == None when the manifest has no input_hash key and the caller's
+    # hash is also None -- that would report a stale stage as current.
+    d = stages.stage_dir(tmp_path, "fit")
+    (d / "manifest.json").write_text(json.dumps({"stage": "fit", "metadata": {}}))
+    assert not stages.stage_is_current(tmp_path, "fit", None)
+
+
+def test_stage_not_current_when_manifest_input_hash_is_explicitly_null(tmp_path):
+    # Same degenerate comparison, but input_hash is present and explicitly null
+    # rather than simply absent.
+    d = stages.stage_dir(tmp_path, "fit")
+    (d / "manifest.json").write_text(json.dumps({"stage": "fit", "input_hash": None}))
+    assert not stages.stage_is_current(tmp_path, "fit", None)
+
+
 # --- write_manifest / manifest format --------------------------------------------
 
 
