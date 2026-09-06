@@ -1,0 +1,226 @@
+"""Output layout, input hashing and resumable stages (spec sections 6 and 8).
+
+The pipeline writes its outputs into a fixed set of numbered subdirectories
+under a single ``outdir`` (spec section 6). Each stage that completes writes
+a small JSON manifest recording a hash of everything that fed into it; a
+later ``--resume`` run can then compare a freshly computed hash against the
+recorded one to decide whether the stage can be skipped (spec section 8).
+
+Getting :func:`stage_is_current` wrong is asymmetric: treating a stale stage
+as current silently reuses results computed from different inputs and
+produces a plausible-looking but wrong final answer. Treating a current
+stage as stale merely wastes time recomputing it. This module is therefore
+deliberately conservative: any manifest that is missing, unreadable, or of
+the wrong shape is treated as "stage not current" rather than raising or
+guessing.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .errors import ValidationError
+
+STAGE_DIRS: dict[str, str] = {
+    "input": "00_input",
+    "qm_scan": "01_qm_scan",
+    "mm_scan": "02_mm_scan",
+    "fit": "03_fit",
+    "charges": "04_charges",
+    "final": "final",
+}
+"""The spec section 6 output layout: logical stage name -> directory name."""
+
+MANIFEST_NAME = "manifest.json"
+"""Filename of the per-stage resume manifest, written inside each stage dir."""
+
+
+def _validate_stage(stage: str) -> None:
+    """Raise :class:`ValidationError` if ``stage`` is not a known stage name."""
+    if stage not in STAGE_DIRS:
+        raise ValidationError(f"unknown stage {stage!r}; expected one of {sorted(STAGE_DIRS)}")
+
+
+def stage_dir(outdir: str | Path, stage: str) -> Path:
+    """Return the directory for a pipeline stage, creating it if necessary.
+
+    Args:
+        outdir: the run's top-level output directory.
+        stage: logical stage name, one of the keys of :data:`STAGE_DIRS`.
+
+    Returns:
+        The stage's directory, guaranteed to exist.
+
+    Raises:
+        ValidationError: if ``stage`` is not a recognised stage name.
+    """
+    _validate_stage(stage)
+    path = Path(outdir) / STAGE_DIRS[stage]
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def hash_file(path: str | Path) -> str:
+    """Return the SHA-256 digest of a file's contents, hex encoded.
+
+    Args:
+        path: file to hash. Read in binary mode; never modified.
+
+    Returns:
+        Lowercase hex digest.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hash_inputs(paths: list[str | Path], extra: dict | None = None) -> str:
+    """Return a combined SHA-256 hash of input files and stage settings.
+
+    Used to decide whether a stage's recorded manifest still matches its
+    current inputs (see :func:`stage_is_current`): the same files with the
+    same settings must always hash identically, and changing either the file
+    contents, the settings, or which files are included must change the
+    hash.
+
+    ``paths`` are hashed by content, in the order given. Order is
+    significant: callers pass a stage's inputs in a fixed, meaningful
+    sequence (e.g. topology before structure), and this function does not
+    second-guess that ordering.
+
+    ``extra`` captures whatever non-file settings also affect the stage's
+    output (grid step, energy cutoff, multiplicities, ...). It is serialised
+    to JSON with keys sorted, so the *order* keys happen to appear in the
+    dict never changes the hash -- only the key/value contents do, which is
+    the only thing that is semantically meaningful for a plain dict.
+
+    Args:
+        paths: input files, hashed by content in the given order.
+        extra: JSON-serialisable settings that also affect the stage;
+            defaults to an empty mapping.
+
+    Returns:
+        Lowercase hex digest.
+    """
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(hash_file(path).encode("utf-8"))
+    digest.update(json.dumps(extra or {}, sort_keys=True, default=str).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def write_manifest(
+    outdir: str | Path, stage: str, input_hash: str, metadata: dict | None = None
+) -> None:
+    """Record that a stage completed, and the hash of the inputs it used.
+
+    Creates the stage directory if it does not already exist.
+
+    Args:
+        outdir: the run's top-level output directory.
+        stage: logical stage name, one of the keys of :data:`STAGE_DIRS`.
+        input_hash: the hash (from :func:`hash_inputs`) of this stage's
+            inputs at the time it completed.
+        metadata: arbitrary JSON-serialisable extra information about the
+            run (e.g. fitted multiplicities); defaults to an empty mapping.
+
+    Raises:
+        ValidationError: if ``stage`` is not a recognised stage name.
+    """
+    path = stage_dir(outdir, stage) / MANIFEST_NAME
+    payload = {
+        "stage": stage,
+        "input_hash": input_hash,
+        "completed_utc": datetime.now(timezone.utc).isoformat(),
+        "metadata": metadata or {},
+    }
+    path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+
+
+def stage_is_current(outdir: str | Path, stage: str, input_hash: str) -> bool:
+    """Decide whether a stage can be skipped under ``--resume``.
+
+    Returns ``True`` only when the stage's manifest exists, parses as a JSON
+    object, and its recorded ``input_hash`` matches ``input_hash`` exactly.
+    Every other case -- the outdir or stage directory not existing, no
+    manifest having been written yet, a manifest that fails to parse (e.g.
+    truncated by a killed run), or a manifest whose hash differs -- returns
+    ``False``. This function never raises on a bad manifest; a corrupt or
+    unreadable manifest is treated the same as a missing one, so a damaged
+    run always gets recomputed rather than silently trusted.
+
+    Args:
+        outdir: the run's top-level output directory.
+        stage: logical stage name, one of the keys of :data:`STAGE_DIRS`.
+        input_hash: the hash (from :func:`hash_inputs`) of the stage's
+            current inputs, to compare against what was recorded.
+
+    Returns:
+        Whether the previously completed stage's recorded inputs match.
+
+    Raises:
+        ValidationError: if ``stage`` is not a recognised stage name (this
+            indicates a programming error, not a stale-cache condition, so
+            it is not swallowed like a corrupt manifest is).
+    """
+    _validate_stage(stage)
+    manifest_path = Path(outdir) / STAGE_DIRS[stage] / MANIFEST_NAME
+    if not manifest_path.exists():
+        return False
+    try:
+        data = json.loads(manifest_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("input_hash") == input_hash
+
+
+def setup_logging(outdir: str | Path, verbose: bool = False) -> None:
+    """Configure the ``ffrefine`` logger to log to the console and run.log.
+
+    :mod:`ffrefine.runner` logs every external command (its full command
+    line, and where its captured stdout/stderr live) through the
+    ``"ffrefine"`` logger; this function is what routes those messages to
+    the console and to ``<outdir>/run.log``. Call it once at CLI startup.
+
+    Idempotent: calling this more than once (e.g. because a resumed run
+    re-invokes CLI setup) replaces any handlers this function previously
+    attached rather than adding a second copy, so log lines are never
+    duplicated. Propagation to the root logger is disabled so this function
+    fully owns where ``ffrefine`` messages go, regardless of what other
+    logging configuration (pytest's, or a future caller's) exists on the
+    root logger.
+
+    Args:
+        outdir: the run's top-level output directory; ``run.log`` is written
+            directly inside it (spec section 6). Created if it does not
+            already exist.
+        verbose: if set, emit DEBUG-level messages; otherwise INFO.
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    log = logging.getLogger("ffrefine")
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    log.propagate = False
+
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+        handler.close()
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S")
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    log.addHandler(console)
+
+    file_handler = logging.FileHandler(outdir / "run.log", encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    log.addHandler(file_handler)
