@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from ffrefine.errors import ValidationError
 from ffrefine.fit import weights as w
 
 
@@ -48,3 +49,15 @@ def test_all_weights_non_negative():
     qm = np.linspace(0, 80, 17)
     assert np.all(w.uniform_weights(qm) >= 0)
     assert np.all(w.boltzmann_weights(qm) >= 0)
+
+
+def test_boltzmann_rejects_zero_temperature():
+    """Temperature <= 0 must raise ValidationError to prevent NaN output."""
+    qm = np.array([0.0, 5.0, 20.0])
+    with pytest.raises(ValidationError, match="temperature must be > 0"):
+        w.boltzmann_weights(qm, temperature=0.0, emax=None)
+    with pytest.raises(ValidationError, match="temperature must be > 0"):
+        w.boltzmann_weights(qm, temperature=-5.0, emax=None)
+    # Valid temperature still works
+    result = w.boltzmann_weights(qm, temperature=300.0, emax=None)
+    assert result[0] == pytest.approx(1.0)

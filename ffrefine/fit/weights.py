@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..errors import ValidationError
+
 GAS_CONSTANT_KJ: float = 0.0083144626
 """Molar gas constant in kJ/mol/K."""
 
@@ -53,7 +55,12 @@ def boltzmann_weights(
 
     Returns:
         Weights in [0, 1].
+
+    Raises:
+        ValidationError: if temperature <= 0.
     """
+    if temperature <= 0:
+        raise ValidationError(f"temperature must be > 0, got {temperature}")
     rel = _relative(qm_kj)
     out = np.exp(-rel / (GAS_CONSTANT_KJ * temperature))
     if emax is not None:
