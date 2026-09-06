@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..mm.torsionset import validate_quad
 from ..units import kj_to_kcal
 from .topology import Topology
 
@@ -60,18 +61,33 @@ def write_prm_block(
 
     Returns:
         The block text that was written to ``out_path``.
+
+    Raises:
+        ValidationError: ``quad`` is malformed -- wrong length, an atom
+            index outside ``1..topology.natoms``, a repeated index, a
+            central pair that is not a bond, or no proper dihedral in the
+            topology actually uses that central bond. Delegated to
+            :func:`ffrefine.mm.torsionset.validate_quad`, the single place
+            this check is implemented; a raw ``atoms[i - 1]`` lookup would
+            otherwise accept an out-of-range or wraparound index (e.g. ``0``
+            silently indexing the last atom) and emit a plausible-looking
+            but wrong block.
     """
+    validate_quad(topology, quad)
     types = [topology.atoms[i - 1].atype for i in quad]  # 1-based -> 0-based
     lines: list[str] = []
     if not distribute:
         lines.append(_NO_DISTRIBUTE_WARNING)
     lines.append("DIHEDRALS")
-    lines.append("!atom types            Kchi     n   delta")
+    lines.append("!atom types                          Kchi     n   delta")
+    # Each type field is padded to 8 chars -- 2 wider than CGenFF's 6-char
+    # type-name limit -- and explicitly space-joined, so two fields can never
+    # fuse into one unparseable token even if a type reaches or exceeds that
+    # width; padding alone (e.g. ``f"{t:<6s}"`` with no separator) would fuse
+    # silently once a type is >= the field width.
+    type_field = " ".join(f"{t:<8s}" for t in types)
     for kk, dd, nn in zip(np.atleast_1d(k), np.atleast_1d(delta_deg), np.atleast_1d(mult)):
-        lines.append(
-            f"{types[0]:<6s}{types[1]:<6s}{types[2]:<6s}{types[3]:<6s}"
-            f"{kj_to_kcal(float(kk)):>10.4f}{int(nn):>5d}{float(dd):>9.2f}"
-        )
+        lines.append(f"{type_field} {kj_to_kcal(float(kk)):>10.4f}{int(nn):>5d}{float(dd):>9.2f}")
     lines.append("")
     lines.append("END")
     text = "\n".join(lines) + "\n"
