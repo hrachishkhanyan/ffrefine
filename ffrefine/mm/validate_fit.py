@@ -44,6 +44,11 @@ class ValidationResult:
     ``mm_before_kj``, ``mm_after_kj`` and ``qm_kj`` are the raw (un-zeroed)
     profiles; :func:`ffrefine.plots.plot_validation` zeros each to its own
     minimum itself, so callers must not zero these before plotting them.
+
+    ``mm_before_kj`` reflects whatever topology :func:`validate_refit` was
+    actually called with -- see that function's "before" note for why this
+    must be the original force field's topology, not a zeroed one, in real
+    pipeline usage.
     """
 
     rmse_before: float
@@ -100,17 +105,40 @@ def validate_refit(
 ) -> ValidationResult:
     """Compare MM against QM before and after applying the fitted parameters.
 
-    "Before" is ``topology`` exactly as given (whatever state it was in prior
-    to this fit -- e.g. a placeholder or zeroed torsion); "after" is the same
-    topology with the fitted series written over the target torsion set via
-    :func:`ffrefine.io.topwriter.write_refit_topology`. Both are rebuilt into
-    ``workdir`` and re-run through the same single-point MM engine on the
-    same ``frames`` used for the QM reference, so the two RMSE values are
-    directly comparable.
+    "Before" is ``topology`` exactly as given, rebuilt and re-run unchanged;
+    "after" is the same topology with the fitted series written over the
+    target torsion set via :func:`ffrefine.io.topwriter.write_refit_topology`.
+    Both are rebuilt into ``workdir`` and re-run through the same
+    single-point MM engine on the same ``frames`` used for the QM reference,
+    so the two RMSE values are directly comparable.
+
+    **Callers must pass the ORIGINAL force-field topology as** ``topology``
+    **-- the one carrying the force field's own, pre-fit parameters for the
+    target torsion -- never a topology with the target torsion set already
+    zeroed out.** Spec section 4.9's "before refitting" means the original
+    force field's torsion term, and ``rmse_before``/``rmse_after`` are the
+    headline numbers the whole tool is judged by (spec 4.9: "this is the
+    number that matters"). Passing a *zeroed* topology instead inflates
+    ``rmse_before``: it then measures "how much this fit improves on having
+    no torsion term at all" rather than "how much this fit improves on the
+    force field's original guess", making the reported improvement look
+    larger than it really is, with nothing downstream able to catch the
+    substitution. ``write_refit_topology`` *replaces* the target torsion
+    set's lines outright, so this function computes a correct RMSE for
+    whatever topology it is actually given either way -- this requirement is
+    about what the caller must supply, not a limitation of this function's
+    own logic. A zeroed "before" is legitimate only as a deliberate,
+    test-only construction used to manufacture a large, unambiguous
+    improvement to exercise this code path (see
+    ``tests/test_validate_fit.py::test_refit_reproduces_the_original_profile``
+    and its docstring) -- never in real pipeline usage.
 
     Args:
         binaries: resolved binaries; ``gmx`` required.
-        topology: the topology to refit, as currently parsed.
+        topology: the ORIGINAL topology to refit, as currently parsed --
+            i.e. carrying the force field's own pre-fit parameters for the
+            target torsion, not a zeroed stand-in. See the "before" note
+            above.
         quad: 1-based target quadruplet.
         structure: naming for the rerun trajectory.
         frames: the same geometries the QM profile was computed on, shape
