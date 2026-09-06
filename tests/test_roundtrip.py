@@ -67,7 +67,6 @@ from ffrefine.io.topwriter import make_system_top, write_zeroed_topology
 from ffrefine.mm import gromacs
 from ffrefine.mm.torsionset import collect_torsion_set
 
-
 # Round-trip tolerances, set from the measured floor documented in the module
 # docstring above rather than from spec 7.1's literal 1e-6.  Do not raise these
 # without re-running the translation probe described there.

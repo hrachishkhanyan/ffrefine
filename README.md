@@ -1,0 +1,276 @@
+# ffrefine
+
+Repairs high-penalty parameters from generalized force fields (CGenFF, GAFF) by
+refitting proper dihedrals against a QM torsion scan, using GROMACS to remove
+the existing torsion contribution first.
+
+The idea is simple and the bookkeeping is not. To fit a torsion you need the
+molecule's energy profile *without* that torsion's own contribution, so the
+tool zeroes every dihedral entry sharing the target central bond, re-runs the
+MM energies, and fits the difference against QM. Getting that subtraction wrong
+produces a plausible-looking profile and silently wrong parameters, so a
+mandatory self-consistency check (spec section 4.5) verifies the edit against
+an independent analytic evaluation before any fitting happens, and aborts if it
+disagrees by more than 1e-3 kJ/mol.
+
+## Status: milestones 1-3 of 6
+
+| Subcommand | State |
+|---|---|
+| `ffrefine mmscan` | works -- MM single points with and without the torsion, plus the mandatory self-check |
+| `ffrefine fit` | works -- weighted linear cosine fit, BIC model selection, `.itp`/`.prm`/`fit.json`/plots |
+| `ffrefine validate` | works -- rebuild with the fitted series, re-run MM, report RMSE before and after |
+| `ffrefine run` | works -- chains the three above and says which stages it skipped |
+| `ffrefine scan` | **not implemented** (milestone 4, xtb). Exits 2, writes nothing. |
+| `ffrefine charges` | **not implemented** (milestone 5, ORCA ESP/RESP). Exits 2, writes nothing. |
+
+Also not implemented: CGenFF `.str` penalty parsing and automatic torsion
+selection (`--str`, milestone 6), the `final/report.md` summary document
+(milestone 6), and `--mm-relax` (spec 4.6, deferred with the QM scan because it
+operates on scan geometries).
+
+Because `scan` is missing, the QM half of the pipeline must be supplied by
+hand as `01_qm_scan/scan.json` -- see "Supplying a QM scan" below. The tool
+does not fabricate one.
+
+## Requirements
+
+- Python 3.10+ with `numpy`, `scipy` and `matplotlib` -- no other runtime
+  dependencies, and no chemistry libraries: every file format is parsed
+  in-house.
+- GROMACS 2023 or newer on `PATH` (or `--gmx-bin /path/to/gmx`).
+- No network access is used at any point.
+
+## Install
+
+    pip install -e .
+
+## Inputs
+
+- `-s/--structure`: `.pdb`, `.gro` or `.xyz`, one molecule, **atom order
+  identical to the topology**.
+- `-p/--topology`: the molecule's `.itp` or `.top` (CHARMM36/CGenFF or GAFF
+  style).
+- `--dihedral i,j,k,l`: the target torsion, **1-based** atom indices matching
+  the topology's `[ atoms ]` numbering. This is the only index convention the
+  user ever sees; the conversion to 0-based array indices happens internally at
+  the geometry boundary.
+
+Input files are never modified. Everything is written under `--outdir`, and
+normalized copies of the inputs land in `00_input/`.
+
+## Worked example: n-butane
+
+`fixtures/butane/` holds a hand-authored n-butane with CGenFF-style atom types.
+It is a test fixture, not a CGenFF distribution file; do not simulate with it.
+
+The C1-C2-C3-C4 torsion is atoms **1, 5, 8, 11**. Its central bond 5-8 carries
+nine distinct dihedral quadruplets (ten term-lines: the target itself is split
+across two multiplicities). All of them are zeroed to build the MM reference --
+zeroing only the selected quadruplet is spec section 9.1's first named pitfall.
+
+### 1. MM energies, with and without the torsion
+
+    ffrefine mmscan \
+        -s fixtures/butane/butane.pdb \
+        -p fixtures/butane/butane.itp \
+        --dihedral 1,5,8,11 \
+        --outdir butane_out
+
+This writes `full.top` and `zeroed.top`, runs `gmx mdrun -rerun` on both, and
+runs the mandatory self-consistency check: `E_full - E_zeroed` must equal the
+analytic sum of the removed torsion terms to better than 1e-3 kJ/mol at every
+frame. If it does not, the run aborts rather than fitting nonsense. On this
+fixture it agrees to about 4e-5 kJ/mol, which is GROMACS's own mixed-precision
+noise floor.
+
+With no `01_qm_scan/scan.json` present, only the input structure's single frame
+is available, so this checks the topology edit but produces no profile. Supply
+a scan to get one.
+
+### 2. Supplying a QM scan
+
+`ffrefine scan` (milestone 4) would write this file. Until then, write
+`butane_out/01_qm_scan/scan.json` yourself:
+
+```json
+{
+  "energy_kj": [0.0, 1.2, 4.5, "... one QM energy in kJ/mol per frame ..."],
+  "frames_nm": ["... (nframes, natoms, 3) coordinates in nanometres ..."],
+  "phi_deg": ["... optional, informational ..."]
+}
+```
+
+`frames_nm` is in **nanometres**, in topology atom order. `energy_kj` is in
+**kJ/mol**, one value per frame, in the same order. Absolute offsets do not
+matter -- both profiles are referenced to their own minimum. Re-run `mmscan`
+once the file exists so the MM energies cover the scan geometries.
+
+The angles used for fitting are then measured from those geometries, never from
+a requested grid (spec section 9.5).
+
+### 3. Fit
+
+    ffrefine fit \
+        -s fixtures/butane/butane.pdb \
+        -p fixtures/butane/butane.itp \
+        --dihedral 1,5,8,11 \
+        --multiplicities 1,2,3,4,6 \
+        --outdir butane_out
+
+Fits `dE(phi) = [E_QM - min E_QM] - [E_MM0 - min E_MM0]` to
+`sum_n k_n [1 + cos(n phi - delta_n)]`. This is exactly linear least squares in
+a cosine basis, so there is no optimiser and no starting guess. Every subset of
+the allowed multiplicities is fitted, ranked by BIC, and the printed table shows
+the ranking; the selected model is the *smallest* subset whose RMSE is within
+0.5 kJ/mol of the best, which deliberately trades a little accuracy for
+parsimony. Expect butane to select `n=3` alone.
+
+Useful flags:
+
+- `--emax 40` -- discard points this far above the QM minimum (default 40 kJ/mol).
+- `--boltzmann [T]` -- weight by `exp(-E_QM/RT)` instead of uniformly (default 300 K).
+- `--free-phase` -- fit `a_n cos + b_n sin` and recover arbitrary phases. Needed
+  for chiral or otherwise phase-shifted profiles; `fit` warns and names this flag
+  when it detects one.
+- `--distribute` -- spread `k_n` over all nine equivalent quadruplets as `k_n/N_T`
+  instead of writing the whole series onto the target quadruplet. See the
+  limitations below; this is the difference between a molecule-specific fix and a
+  reusable dihedral type.
+
+Physically expected for butane: a 3-fold profile, trans as the global minimum,
+gauche roughly 2.5-3.5 kJ/mol above trans, syn barrier 14-20 kJ/mol.
+
+### 4. Validate
+
+    ffrefine validate \
+        -s fixtures/butane/butane.pdb \
+        -p fixtures/butane/butane.itp \
+        --dihedral 1,5,8,11 \
+        --outdir butane_out
+
+Rebuilds the topology with the fitted series, re-runs the MM single points on
+the same geometries, and reports MM-against-QM RMSE **before and after**
+refitting. Spec section 4.9 calls this the number that matters. "Before" is the
+original force field's own parameters -- not the zeroed topology -- so the
+improvement reported is improvement over the force field, not over having no
+torsion at all.
+
+### Or all three at once
+
+    ffrefine run -s ... -p ... --dihedral 1,5,8,11 --outdir butane_out
+
+`run` chains `mmscan -> fit -> validate` and states up front that it is skipping
+`scan` (milestone 4) and `charges` (milestone 5).
+
+## Output layout
+
+    butane_out/
+      00_input/     copies of the input structure and topology, plus model.json
+                    (atom/bond/dihedral counts, fudgeQQ, fudgeLJ, the torsion set)
+      01_qm_scan/   scan.json -- supplied by you until milestone 4 lands
+      02_mm_scan/   mdp, tpr, edr, xvg, full.top, zeroed.top, GROMACS logs, and
+                    energies.json (measured phi, full and zeroed potentials, the
+                    self-check residual)
+      03_fit/       fit.json (every number), dihedral.itp (the fitted [ dihedrals ]
+                    lines, funct 9, kJ/mol and degrees), dihedral.prm (CHARMM
+                    DIHEDRALS block in kcal/mol), plots/
+      final/        molecule_refined.itp, validation.json, plots/validation.png,
+                    plus the before/after topologies and GROMACS logs
+      run.log       every external command with its full command line
+
+`04_charges/` and `final/report.md` are part of the layout but belong to
+milestones 5 and 6 and are not produced.
+
+Plots: `03_fit/plots/` holds the QM profile, the MM-zeroed profile, the target
+difference with the fitted series overlaid, and the residuals.
+`final/plots/validation.png` holds total MM energy against QM, before and after.
+
+## Common flags
+
+Every subcommand accepts `--config file.json`, `--outdir`, `--nthreads`,
+`--resume`, `--dry-run`, `--verbose`, `--gmx-bin`, `--xtb-bin`, `--orca-bin`
+and `--no-strict-names`.
+
+- `--config` values are overridden by anything given on the command line. A
+  `"binaries": {"gmx": "..."}` object is honoured alongside the flat keys.
+- `--resume` skips a stage whose recorded input hashes still match. A manifest
+  that is missing, corrupt, or built from different inputs always recomputes.
+- `--dry-run` validates the inputs, reports what would run, and creates nothing
+  at all -- not even the output directory.
+- `--no-strict-names` downgrades an atom-name mismatch between structure and
+  topology to a warning. Atom count and element ordering stay fatal: `grompp`
+  runs with `-maxwarn`, which suppresses its own atom-order guard, so this check
+  is the only thing standing between a mis-ordered file and silently wrong
+  energies.
+
+Exit codes: `0` success, `1` a reported ffrefine error (printed as
+`error: ...`, never a traceback), `2` a usage error or an unimplemented
+subcommand.
+
+One torsion per run. `--dihedral` is repeatable in the parser to match the spec's
+CLI surface, but the stage layout holds a single scan and a single fit per output
+directory, so passing more than one is rejected with a message rather than
+silently fitting only the first. Use a separate `--outdir` per torsion.
+
+## Physical assumptions and their limits
+
+**The fitted torsion is convention-bound. This is the big one.** The refit
+absorbs whatever the 1-4 interactions do not already account for, which is
+exactly why `[ pairs ]` is never removed. The consequence is that the fitted
+parameters are **only valid alongside the same nonbonded parameters and the same
+1-4 conventions (`fudgeQQ`, `fudgeLJ`) as the topology they were fitted
+against**. Those values are read from the topology's `[ defaults ]`, never
+assumed, and recorded in `00_input/model.json`. CHARMM and Amber/GAFF differ
+here. Moving a fitted dihedral between force fields is not meaningful, and
+nothing in the output file will stop you from doing it.
+
+**Milestones 4-6 do not exist.** There is no xtb scan driver, no ORCA charge
+refinement, and no CGenFF `.str` parsing. The charge module of the spec is
+entirely unimplemented: this tool changes torsions and nothing else. If a
+subcommand for one of those appears to accept your arguments, it will still
+refuse to run and write nothing.
+
+**Molecule-specific by default.** Without `--distribute` the fitted series is
+written onto one quadruplet and the other torsions about that bond are set to
+zero. That reproduces this molecule exactly but is not a transferable dihedral
+type -- applied as a CHARMM type it would hit every quadruplet matching those
+atom types. The emitted `.prm` block carries a loud warning to that effect
+unless `--distribute` was used.
+
+**Vacuum throughout.** The MM reference is gas phase, so the QM scan must be
+too. No implicit solvent enters the torsion profile, and a torsion fitted in
+vacuum is not automatically the right torsion in water.
+
+**The fit is only as good as the scan.** Relaxed scans hop conformers; a
+discontinuity in the QM profile will be fitted straight through. Look at
+`03_fit/plots/fit.png` and the residuals before trusting anything.
+
+**Asymmetric profiles need `--free-phase`.** The default cosine-only basis is
+even in `phi` and restricts phases to 0 or 180 degrees, so it cannot represent a
+chiral or phase-shifted torsion at all. `fit` measures the profile's mismatch
+against its own mirror image and warns when that exceeds 0.5 kJ/mol, naming the
+flag. Do not ignore that warning.
+
+**Bonds, angles, LJ parameters and improper dihedrals are out of scope.**
+Impropers (funct 2 and 4) are never modified, and `[ pairs ]` is never removed.
+
+**Round-trip precision is bounded by GROMACS, not by the fitter.** Energies are
+read back from `gmx energy` `.xvg` text at six decimal places over a
+mixed-precision (float32) `.edr`, which puts an absolute floor of about
+1e-5 kJ/mol on the recovered coefficients. See the module docstring of
+`tests/test_roundtrip.py` for the measurement and how to tighten it.
+
+## Tests
+
+    pytest
+
+Tests that need GROMACS are marked `needs_gmx` and skip when `gmx` is not on
+`PATH`; run with GROMACS available to exercise them.
+
+The load-bearing one is spec section 7.1's round trip, which covers the whole
+pipeline except xtb and ORCA: take the MM energies with the original
+parameters, treat them as the QM reference, zero the torsion, refit, and require
+the original profile back. `tests/test_cli.py::test_end_to_end_mmscan_fit_validate`
+drives that same round trip through the CLI end to end and checks that
+validation's "before" RMSE really is measured against the original force field.

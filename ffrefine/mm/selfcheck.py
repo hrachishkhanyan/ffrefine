@@ -77,7 +77,16 @@ def _as_gromacs_saw_it(frames: np.ndarray) -> np.ndarray:
 
 @dataclass
 class SelfCheckResult:
-    """Outcome of the section 4.5 check."""
+    """Outcome of the section 4.5 check.
+
+    ``full_potential_kj`` and ``zeroed_potential_kj`` are the two total
+    potential-energy profiles the check itself had to compute (spec section
+    4.4: "single-point energies with and without the target torsions"). They
+    are carried out of here rather than discarded so the ``mmscan`` stage can
+    write them to ``02_mm_scan/energies.json`` -- which the fit consumes as
+    ``E_MM0`` -- without paying for a third GROMACS rerun over the same
+    frames. ``gromacs_difference`` is exactly their difference.
+    """
 
     max_abs_error: float
     passed: bool
@@ -85,6 +94,8 @@ class SelfCheckResult:
     analytic_difference: np.ndarray
     phi_deg: np.ndarray
     tolerance: float
+    full_potential_kj: np.ndarray
+    zeroed_potential_kj: np.ndarray
 
 
 def check_torsion_removal(
@@ -96,6 +107,7 @@ def check_torsion_removal(
     workdir: str | Path,
     nthreads: int = 1,
     tolerance: float = DEFAULT_TOLERANCE,
+    strict_names: bool = True,
 ) -> SelfCheckResult:
     """Verify that zeroing removed exactly the intended torsion terms.
 
@@ -108,6 +120,16 @@ def check_torsion_removal(
         workdir: stage directory.
         nthreads: mdrun thread count.
         tolerance: maximum permitted absolute deviation in kJ/mol.
+        strict_names: treat an atom-name mismatch between ``structure`` and
+            ``topology`` as fatal rather than as a warning. Element ordering
+            and atom count are always fatal regardless; only *names* are
+            relaxed, and only because a topology and a coordinate file can
+            legitimately disagree on naming while describing the same
+            molecule in the same order. Exposed so the CLI's
+            ``--no-strict-names`` -- which
+            :func:`ffrefine.io.validate.validate_structure_topology` names in
+            its own error message -- actually reaches this call, instead of
+            being overridden by a strict re-check here.
 
     Returns:
         The check result when it passes.
@@ -123,7 +145,7 @@ def check_torsion_removal(
     # that guard suppressed, grompp would silently proceed using topology
     # order and every frame's energy would be wrong. Check explicitly here,
     # before any energy is computed, and surface non-fatal warnings.
-    for warning in validate_structure_topology(structure, topology):
+    for warning in validate_structure_topology(structure, topology, strict_names=strict_names):
         log.warning("structure/topology validation: %s", warning)
 
     workdir = Path(workdir)
@@ -146,7 +168,9 @@ def check_torsion_removal(
         binaries, zero_top, structure, frames, workdir / "zeroed", "zeroed", nthreads
     )
 
-    gromacs_difference = e_full.potential() - e_zero.potential()
+    full_potential = e_full.potential()
+    zeroed_potential = e_zero.potential()
+    gromacs_difference = full_potential - zeroed_potential
     # Evaluate the analytic reference at the same quantized coordinates
     # GROMACS actually saw (see _as_gromacs_saw_it), not the caller's raw
     # frames -- otherwise the comparison measures PDB coordinate precision
@@ -170,6 +194,8 @@ def check_torsion_removal(
         analytic_difference=analytic_difference,
         phi_deg=phi,
         tolerance=tolerance,
+        full_potential_kj=full_potential,
+        zeroed_potential_kj=zeroed_potential,
     )
 
     if not passed:

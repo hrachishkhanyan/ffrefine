@@ -102,6 +102,7 @@ def validate_refit(
     workdir: str | Path,
     distribute: bool = False,
     nthreads: int = 1,
+    strict_names: bool = True,
 ) -> ValidationResult:
     """Compare MM against QM before and after applying the fitted parameters.
 
@@ -154,6 +155,11 @@ def validate_refit(
             onto the target quadruplet alone. Passed straight through to
             :func:`write_refit_topology`.
         nthreads: mdrun thread count.
+        strict_names: treat an atom-name mismatch between ``structure`` and
+            ``topology`` as fatal rather than as a warning; see the identical
+            argument on
+            :func:`ffrefine.mm.selfcheck.check_torsion_removal`. Atom count
+            and element ordering stay fatal either way.
 
     Returns:
         RMSE before and after, and the profiles behind them.
@@ -170,7 +176,7 @@ def validate_refit(
     # suppresses its atom-name-mismatch warning -- the only in-band guard
     # against a structure whose atom order disagrees with the topology.
     # Check explicitly before spending any GROMACS time on it.
-    for warning in validate_structure_topology(structure, topology):
+    for warning in validate_structure_topology(structure, topology, strict_names=strict_names):
         log.warning("structure/topology validation: %s", warning)
 
     workdir = Path(workdir)
