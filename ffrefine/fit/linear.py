@@ -111,3 +111,44 @@ def fit_cosine_series(
         free_phase=free_phase,
         n_params=int(coeffs.size),
     )
+
+
+DEFAULT_ASYMMETRY_TOLERANCE: float = 0.5
+"""kJ/mol; above this the cosine-only basis cannot represent the profile."""
+
+
+def asymmetry_metric(phi_deg: np.ndarray, target_kj: np.ndarray) -> float:
+    """RMS mismatch between a torsion profile and its mirror about phi = 0.
+
+    A cosine-only basis is even in phi, so it can only represent profiles
+    symmetric about zero.  Chiral or otherwise phase-shifted torsions break
+    that assumption (spec section 4.7).
+
+    Measured angles are not on an exact grid, so the mirrored profile is
+    obtained by periodic interpolation rather than by index reversal.
+
+    Args:
+        phi_deg: measured dihedral values in degrees, any order.
+        target_kj: the profile in kJ/mol.
+
+    Returns:
+        RMS difference in kJ/mol between the profile and its mirror.
+    """
+    phi = wrap_deg(np.asarray(phi_deg, dtype=float))
+    y = np.asarray(target_kj, dtype=float)
+    order = np.argsort(phi)
+    ps, ys = phi[order], y[order]
+    # Extend periodically so interpolation at -phi never falls off the ends.
+    ext_p = np.concatenate([ps - 360.0, ps, ps + 360.0])
+    ext_y = np.concatenate([ys, ys, ys])
+    mirrored = np.interp(-ps, ext_p, ext_y)
+    return float(np.sqrt(np.mean((ys - mirrored) ** 2)))
+
+
+def is_asymmetric(
+    phi_deg: np.ndarray,
+    target_kj: np.ndarray,
+    tolerance: float = DEFAULT_ASYMMETRY_TOLERANCE,
+) -> bool:
+    """Whether a profile is too asymmetric for the cosine-only basis."""
+    return asymmetry_metric(phi_deg, target_kj) > tolerance
