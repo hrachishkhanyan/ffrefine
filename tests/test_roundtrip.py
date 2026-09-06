@@ -1,3 +1,62 @@
+"""Spec section 7.1: the round-trip refit must recover the original parameters.
+
+GROMACS supplies the MM energies with the original parameters, those stand in
+for the QM reference, the target torsion is zeroed, and the refit has to come
+back with what was removed.
+
+Documented deviation from spec section 7.1's literal ``1e-6`` figure
+-------------------------------------------------------------------
+Spec line 214 reads "The recovered coefficients must match the originals to
+1e-6".  That bound is **not reachable on this build**, through any file-based
+energy extraction, and the two tolerances below are therefore set from a
+measured noise floor instead.  This is a deliberate, documented deviation from
+the spec figure (Task 13 fix round 4, rulings R25/R27), not an accidentally
+loosened assertion.
+
+Mechanism.  Every energy this package consumes is extracted from GROMACS as
+*text*: ``gmx energy`` writes an ``.xvg`` whose data lines carry exactly six
+decimal places -- verified directly on this build (``4.604160``,
+``18.461096``, ``25.800283``) -- so each extracted value is quantized to
+1e-6 kJ/mol irrespective of its magnitude.  Reading the ``.edr`` underneath
+would not help: this is GROMACS 2025.4-conda_forge reporting
+``Precision: mixed``, so energies are stored there as ``real`` = float32,
+which is comparable or worse at these magnitudes (~3.1e-6 kJ/mol on a
+25.8 kJ/mol ``Potential``).  The round trip then *differences* two
+independently quantized values (full topology minus zeroed topology), giving
+~2e-6 kJ/mol, and the 5-parameter least-squares cosine fit over the removed
+set amplifies that by roughly 10x.
+
+The floor is consequently **absolute** -- about 1e-6 kJ/mol per extracted
+value -- and scales with neither term magnitude nor coordinate magnitude.
+That is precisely why fix round 2's term-magnitude probe came back flat
+(1.03-1.16x across a 7.5x range of term magnitude, with the two residual
+curves correlated at 0.988) and why fix round 3's coordinate-magnitude probe
+came back flat as well (<2%).
+
+Measured floor, 36 frames, deterministic (bit-identical across three repeat
+runs in fresh working directories):
+
+    fit rmse                        1.031101e-05 kJ/mol
+    max |predicted - reference|     1.797718e-05 kJ/mol
+
+The tolerances below sit ~10x above those numbers and deliberately no higher:
+a bound loose enough to pass on anything would not be testing anything.
+
+How to tighten this.  A double-precision GROMACS (``gmx_d`` / ``gmx_mpi_d``,
+neither present in this conda environment -- ``gmx`` is the only binary there)
+writes more significant digits and stores double in the ``.edr``, and is
+expected to reach the spec's ``1e-6``.  Before changing these constants,
+re-run the measurement that established the floor's absoluteness in the first
+place -- the *translation probe*: repeat the frame scan with the whole
+molecule translated by 0, 1 and 5 nm, and measure the spread of the **zeroed**
+topology's remaining ``Proper Dih.`` term (the methyl torsions about the two
+untouched terminal bonds, geometrically invariant under rotation about the
+central bond and therefore exactly constant, so any spread is pure numerical
+noise).  It measured 4.0e-6 / 1.0e-6 / 4.0e-6 kJ/mol -- flat across a 20x
+change in coordinate magnitude, and every value an exact integer multiple of
+1e-6, which is what pointed at the ``.xvg`` text format to begin with.
+"""
+
 import numpy as np
 import pytest
 from ffrefine.config import Binaries
@@ -7,6 +66,16 @@ from ffrefine.io.topology import read_topology
 from ffrefine.io.topwriter import make_system_top, write_zeroed_topology
 from ffrefine.mm import gromacs
 from ffrefine.mm.torsionset import collect_torsion_set
+
+
+# Round-trip tolerances, set from the measured floor documented in the module
+# docstring above rather than from spec 7.1's literal 1e-6.  Do not raise these
+# without re-running the translation probe described there.
+ROUND_TRIP_RMSE_TOL = 1e-4
+"""kJ/mol.  Measured floor 1.031101e-05 -> 9.7x headroom (spec 7.1 says 1e-6)."""
+
+ROUND_TRIP_MAX_DEV_TOL = 2e-4
+"""kJ/mol.  Measured floor 1.797718e-05 -> 11.1x headroom (spec 7.1 says 1e-6)."""
 
 
 @pytest.mark.needs_gmx
@@ -76,7 +145,10 @@ def test_round_trip_refit_recovers_original_parameters(
 
     reference = reference - reference.min()
     predicted = r.predicted - r.predicted.min()
-    assert np.max(np.abs(predicted - reference)) < 1e-6
+    # Spec 7.1 asks for 1e-6 here; the .xvg six-decimal quantization floor over
+    # a float32 .edr in this mixed-precision build makes that unreachable.  See
+    # the module docstring: measured 1.797718e-05, tolerance carries 11.1x.
+    assert np.max(np.abs(predicted - reference)) < ROUND_TRIP_MAX_DEV_TOL
 
 
 @pytest.mark.needs_gmx
@@ -107,4 +179,7 @@ def test_round_trip_residuals_are_numerically_zero(
         e_zero.potential() - e_zero.potential().min()
     )
     r = fit_cosine_series(phi, target, [1, 2, 3, 4, 6])
-    assert r.rmse < 1e-6
+    # Spec 7.1 asks for 1e-6 here; the .xvg six-decimal quantization floor over
+    # a float32 .edr in this mixed-precision build makes that unreachable.  See
+    # the module docstring: measured 1.031101e-05, tolerance carries 9.7x.
+    assert r.rmse < ROUND_TRIP_RMSE_TOL
