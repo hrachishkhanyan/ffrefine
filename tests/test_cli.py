@@ -26,6 +26,7 @@ from ffrefine.cli import build_parser, main, parse_dihedral
 from ffrefine.errors import ValidationError
 from ffrefine.io.structure import read_pdb
 from ffrefine.mm.validate_fit import profile_rmse
+from ffrefine.stages import hash_array
 
 # --------------------------------------------------------------------------
 # helpers
@@ -45,23 +46,44 @@ def _base_args(butane_pdb, butane_itp, outdir) -> list[str]:
     ]
 
 
-def _write_stage_inputs(outdir, phi_deg, qm_kj, mm0_kj=None):
+def _fake_frames(n: int, natoms: int = 14) -> np.ndarray:
+    """Deterministic placeholder geometries of the right shape.
+
+    ``fit`` never evaluates these -- it only hashes them to confirm the MM
+    energies were computed on the same frames -- so their values are
+    arbitrary, but they must be reproducible across the two payloads.
+    """
+    return np.arange(n * natoms * 3, dtype=float).reshape(n, natoms, 3) * 0.01
+
+
+def _write_stage_inputs(outdir, phi_deg, qm_kj, mm0_kj=None, quad=(1, 5, 8, 11), frames=None):
     """Hand-build the 01_qm_scan and 02_mm_scan payloads ``fit`` consumes.
 
-    Lets the whole fit path be exercised with no GROMACS and no xtb.
+    Lets the whole fit path be exercised with no GROMACS and no xtb.  The two
+    payloads are written *consistently* -- same quad, same geometries, and the
+    matching ``frames_sha256`` -- because that is what ``mmscan`` produces;
+    tests that want a mispairing construct it explicitly.
     """
     mm0 = np.zeros_like(np.asarray(qm_kj, dtype=float)) if mm0_kj is None else np.asarray(mm0_kj)
+    frames = _fake_frames(len(list(phi_deg))) if frames is None else np.asarray(frames, float)
     qm_dir = outdir / "01_qm_scan"
     qm_dir.mkdir(parents=True, exist_ok=True)
     (qm_dir / "scan.json").write_text(
-        json.dumps({"phi_deg": list(phi_deg), "energy_kj": [float(v) for v in qm_kj]})
+        json.dumps(
+            {
+                "phi_deg": list(phi_deg),
+                "energy_kj": [float(v) for v in qm_kj],
+                "frames_nm": frames.tolist(),
+            }
+        )
     )
     mm_dir = outdir / "02_mm_scan"
     mm_dir.mkdir(parents=True, exist_ok=True)
     (mm_dir / "energies.json").write_text(
         json.dumps(
             {
-                "quad": [1, 5, 8, 11],
+                "quad": list(quad),
+                "frames_sha256": hash_array(frames),
                 "phi_deg": [float(v) for v in phi_deg],
                 "zeroed_potential_kj": [float(v) for v in mm0],
                 "full_potential_kj": [float(v) for v in mm0],
@@ -710,6 +732,12 @@ def test_validate_without_scan_geometries_is_a_clean_error(
     _write_stage_inputs(out, phi, qm)
     assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
     capsys.readouterr()
+    # Drop the geometries after fitting: validate re-runs MM single points on
+    # them (spec 4.9) and cannot proceed without them.
+    scan_path = out / "01_qm_scan" / "scan.json"
+    scan = json.loads(scan_path.read_text())
+    del scan["frames_nm"]
+    scan_path.write_text(json.dumps(scan))
     code = main(["validate"] + _base_args(butane_pdb, butane_itp, out))
     assert code == 1
     assert "frames_nm" in capsys.readouterr().err
@@ -808,3 +836,134 @@ def test_end_to_end_mmscan_fit_validate(tmp_path, butane_pdb, butane_itp, gmx_bi
     assert result["rmse_after_kj_per_mol"] < 0.2 * zeroed_rmse
     assert (out / "final" / "molecule_refined.itp").is_file()
     assert (out / "final" / "plots" / "validation.png").is_file()
+
+
+# --------------------------------------------------------------------------
+# stage pairing (final review, item 3)
+# --------------------------------------------------------------------------
+
+
+def test_fit_refuses_energies_computed_for_another_torsion(
+    tmp_path, butane_pdb, butane_itp, capsys
+):
+    """`fit --dihedral 2,1,5,8` after `mmscan --dihedral 1,5,8,11` used to fit
+    torsion A's data and write the parameters onto torsion B, exit 0."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    argv = [
+        "fit",
+        "-s",
+        str(butane_pdb),
+        "-p",
+        str(butane_itp),
+        "--dihedral",
+        "2,1,5,8",
+        "--outdir",
+        str(out),
+    ]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "1,5,8,11" in err and "2,1,5,8" in err
+    assert not (out / "03_fit" / "fit.json").exists()
+
+
+def test_fit_refuses_when_the_scan_geometries_changed(tmp_path, butane_pdb, butane_itp, capsys):
+    """Regenerating scan.json's geometries without re-running mmscan pairs the
+    new QM energies with stale angles and a stale E_MM0."""
+    out = tmp_path / "out"
+    phi = _grid()
+    qm = 5.0 * (1.0 + np.cos(np.radians(3.0 * phi)))
+    _write_stage_inputs(out, phi, qm)
+    scan_path = out / "01_qm_scan" / "scan.json"
+    scan = json.loads(scan_path.read_text())
+    moved = np.asarray(scan["frames_nm"], dtype=float)
+    moved[0, 0, 0] += 0.05  # one atom, one frame
+    scan["frames_nm"] = moved.tolist()
+    scan_path.write_text(json.dumps(scan))
+
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 1
+    err = capsys.readouterr().err
+    assert "different geometries" in err
+    assert "mmscan" in err
+
+
+def test_fit_allows_replacing_only_the_qm_energies(tmp_path, butane_pdb, butane_itp):
+    """The documented workflow, and spec 7.1's round trip: swap the QM column
+    while keeping the geometries. Only frames_nm is hashed, so this is legal."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, np.zeros_like(phi))
+    scan_path = out / "01_qm_scan" / "scan.json"
+    scan = json.loads(scan_path.read_text())
+    scan["energy_kj"] = list(5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    scan_path.write_text(json.dumps(scan))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+
+
+def test_fit_refuses_an_energies_file_that_predates_the_check(
+    tmp_path, butane_pdb, butane_itp, capsys
+):
+    """A payload with no quad or no frames digest cannot be verified, so it is
+    refused rather than trusted -- mmscan is cheap."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    energies_path = out / "02_mm_scan" / "energies.json"
+    payload = json.loads(energies_path.read_text())
+    del payload["frames_sha256"]
+    energies_path.write_text(json.dumps(payload))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 1
+    assert "frames_sha256" in capsys.readouterr().err
+
+
+def test_fit_records_its_provenance(tmp_path, butane_pdb, butane_itp):
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    payload = json.loads((out / "03_fit" / "fit.json").read_text())
+    prov = payload["provenance"]
+    assert prov["quad_1_based"] == [1, 5, 8, 11]
+    assert prov["frames_sha256"] == hash_array(_fake_frames(len(phi)))
+
+
+def test_validate_refuses_a_fit_made_for_another_torsion(tmp_path, butane_pdb, butane_itp, capsys):
+    """cmd_validate applies fit.json's k/delta/mult to whatever --dihedral it
+    is given; fit.json now says which torsion it was made for."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    capsys.readouterr()
+    argv = [
+        "validate",
+        "-s",
+        str(butane_pdb),
+        "-p",
+        str(butane_itp),
+        "--dihedral",
+        "2,1,5,8",
+        "--outdir",
+        str(out),
+    ]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "1,5,8,11" in err and "2,1,5,8" in err
+    assert not (out / "final" / "validation.json").exists()
+
+
+def test_validate_refuses_a_fit_made_on_other_geometries(tmp_path, butane_pdb, butane_itp, capsys):
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    capsys.readouterr()
+    scan_path = out / "01_qm_scan" / "scan.json"
+    scan = json.loads(scan_path.read_text())
+    moved = np.asarray(scan["frames_nm"], dtype=float)
+    moved[2, 3, 1] -= 0.07
+    scan["frames_nm"] = moved.tolist()
+    scan_path.write_text(json.dumps(scan))
+    assert main(["validate"] + _base_args(butane_pdb, butane_itp, out)) == 1
+    assert "different geometries" in capsys.readouterr().err

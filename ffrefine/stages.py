@@ -87,6 +87,33 @@ def hash_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def hash_array(values) -> str:
+    """Return the SHA-256 digest of a numeric array's float64 contents.
+
+    Used to bind one stage's output to the geometries another stage consumed
+    (``02_mm_scan/energies.json`` and ``03_fit/fit.json`` both record the
+    digest of ``01_qm_scan/scan.json``'s ``frames_nm``).  Hashing the array
+    rather than the whole scan file is deliberate: the MM energies and
+    measured angles depend on the *geometries* only, so replacing the QM
+    ``energy_kj`` column -- which is the documented workflow, and spec section
+    7.1's round trip -- must not invalidate them, while changing a coordinate
+    must.
+
+    Args:
+        values: anything ``numpy.asarray(..., dtype=float)`` accepts.
+
+    Returns:
+        Lowercase hex digest, stable across runs for identical values.
+    """
+    import numpy as np
+
+    arr = np.ascontiguousarray(np.asarray(values, dtype=float))
+    digest = hashlib.sha256()
+    digest.update(str(arr.shape).encode("utf-8"))
+    digest.update(arr.tobytes())
+    return digest.hexdigest()
+
+
 def hash_inputs(paths: list[str | Path], extra: dict | None = None) -> str:
     """Return a combined SHA-256 hash of input files and stage settings.
 

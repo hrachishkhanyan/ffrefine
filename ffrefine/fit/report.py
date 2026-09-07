@@ -89,7 +89,12 @@ def profile_stats(phi_deg: np.ndarray, energy_kj: np.ndarray) -> ProfileStats:
     )
 
 
-def fit_summary(result: FitResult, phi_deg: np.ndarray, target_kj: np.ndarray) -> dict:
+def fit_summary(
+    result: FitResult,
+    phi_deg: np.ndarray,
+    target_kj: np.ndarray,
+    provenance: dict | None = None,
+) -> dict:
     """Build the JSON-serialisable fit record written to fit.json (spec 4.8).
 
     Energies are reported in kJ/mol, with kcal/mol alongside for users going
@@ -101,6 +106,12 @@ def fit_summary(result: FitResult, phi_deg: np.ndarray, target_kj: np.ndarray) -
         result: the fit to summarise.
         phi_deg: dihedral values the fit was evaluated at, degrees.
         target_kj: the target curve the fit was made against, kJ/mol.
+        provenance: what produced this fit -- the target quadruplet, the
+            geometry digest binding it to a particular ``scan.json``, and the
+            settings that shaped it (spec 4.8's "every number"). Recorded
+            verbatim under ``"provenance"``. ``validate`` reads
+            ``quad_1_based`` and ``frames_sha256`` back out of it to refuse
+            applying this fit to a different torsion or a different scan.
 
     Returns:
         A dict safe to pass to ``json.dumps``.
@@ -123,6 +134,7 @@ def fit_summary(result: FitResult, phi_deg: np.ndarray, target_kj: np.ndarray) -
 
     stats = profile_stats(phi_arr, result.predicted)
     return {
+        "provenance": dict(provenance or {}),
         "multiplicities": [int(m) for m in result.mults],
         "terms": [
             {

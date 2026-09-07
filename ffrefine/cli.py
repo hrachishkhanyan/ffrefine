@@ -51,11 +51,24 @@ exists, and accepted from the user in the meantime::
 
     {"quad": [i, j, k, l], "phi_deg": [...],
      "full_potential_kj": [...], "zeroed_potential_kj": [...],
-     "selfcheck_max_abs_error_kj": ..., "nframes": ...}
+     "frames_sha256": "...", "selfcheck_max_abs_error_kj": ..., "nframes": ...}
 
 ``phi_deg`` in ``energies.json`` is *measured from the geometries GROMACS
 actually saw*, not the requested grid (spec section 9.5), and it is the angle
 array the fit uses.
+
+How stage payloads are paired
+-----------------------------
+Matching array lengths are NOT evidence that two payloads belong together.
+``energies.json`` records the ``quad`` it was computed for and a
+``frames_sha256`` digest of the geometries it saw; ``fit.json`` records both
+again under ``provenance``.  :func:`_check_stage_pairing` and
+:func:`_check_fit_applies_here` compare them and refuse a mismatch, so
+fitting one torsion's energies and writing the answer onto another -- or
+fitting against geometries ``mmscan`` never saw -- is an error rather than a
+confident wrong number.  The digest covers ``frames_nm`` only, so replacing
+the QM ``energy_kj`` column (the documented workflow, and spec section 7.1's
+round trip) stays legal.
 """
 
 from __future__ import annotations
@@ -92,6 +105,7 @@ from .mm.validate_fit import validate_refit
 from .plots import plot_fit, plot_mm_zeroed, plot_qm_profile, plot_residuals, plot_validation
 from .stages import (
     STAGE_DIRS,
+    hash_array,
     hash_inputs,
     setup_logging,
     stage_dir,
@@ -570,6 +584,141 @@ _SCAN_REMEDY = (
 )
 
 
+def _check_fit_applies_here(
+    quad: Quad, fit_payload: dict, fit_path: Path, frames: np.ndarray, scan_path: Path
+) -> None:
+    """Refuse to validate a fit that was not made for this torsion or scan.
+
+    ``cmd_validate`` reads ``k``/``delta``/``mult`` out of ``fit.json`` and
+    applies them to whatever ``--dihedral`` the invocation carries.  Before
+    ``fit.json`` recorded a quad, a mistyped ``--dihedral`` wrote one
+    torsion's fitted series onto a different torsion and reported an RMSE for
+    it -- exit 0, no warning.
+
+    Args:
+        quad: the 1-based quadruplet this invocation is validating.
+        fit_payload: parsed ``03_fit/fit.json``.
+        fit_path: its path, for messages.
+        frames: the geometries from ``scan.json``, shape (nframes, natoms, 3).
+        scan_path: the scan's path, for messages.
+
+    Raises:
+        ValidationError: the fit belongs to a different torsion or a
+            different set of geometries, or predates the provenance block.
+    """
+    provenance = fit_payload.get("provenance") or {}
+    recorded_quad = provenance.get("quad_1_based")
+    if recorded_quad is None:
+        raise ValidationError(
+            f"{fit_path} records no target torsion, so there is no way to tell whether its "
+            "parameters belong to the torsion being validated. It predates this check; "
+            "re-run 'ffrefine fit'."
+        )
+    if list(recorded_quad) != list(quad):
+        shown = ",".join(str(i) for i in recorded_quad)
+        wanted = ",".join(str(i) for i in quad)
+        raise ValidationError(
+            f"{fit_path} holds the fit for torsion {shown}, but this validation is for "
+            f"torsion {wanted}. Applying one torsion's fitted series to another and "
+            f"reporting its RMSE is meaningless. Re-run 'ffrefine fit --dihedral {wanted}', "
+            f"or validate torsion {shown}."
+        )
+    recorded_digest = provenance.get("frames_sha256")
+    if recorded_digest is None:
+        raise ValidationError(
+            f"{fit_path} records no 'frames_sha256', so it cannot be tied to this scan's "
+            "geometries. It predates this check; re-run 'ffrefine fit'."
+        )
+    if recorded_digest != hash_array(frames):
+        raise ValidationError(
+            f"{fit_path} was fitted against different geometries than {scan_path} now "
+            "holds, so validating it on these frames compares a fit to a profile it never "
+            "saw. Re-run 'ffrefine mmscan' and 'ffrefine fit' before validating."
+        )
+
+
+def _check_stage_pairing(
+    quad: Quad, scan: dict, scan_path: Path, energies: dict, energies_path: Path
+) -> str:
+    """Refuse an ``mmscan`` payload that does not belong to this fit.
+
+    The two stage payloads used to be paired by array length alone, so three
+    different mispairings all exited 0 with a confident wrong answer:
+
+    * ``fit --dihedral 2,1,5,8`` after ``mmscan --dihedral 1,5,8,11`` in the
+      same outdir fitted torsion A's angles and MM-zeroed energies and wrote
+      the parameters onto torsion B.  ``energies.json`` recorded the quad it
+      was computed for; nothing read it.
+    * Regenerating ``scan.json``'s geometries without re-running ``mmscan``
+      paired the new QM energies with stale ``phi_deg`` and a stale
+      ``E_MM0``.
+
+    Both are checked here, before any fitting.  The geometry check hashes
+    ``frames_nm`` rather than the whole ``scan.json`` file, because that is
+    precisely what ``mmscan``'s outputs depend on: replacing the QM
+    ``energy_kj`` column while keeping the geometries is the documented
+    workflow (and spec section 7.1's round trip) and stays legal, while
+    touching a coordinate does not.
+
+    Args:
+        quad: the 1-based quadruplet this invocation is fitting.
+        scan: parsed ``01_qm_scan/scan.json``.
+        scan_path: its path, for messages.
+        energies: parsed ``02_mm_scan/energies.json``.
+        energies_path: its path, for messages.
+
+    Returns:
+        The hex digest of ``scan``'s ``frames_nm``, for recording in
+        ``fit.json`` so ``validate`` can make the same check.
+
+    Raises:
+        ValidationError: the payloads disagree, or either lacks the field
+            needed to tell.  A payload written by an older ffrefine is
+            refused rather than trusted -- ``mmscan`` is cheap and a wrong
+            pairing is not detectable any other way.
+    """
+    recorded = energies.get("quad")
+    if recorded is None:
+        raise ValidationError(
+            f"{energies_path} records no 'quad', so there is no way to tell which torsion "
+            "its energies belong to. It predates this check; re-run 'ffrefine mmscan'."
+        )
+    if list(recorded) != list(quad):
+        shown = ",".join(str(i) for i in recorded)
+        wanted = ",".join(str(i) for i in quad)
+        raise ValidationError(
+            f"{energies_path} holds the MM energies for torsion {shown}, but this fit is "
+            f"for torsion {wanted}. Fitting one torsion's energies and writing the result "
+            f"onto another produces plausible-looking, wrong parameters. Re-run "
+            f"'ffrefine mmscan --dihedral {wanted}' in this outdir, or fit torsion "
+            f"{shown}, or use a separate --outdir per torsion."
+        )
+
+    if "frames_nm" not in scan:
+        raise ValidationError(
+            f"{scan_path} has no 'frames_nm' array, so the fit cannot confirm that "
+            f"{energies_path} was computed on these geometries. " + _SCAN_REMEDY
+        )
+    digest = hash_array(_require_array(scan, "frames_nm", scan_path))
+    recorded_digest = energies.get("frames_sha256")
+    if recorded_digest is None:
+        raise ValidationError(
+            f"{energies_path} records no 'frames_sha256', so the fit cannot confirm it was "
+            "computed on this scan's geometries. It predates this check; re-run "
+            "'ffrefine mmscan'."
+        )
+    if recorded_digest != digest:
+        raise ValidationError(
+            f"{energies_path} was computed on different geometries than {scan_path} now "
+            "holds. Its 'phi_deg' and 'zeroed_potential_kj' therefore do not correspond to "
+            "this scan's frames, and the fit target would pair the new QM energies with "
+            "stale angles and a stale E_MM0. Re-run 'ffrefine mmscan' before fitting. "
+            "(Replacing only the QM 'energy_kj' column is fine and does not trigger this; "
+            "only the geometries are hashed.)"
+        )
+    return digest
+
+
 # ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
@@ -668,6 +817,11 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
     payload = {
         "quad": list(quad),
         "nframes": int(frames.shape[0]),
+        # Binds these energies to the geometries they were computed on, so
+        # 'fit' and 'validate' can refuse a stale pairing instead of trusting
+        # matching array lengths (see _check_stage_pairing).
+        "frames_sha256": hash_array(frames),
+        "frames_source": str(scan_path) if scan_path.exists() else str(args.structure),
         "phi_deg": [float(v) for v in result.phi_deg],
         "full_potential_kj": [float(v) for v in result.full_potential_kj],
         "zeroed_potential_kj": [float(v) for v in result.zeroed_potential_kj],
@@ -705,6 +859,10 @@ def cmd_fit(args: argparse.Namespace) -> int:
     )
     mm0 = _require_array(energies, "zeroed_potential_kj", energies_path)
     phi = _require_array(energies, "phi_deg", energies_path)
+
+    # Before anything numeric: are these two payloads even about the same
+    # torsion and the same geometries? Matching array lengths are not evidence.
+    frames_digest = _check_stage_pairing(quad, scan, scan_path, energies, energies_path)
 
     if not (qm.shape == mm0.shape == phi.shape):
         raise ValidationError(
@@ -795,7 +953,15 @@ def cmd_fit(args: argparse.Namespace) -> int:
     )
 
     outdir = stage_dir(args.outdir, "fit")
-    (outdir / "fit.json").write_text(json.dumps(fit_summary(result, phi, target), indent=2) + "\n")
+    provenance = {
+        "quad_1_based": list(quad),
+        "frames_sha256": frames_digest,
+        "scan_json": str(scan_path),
+        "energies_json": str(energies_path),
+    }
+    (outdir / "fit.json").write_text(
+        json.dumps(fit_summary(result, phi, target, provenance), indent=2) + "\n"
+    )
     write_refit_topology(
         topology,
         quad,
@@ -890,6 +1056,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
         raise ValidationError(
             f"{scan_path}: {qm.size} QM energies but {frames.shape[0]} geometries"
         )
+
+    # The fit records nothing about the torsion it was fitted for unless we put
+    # it there, so a --dihedral typo used to apply one torsion's parameters to
+    # another and report a confident RMSE for it.
+    _check_fit_applies_here(quad, fit_payload, fit_path, frames, scan_path)
 
     ff_includes = _ff_includes(args)
     settings = {

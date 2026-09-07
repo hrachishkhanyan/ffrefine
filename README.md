@@ -144,8 +144,20 @@ a scan to get one.
 
 `frames_nm` is in **nanometres**, in topology atom order. `energy_kj` is in
 **kJ/mol**, one value per frame, in the same order. Absolute offsets do not
-matter -- both profiles are referenced to their own minimum. Re-run `mmscan`
-once the file exists so the MM energies cover the scan geometries.
+matter -- both profiles are referenced to their own minimum.
+
+**Re-run `mmscan` once the file exists**, so the MM energies cover the scan
+geometries. `mmscan` records the digest of the `frames_nm` it saw, and `fit`
+and `validate` refuse to run against a `scan.json` whose geometries have
+changed since -- pairing new QM energies with stale angles and a stale `E_MM0`
+is silent, undetectable and wrong. Only the geometries are hashed, so replacing
+the `energy_kj` column alone (swapping in a better QM level, say) needs no
+re-run.
+
+The same check covers the target torsion: `energies.json` records the `quad` it
+was computed for and `fit.json` records the quad it was fitted for, so fitting
+one torsion's energies and writing the parameters onto another is an error
+rather than a plausible-looking answer.
 
 The angles used for fitting are then measured from those geometries, never from
 a requested grid (spec section 9.5).
