@@ -235,4 +235,6 @@ def write_multimodel_pdb(path: str | Path, structure: Structure, frames: np.ndar
             )
         out.append("ENDMDL")
     out.append("END")
-    Path(path).write_text("\n".join(out) + "\n")
+    # newline="\n" for consistency with every other file ffrefine hands to
+    # GROMACS (see ffrefine.mm.gromacs and ffrefine.io.topwriter).
+    Path(path).write_text("\n".join(out) + "\n", newline="\n")

@@ -20,6 +20,10 @@ include = ["ffrefine*"]
 
 [tool.black]
 line-length = 100
+# Without this, black infers a target from the source and warns
+# "Python 3.11 cannot parse code formatted for Python 3.15" on every run
+# before passing. requires-python is >=3.10, so pin the floor.
+target-version = ["py310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

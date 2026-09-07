@@ -79,13 +79,33 @@ def load_config(path: str | Path | None, cli_overrides: dict) -> dict:
 
     CLI values that are None mean "not supplied on the command line" and never
     override the file.
+
+    Args:
+        path: the ``--config`` file, or None.
+        cli_overrides: values from the command line; None means "not given".
+
+    Returns:
+        The merged settings.
+
+    Raises:
+        FFRefineError: the file is missing, is not valid JSON, or is valid
+            JSON that is not an object. Ruling R29: bad input never produces a
+            traceback, and a top-level JSON array used to reach ``dict.update``
+            and escape ``main``'s handler as a bare ``TypeError``.
     """
     merged: dict = {}
     if path is not None:
         try:
-            merged.update(json.loads(Path(path).read_text()))
+            data = json.loads(Path(path).read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise FFRefineError(f"could not read config file {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise FFRefineError(
+                f"config file {path} must contain a JSON object mapping option names to "
+                f'values, e.g. {{"outdir": "run1", "emax": 40}}; found a '
+                f"{type(data).__name__}."
+            )
+        merged.update(data)
     for key, value in cli_overrides.items():
         if value is not None:
             merged[key] = value

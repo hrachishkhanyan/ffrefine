@@ -1045,3 +1045,27 @@ def test_fit_labels_its_printed_statistics(tmp_path, butane_pdb, butane_itp, cap
     assert "profile" not in payload
     assert "correction_curve_profile" in payload
     assert "qm_profile" in payload
+
+
+def test_config_that_is_a_json_array_is_a_clean_error(tmp_path, butane_pdb, butane_itp, capsys):
+    """Item 8 / ruling R29: bad input must never produce a traceback.
+
+    A top-level JSON array reached dict.update and escaped main's
+    FFRefineError handler as a bare TypeError.
+    """
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text('["outdir", "run1"]')
+    argv = _base_args(butane_pdb, butane_itp, tmp_path / "o") + ["--config", str(cfg)]
+    assert main(["mmscan"] + argv + ["--dry-run"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "JSON object" in err
+    assert "list" in err
+
+
+def test_config_that_is_a_json_scalar_is_a_clean_error(tmp_path, butane_pdb, butane_itp, capsys):
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text("42")
+    argv = _base_args(butane_pdb, butane_itp, tmp_path / "o") + ["--config", str(cfg)]
+    assert main(["mmscan"] + argv + ["--dry-run"]) == 1
+    assert "JSON object" in capsys.readouterr().err

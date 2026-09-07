@@ -243,3 +243,11 @@ def test_adopt_topology_naming_leaves_real_names_alone(butane_pdb, butane_itp):
     s = read_pdb(butane_pdb)
     t = read_topology(butane_itp)
     assert adopt_topology_naming(s, t) is s
+
+
+def test_multimodel_pdb_uses_lf_line_endings(tmp_path, butane_pdb):
+    """Item 15: consistent with ffrefine.mm.gromacs and ffrefine.io.topwriter."""
+    s = read_pdb(butane_pdb)
+    out = tmp_path / "traj.pdb"
+    st.write_multimodel_pdb(out, s, np.stack([s.coords, s.coords]))
+    assert b"\r\n" not in out.read_bytes()
