@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
-from ffrefine.errors import ExternalToolError
+from ffrefine.config import Binaries
+from ffrefine.errors import ExternalToolError, ValidationError
 from ffrefine.io.structure import read_pdb
 from ffrefine.io.topology import read_topology
 from ffrefine.io.topwriter import make_system_top, write_zeroed_topology
@@ -136,3 +137,77 @@ def test_zeroing_lowers_proper_dihedral_energy(tmp_path, butane_pdb, butane_itp,
     ef = gromacs.single_point_energies(b, full_top, s, frames, tmp_path / "f", "full")
     ez = gromacs.single_point_energies(b, zero_top, s, frames, tmp_path / "z", "zero")
     assert ez.terms["Proper Dih."][0] < ef.terms["Proper Dih."][0]
+
+
+# --------------------------------------------------------------------------
+# cutoff guard (final review, item 6)
+# --------------------------------------------------------------------------
+
+
+def test_max_interatomic_distance_on_a_known_geometry():
+    frames = np.array([[[0.0, 0.0, 0.0], [3.0, 4.0, 0.0], [1.0, 1.0, 1.0]]])
+    assert gromacs.max_interatomic_distance(frames) == pytest.approx(5.0)
+
+
+def test_max_interatomic_distance_takes_the_worst_frame():
+    frames = np.array(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [7.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        ]
+    )
+    assert gromacs.max_interatomic_distance(frames) == pytest.approx(7.0)
+
+
+def test_max_interatomic_distance_handles_degenerate_input():
+    assert gromacs.max_interatomic_distance(np.zeros((0, 5, 3))) == 0.0
+    assert gromacs.max_interatomic_distance(np.zeros((3, 1, 3))) == 0.0
+
+
+def test_cutoff_guard_accepts_a_molecule_that_fits():
+    frames = np.zeros((2, 4, 3))
+    frames[:, 1, 0] = 2.9
+    gromacs._check_molecule_fits_cutoff(frames)  # must not raise
+
+
+def test_cutoff_guard_refuses_a_molecule_that_does_not_fit():
+    """Item 6: pairs beyond rvdw contribute nothing, and the spec 4.5
+    self-check cannot see it -- the truncation is identical in the full and
+    zeroed topologies and cancels in their difference."""
+    frames = np.zeros((2, 4, 3))
+    frames[1, 3, 0] = 3.5
+    with pytest.raises(ValidationError) as excinfo:
+        gromacs._check_molecule_fits_cutoff(frames)
+    msg = str(excinfo.value)
+    assert "3.500 nm" in msg
+    assert "cannot detect it" in msg
+
+
+def test_fallback_mdp_cutoffs_match_the_guard():
+    """The mdp and the guard must use one number, not two that can drift."""
+    for key in ("rlist", "rcoulomb", "rvdw"):
+        line = next(ln for ln in gromacs.FALLBACK_MDP.splitlines() if ln.startswith(key))
+        assert float(line.split("=")[1]) == pytest.approx(gromacs.FALLBACK_CUTOFF_NM)
+
+
+@pytest.mark.needs_gmx
+def test_oversized_molecule_is_refused_before_mdrun(tmp_path, butane_pdb, butane_itp, gmx_bin):
+    """End to end: the guard fires on the fallback path and no energies are
+    produced that a caller could mistake for correct ones."""
+    s = read_pdb(butane_pdb)
+    top = read_topology(butane_itp)
+    system = tmp_path / "topol.top"
+    itp = tmp_path / "mol.itp"
+    itp.write_text(butane_itp.read_text(), newline="\n")
+    make_system_top(itp, system, top.name)
+
+    stretched = s.coords.copy()
+    stretched[7:] += np.array([4.0, 0.0, 0.0])  # C3 side pushed 4 nm away
+    frames = np.stack([s.coords, stretched])
+
+    with pytest.raises(ValidationError, match="does not fit inside the MM cutoff"):
+        gromacs.single_point_energies(
+            Binaries(gmx=gmx_bin), system, s, frames, tmp_path / "wd", "sp"
+        )
+    assert not (tmp_path / "wd" / "sp.edr").exists()

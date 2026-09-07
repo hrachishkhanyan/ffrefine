@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from ..config import Binaries
-from ..errors import ExternalToolError
+from ..errors import ExternalToolError, ValidationError
 from ..io.structure import ANGSTROM_TO_NM, Structure
 from ..runner import run_command
 
@@ -43,22 +43,29 @@ nstcalcenergy           = 1
 nstenergy               = 1
 """
 
+FALLBACK_CUTOFF_NM = 3.0
+"""Cut-off radius in nm on the fallback path -- rlist, rcoulomb and rvdw alike.
+
+Named rather than repeated so :func:`_check_molecule_fits_cutoff` measures the
+molecule against the number the mdp actually uses, and the two cannot drift.
+"""
+
 # nstlist=10 here (vs. 0 in SP_MDP): the Verlet cutoff scheme on GROMACS
 # 2025.4 rejects nstlist=0 outright, independent of pbc/cutoffs -- confirmed
 # by Task 6's supplementary grompp check, where nstlist=10 succeeded. nsteps=0
 # makes the neighbour-list rebuild interval otherwise irrelevant here.
-FALLBACK_MDP = """\
+FALLBACK_MDP = f"""\
 integrator              = md
 nsteps                  = 0
 pbc                     = xyz
 cutoff-scheme           = Verlet
 verlet-buffer-tolerance = -1
 nstlist                 = 10
-rlist                   = 3.0
+rlist                   = {FALLBACK_CUTOFF_NM}
 coulombtype             = Cut-off
-rcoulomb                = 3.0
+rcoulomb                = {FALLBACK_CUTOFF_NM}
 vdwtype                 = Cut-off
-rvdw                    = 3.0
+rvdw                    = {FALLBACK_CUTOFF_NM}
 epsilon_r               = 1
 constraints             = none
 continuation            = yes
@@ -140,6 +147,72 @@ def _box_line(fallback: bool) -> np.ndarray | None:
     return np.array([FALLBACK_BOX_NM] * 3) if fallback else None
 
 
+def max_interatomic_distance(frames: np.ndarray) -> float:
+    """Largest distance between any two atoms, over every frame, in nm.
+
+    Args:
+        frames: shape (nframes, natoms, 3) in nm.
+
+    Returns:
+        The maximum pairwise distance, or 0.0 for fewer than two atoms.
+    """
+    arr = np.asarray(frames, dtype=float)
+    if arr.ndim != 3 or arr.shape[1] < 2 or arr.shape[0] == 0:
+        return 0.0
+    worst = 0.0
+    for frame in arr:
+        # The bounding-box diagonal is an exact upper bound on any pair
+        # distance in this frame, so a frame that cannot beat the running
+        # maximum is skipped without the O(natoms^2) pass.
+        if float(np.linalg.norm(frame.max(axis=0) - frame.min(axis=0))) <= worst:
+            continue
+        delta = frame[:, None, :] - frame[None, :, :]
+        worst = max(worst, float(np.sqrt((delta * delta).sum(axis=-1)).max()))
+    return worst
+
+
+def _check_molecule_fits_cutoff(frames: np.ndarray, cutoff_nm: float = FALLBACK_CUTOFF_NM) -> None:
+    """Refuse a molecule larger than the cutoff the fallback mdp applies.
+
+    The spec's literal zero-cutoff vacuum mdp cannot succeed on GROMACS 2020
+    or newer (it implies ``cutoff-scheme = group``, which was removed), so the
+    "fallback" is in practice the only path that ever runs.  A molecule whose
+    atom pairs exceed ``rvdw`` in some conformers silently loses those
+    interactions.
+
+    Nothing else can catch this.  The section 4.5 self-check compares
+    ``E_full - E_zeroed`` against the analytic torsion sum, and the truncation
+    is *identical* in both topologies -- so it cancels exactly in that
+    difference while still distorting ``E_MM0``, and therefore the fit target
+    and every parameter derived from it.
+
+    Args:
+        frames: shape (nframes, natoms, 3) in nm.
+        cutoff_nm: the mdp's rvdw/rcoulomb.
+
+    Raises:
+        ValidationError: some frame has a pair of atoms further apart than
+            ``cutoff_nm``.
+    """
+    span = max_interatomic_distance(frames)
+    if span <= cutoff_nm:
+        log.debug(
+            "largest interatomic distance %.3f nm, within the %.3g nm cutoff", span, cutoff_nm
+        )
+        return
+    raise ValidationError(
+        f"the molecule does not fit inside the MM cutoff: its largest interatomic distance "
+        f"over these {np.asarray(frames).shape[0]} frame(s) is {span:.3f} nm, but this "
+        f"GROMACS build rejected the spec's zero-cutoff vacuum mdp and the fallback path "
+        f"applies a {cutoff_nm:g} nm cutoff to both rvdw and rcoulomb (spec section 4.4).\n"
+        "  Every atom pair beyond that contributes nothing, so the nonbonded energy is "
+        "truncated. The spec 4.5 self-consistency check cannot detect it: the truncation is "
+        "identical in the full and zeroed topologies and cancels exactly in their "
+        "difference, while still distorting E_MM0 and the fit target built from it.\n"
+        "  ffrefine refines small molecules; it has no correct path for one this large."
+    )
+
+
 def single_point_energies(
     binaries: Binaries,
     topology_path: str | Path,
@@ -177,6 +250,9 @@ def single_point_energies(
 
     Raises:
         ExternalToolError: on any GROMACS failure or a frame-count mismatch.
+        ValidationError: the molecule is larger than the fallback path's
+            cutoff, so its nonbonded energy would be silently truncated (see
+            :func:`_check_molecule_fits_cutoff`).
     """
     gmx = binaries.require("gmx")
     workdir = Path(workdir)
@@ -256,6 +332,11 @@ def single_point_energies(
     log.info(
         "GROMACS single point using %s path", "large-box fallback" if used_fallback else "vacuum"
     )
+    if used_fallback:
+        # Only the fallback truncates anything: the vacuum mdp's rvdw = 0 means
+        # no cutoff at all. Checked before mdrun so no energies are produced
+        # that a caller could mistake for correct ones.
+        _check_molecule_fits_cutoff(frames)
 
     run_command(
         [
