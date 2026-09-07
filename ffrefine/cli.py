@@ -580,6 +580,30 @@ def _energies_path(args: argparse.Namespace) -> Path:
     return Path(args.outdir) / STAGE_DIRS["mm_scan"] / "energies.json"
 
 
+_STAGE_OUTPUTS: dict[str, tuple[str, ...]] = {
+    "mm_scan": ("energies.json",),
+    "fit": ("fit.json", "dihedral.itp", "dihedral.prm"),
+    "final": ("validation.json", "molecule_refined.itp", "after.itp"),
+}
+"""Files each stage must have left behind for ``--resume`` to skip it.
+
+A manifest records that a stage *ran*, not that its results survived: deleting
+``03_fit/fit.json`` and re-running with ``--resume`` printed "fit: skipping,
+... is current" and produced no file. Named here, one list per stage, rather
+than inline at each call site so a new output cannot be forgotten in one place
+and remembered in another."""
+
+
+def _stage_outputs(args: argparse.Namespace, stage: str) -> list[str | Path]:
+    """Paths ``stage`` must have produced, for the ``--resume`` liveness check.
+
+    Constructed with plain path joins, never :func:`stage_dir`, so checking
+    does not create the directory it is checking.
+    """
+    base = Path(args.outdir) / STAGE_DIRS[stage]
+    return [base / name for name in _STAGE_OUTPUTS[stage]]
+
+
 _SCAN_REMEDY = (
     "Run 'ffrefine scan' first -- but that stage is milestone 4 and is not implemented "
     "in this build, so supply the file yourself: a JSON object with 'energy_kj' (QM "
@@ -795,7 +819,9 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         "ff_includes": ff_includes,
     }
     digest = hash_inputs(inputs, settings)
-    if args.resume and stage_is_current(args.outdir, "mm_scan", digest):
+    if args.resume and stage_is_current(
+        args.outdir, "mm_scan", digest, _stage_outputs(args, "mm_scan")
+    ):
         print(f"mmscan: skipping, {_energies_path(args)} is current (--resume)")
         return 0
 
@@ -889,7 +915,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         "distribute": bool(args.distribute),
     }
     digest = hash_inputs([args.topology, scan_path, energies_path], settings)
-    if args.resume and stage_is_current(args.outdir, "fit", digest):
+    if args.resume and stage_is_current(args.outdir, "fit", digest, _stage_outputs(args, "fit")):
         print(f"fit: skipping, {Path(args.outdir) / STAGE_DIRS['fit']} is current (--resume)")
         return 0
 
@@ -1085,7 +1111,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "ff_includes": ff_includes,
     }
     digest = hash_inputs([args.topology, scan_path, fit_path], settings)
-    if args.resume and stage_is_current(args.outdir, "final", digest):
+    if args.resume and stage_is_current(
+        args.outdir, "final", digest, _stage_outputs(args, "final")
+    ):
         print(f"validate: skipping, {Path(args.outdir) / STAGE_DIRS['final']} is current")
         return 0
 

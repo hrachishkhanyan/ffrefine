@@ -177,7 +177,12 @@ def write_manifest(
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
 
 
-def stage_is_current(outdir: str | Path, stage: str, input_hash: str) -> bool:
+def stage_is_current(
+    outdir: str | Path,
+    stage: str,
+    input_hash: str,
+    outputs: list[str | Path] | None = None,
+) -> bool:
     """Decide whether a stage can be skipped under ``--resume``.
 
     Returns ``True`` only when the stage's manifest exists, parses as a JSON
@@ -206,9 +211,15 @@ def stage_is_current(outdir: str | Path, stage: str, input_hash: str) -> bool:
         stage: logical stage name, one of the keys of :data:`STAGE_DIRS`.
         input_hash: the hash (from :func:`hash_inputs`) of the stage's
             current inputs, to compare against what was recorded.
+        outputs: files the stage is expected to have left behind. A manifest
+            proves the stage *ran*, not that its results survived: deleting
+            ``03_fit/fit.json`` and re-running with ``--resume`` used to print
+            "fit: skipping, ... is current" and leave no file. Any of these
+            missing makes the stage stale. Paths are checked, never created.
 
     Returns:
-        Whether the previously completed stage's recorded inputs match.
+        Whether the previously completed stage's recorded inputs match and
+        its outputs are still on disk.
 
     Raises:
         ValidationError: if ``stage`` is not a recognised stage name (this
@@ -232,7 +243,15 @@ def stage_is_current(outdir: str | Path, stage: str, input_hash: str) -> bool:
         # recorded hash compared against a caller-supplied ``None`` would
         # degenerate to ``None == None`` and report a stale stage as current.
         return False
-    return recorded == input_hash
+    if recorded != input_hash:
+        return False
+    for output in outputs or ():
+        if not Path(output).exists():
+            logging.getLogger("ffrefine").info(
+                "stage %s has a current manifest but %s is missing; recomputing", stage, output
+            )
+            return False
+    return True
 
 
 def setup_logging(outdir: str | Path, verbose: bool = False) -> None:

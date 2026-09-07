@@ -1069,3 +1069,36 @@ def test_config_that_is_a_json_scalar_is_a_clean_error(tmp_path, butane_pdb, but
     argv = _base_args(butane_pdb, butane_itp, tmp_path / "o") + ["--config", str(cfg)]
     assert main(["mmscan"] + argv + ["--dry-run"]) == 1
     assert "JSON object" in capsys.readouterr().err
+
+
+def test_resume_reruns_when_a_stage_output_was_deleted(tmp_path, butane_pdb, butane_itp, capsys):
+    """Item 9: --resume trusted the manifest without checking the output
+    survived. Deleting 03_fit/fit.json and re-running with --resume printed
+    "fit: skipping, ... is current" and left no file."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    args = _base_args(butane_pdb, butane_itp, out)
+    assert main(["fit"] + args) == 0
+    fit_json = out / "03_fit" / "fit.json"
+    assert fit_json.is_file()
+
+    fit_json.unlink()
+    capsys.readouterr()
+    assert main(["fit"] + args + ["--resume"]) == 0
+    printed = capsys.readouterr().out
+    assert "skipping" not in printed
+    assert fit_json.is_file()
+
+
+def test_resume_reruns_when_a_secondary_output_was_deleted(tmp_path, butane_pdb, butane_itp):
+    """Not just the headline file: every artifact the stage promises."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    args = _base_args(butane_pdb, butane_itp, out)
+    assert main(["fit"] + args) == 0
+    prm = out / "03_fit" / "dihedral.prm"
+    prm.unlink()
+    assert main(["fit"] + args + ["--resume"]) == 0
+    assert prm.is_file()

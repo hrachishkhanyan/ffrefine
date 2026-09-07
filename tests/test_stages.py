@@ -219,3 +219,31 @@ def test_setup_logging_verbose_enables_debug(tmp_path):
     stages.setup_logging(tmp_path, verbose=True)
     logging.getLogger("ffrefine").debug("debug detail")
     assert "debug detail" in (tmp_path / "run.log").read_text()
+
+
+def test_stage_is_current_requires_the_named_outputs(tmp_path):
+    """Item 9: a manifest proves the stage ran, not that its results survived."""
+    digest = stages.hash_inputs([])
+    stages.write_manifest(tmp_path, "fit", digest)
+    out = stages.stage_dir(tmp_path, "fit") / "fit.json"
+    assert stages.stage_is_current(tmp_path, "fit", digest) is True
+    assert stages.stage_is_current(tmp_path, "fit", digest, [out]) is False
+    out.write_text("{}")
+    assert stages.stage_is_current(tmp_path, "fit", digest, [out]) is True
+
+
+def test_stage_is_current_needs_every_named_output(tmp_path):
+    digest = stages.hash_inputs([])
+    stages.write_manifest(tmp_path, "fit", digest)
+    d = stages.stage_dir(tmp_path, "fit")
+    (d / "a.json").write_text("{}")
+    assert stages.stage_is_current(tmp_path, "fit", digest, [d / "a.json"]) is True
+    assert stages.stage_is_current(tmp_path, "fit", digest, [d / "a.json", d / "b.itp"]) is False
+
+
+def test_stage_is_current_does_not_create_the_paths_it_checks(tmp_path):
+    digest = stages.hash_inputs([])
+    stages.write_manifest(tmp_path, "fit", digest)
+    missing = tmp_path / "03_fit" / "nope.json"
+    assert stages.stage_is_current(tmp_path, "fit", digest, [missing]) is False
+    assert not missing.exists()
