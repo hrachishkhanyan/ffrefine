@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..mm.torsionset import validate_quad
+from ..mm.torsionset import distinct_entry_keys, validate_quad
 from ..units import kj_to_kcal
 from .topology import Topology
 
@@ -32,6 +32,41 @@ _NO_DISTRIBUTE_WARNING = """\
 ! ================================================================="""
 
 
+def _distribute_note(quads: list[tuple[int, int, int, int, int]], central: tuple[int, int]) -> str:
+    """Comment block naming the quadruplets a distributed Kchi is spread over.
+
+    A CHARMM ``Kchi`` is a *per-quadruplet* constant and CHARMM sums the type
+    over every matching quadruplet, exactly as GROMACS sums its own
+    ``[ dihedrals ]`` lines.  So the value here must be the same
+    per-quadruplet constant written into the refit ``.itp``, i.e. the fitted
+    ``k_n`` divided by N_T -- not the undivided total.  Saying so in the file
+    is what lets a reader check it against ``03_fit/dihedral.itp`` by eye.
+    """
+    n_t = len(quads)
+    listed = "  ".join("-".join(str(i) for i in key[:4]) for key in quads)
+    wrapped: list[str] = []
+    row: list[str] = []
+    for item in listed.split("  "):
+        row.append(item)
+        if len(row) == 5:
+            wrapped.append("!   " + "  ".join(row))
+            row = []
+    if row:
+        wrapped.append("!   " + "  ".join(row))
+    return "\n".join(
+        [
+            "! Generated with --distribute.",
+            f"! The fitted force constants were spread evenly over the {n_t} distinct",
+            f"! quadruplets about the central bond ({central[0]}, {central[1]}), so each Kchi",
+            f"! below is the fitted k_n divided by {n_t} -- the same per-quadruplet value",
+            "! written to the refit dihedral.itp.  CHARMM sums this type over every",
+            "! matching quadruplet, as GROMACS does, so the two must agree.",
+            "! Quadruplets covered (1-based topology atom indices):",
+            *wrapped,
+        ]
+    )
+
+
 def write_prm_block(
     topology: Topology,
     quad: Quad,
@@ -46,18 +81,25 @@ def write_prm_block(
     Args:
         topology: supplies the atom types for the quadruplet.
         quad: 1-based (i, j, k, l), matching the topology's atom numbering.
-        k: force constants in kJ/mol; converted to kcal/mol on output via
-            :func:`ffrefine.units.kj_to_kcal` (the project's single unit
-            conversion point).
+        k: force constants in kJ/mol, as fitted -- i.e. the *total* over the
+            torsion set, exactly as handed to
+            :func:`ffrefine.io.topwriter.write_refit_topology`.  Converted to
+            kcal/mol on output via :func:`ffrefine.units.kj_to_kcal` (the
+            project's single unit conversion point), and divided by N_T when
+            ``distribute`` is set, so the emitted ``Kchi`` is the same
+            per-quadruplet constant the ``.itp`` carries.
         delta_deg: phases in degrees.
         mult: multiplicities.
         out_path: destination .prm fragment; the input topology is never
             modified.
         distribute: whether the fit was spread over all equivalent
-            quadruplets (spec section 9.7). When False the block is still
-            emitted, with a loud warning comment, because a type-level
-            CHARMM entry built from a molecule-specific fit is not
-            transferable.
+            quadruplets (spec section 9.7). When True each ``Kchi`` is scaled
+            by ``1 / N_T`` using the same denominator ``topwriter`` uses
+            (spec line 242, test 7: "divide the fitted k_n by the number of
+            equivalent quadruplets" -- unqualified, so it governs this file
+            too). When False the block is still emitted unscaled, with a loud
+            warning comment, because a type-level CHARMM entry built from a
+            molecule-specific fit is not transferable.
 
     Returns:
         The block text that was written to ``out_path``.
@@ -76,7 +118,15 @@ def write_prm_block(
     validate_quad(topology, quad)
     types = [topology.atoms[i - 1].atype for i in quad]  # 1-based -> 0-based
     lines: list[str] = []
-    if not distribute:
+    if distribute:
+        # Same denominator as topwriter.write_refit_topology, by construction:
+        # both call distinct_entry_keys. Distinct quadruplets (9 on butane),
+        # NOT term-lines (10) -- rulings R14/R17.
+        keys = distinct_entry_keys(topology, quad)
+        scale = 1.0 / len(keys)
+        lines.append(_distribute_note(keys, (quad[1], quad[2])))
+    else:
+        scale = 1.0
         lines.append(_NO_DISTRIBUTE_WARNING)
     lines.append("DIHEDRALS")
     lines.append("!atom types                          Kchi     n   delta")
@@ -87,7 +137,9 @@ def write_prm_block(
     # silently once a type is >= the field width.
     type_field = " ".join(f"{t:<8s}" for t in types)
     for kk, dd, nn in zip(np.atleast_1d(k), np.atleast_1d(delta_deg), np.atleast_1d(mult)):
-        lines.append(f"{type_field} {kj_to_kcal(float(kk)):>10.4f}{int(nn):>5d}{float(dd):>9.2f}")
+        lines.append(
+            f"{type_field} {kj_to_kcal(float(kk) * scale):>10.4f}" f"{int(nn):>5d}{float(dd):>9.2f}"
+        )
     lines.append("")
     lines.append("END")
     text = "\n".join(lines) + "\n"

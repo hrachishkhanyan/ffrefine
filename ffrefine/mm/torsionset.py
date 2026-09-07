@@ -73,6 +73,43 @@ def collect_torsion_set(topology: Topology, quad: Quad) -> list[Dihedral]:
     return [d for d in topology.propers if d.central_bond == target]
 
 
+EntryKey = tuple[int, int, int, int, int]
+"""``(ai, aj, ak, al, funct)`` -- the identity of a dihedral *quadruplet*."""
+
+
+def distinct_entry_keys(topology: Topology, quad: Quad) -> list[EntryKey]:
+    """The distinct quadruplets of T, in topology order.
+
+    :func:`collect_torsion_set` returns one entry per *term-line*, so a
+    funct-9 torsion split across several multiplicities appears more than once
+    (10 entries on the butane fixture, spanning 9 quadruplets -- rulings
+    R14/R17).  Distributing a fitted force constant is a per-*quadruplet*
+    operation, so N_T is the count returned here, never the term-line count.
+
+    Both writers of a ``--distribute`` artifact --
+    :func:`ffrefine.io.topwriter.write_refit_topology` (the ``.itp``) and
+    :func:`ffrefine.io.prm.write_prm_block` (the CHARMM block) -- take their
+    denominator from this one function, so the two cannot disagree.  They did
+    disagree by a factor of N_T before this was shared.
+
+    Args:
+        topology: parsed topology.
+        quad: 1-based (i, j, k, l); only j and k matter.
+
+    Returns:
+        Distinct entry keys, first-appearance order preserved.
+    """
+    seen: dict[EntryKey, None] = {}
+    for d in collect_torsion_set(topology, quad):
+        seen.setdefault((d.ai, d.aj, d.ak, d.al, d.funct), None)
+    return list(seen)
+
+
+def distribution_count(topology: Topology, quad: Quad) -> int:
+    """N_T: how many distinct quadruplets a ``--distribute`` fit is spread over."""
+    return len(distinct_entry_keys(topology, quad))
+
+
 def find_target_entries(topology: Topology, quad: Quad) -> list[Dihedral]:
     """The members of T matching the exact quadruplet, in either direction."""
     forward = tuple(quad)

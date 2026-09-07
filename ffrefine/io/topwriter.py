@@ -11,14 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
-from ..mm.torsionset import collect_torsion_set
+from ..mm.torsionset import EntryKey as _EntryKey
+from ..mm.torsionset import collect_torsion_set, distinct_entry_keys
 from .topology import Dihedral, Topology
 
 Quad = tuple[int, int, int, int]
 
 ZEROED_TEMPLATE = "{ai:6d}{aj:6d}{ak:6d}{al:6d}{funct:7d}{phi0:12.4f}{k:12.5f}{mult:6d}"
-
-_EntryKey = tuple[int, int, int, int, int]
 
 
 def _entry_key(d: Dihedral) -> _EntryKey:
@@ -157,10 +156,14 @@ def write_refit_topology(
             series onto the target quadruplet only and zeroes the rest, which
             is exact for this molecule but molecule-specific.
     """
-    tset = collect_torsion_set(topology, quad)
-    targets = {_entry_key(d) for d in tset}
+    # N_T is the number of distinct *quadruplets*, not term-lines (9 vs 10 on
+    # the butane fixture; rulings R14/R17).  It comes from the shared
+    # torsionset helper so the CHARMM .prm block written by the same fit gets
+    # the identical denominator.
+    keys = distinct_entry_keys(topology, quad)
+    targets = set(keys)
     forward, reverse = tuple(quad), tuple(reversed(quad))
-    n_t = len(targets)
+    n_t = len(keys)
 
     replacement: dict[_EntryKey, list[str]] = {}
     for key in targets:
