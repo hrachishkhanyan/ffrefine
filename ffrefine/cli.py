@@ -948,12 +948,24 @@ def cmd_fit(args: argparse.Namespace) -> int:
         f"\nselected multiplicities {list(chosen.mults)}: RMSE {result.rmse:.4f} kJ/mol, "
         f"max deviation {result.max_dev:.4f} kJ/mol"
     )
+    # These describe the fitted CORRECTION curve (the fit of dE = QM - MM0),
+    # not the molecule's torsion profile. Printing them unlabelled invited
+    # reading "largest barrier" as the syn barrier, which it is not: the
+    # refined torsion profile is MM plus this correction, and 'validate'
+    # reports that one.
     stats = profile_stats(phi, result.predicted)
+    print("\nfitted correction curve (dE = QM - MM0), NOT the torsion profile:")
     for angle, depth in zip(stats.minima_deg, stats.minima_kj):
-        print(f"  minimum at {angle:8.2f} deg, {depth:8.3f} kJ/mol")
+        print(f"  correction minimum at {angle:8.2f} deg, {depth:8.3f} kJ/mol")
     print(
-        f"  global minimum {stats.global_min_deg:.2f} deg, "
-        f"largest barrier {stats.max_barrier_kj:.3f} kJ/mol"
+        f"  correction global minimum {stats.global_min_deg:.2f} deg, "
+        f"largest correction swing {stats.max_barrier_kj:.3f} kJ/mol"
+    )
+    qm_stats = profile_stats(phi, qm)
+    print("QM reference profile (these ARE torsion barriers):")
+    print(
+        f"  global minimum {qm_stats.global_min_deg:.2f} deg, "
+        f"largest barrier {qm_stats.max_barrier_kj:.3f} kJ/mol"
     )
 
     outdir = stage_dir(args.outdir, "fit")
@@ -964,7 +976,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         "energies_json": str(energies_path),
     }
     (outdir / "fit.json").write_text(
-        json.dumps(fit_summary(result, phi, target, provenance), indent=2) + "\n"
+        json.dumps(fit_summary(result, phi, target, provenance, qm_kj=qm), indent=2) + "\n"
     )
     write_refit_topology(
         topology,

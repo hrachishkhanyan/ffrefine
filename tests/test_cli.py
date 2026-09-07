@@ -1025,3 +1025,23 @@ def test_xyz_input_runs_mmscan_and_matches_the_pdb(
     b = json.loads((from_pdb / "02_mm_scan" / "energies.json").read_text())
     assert a["full_potential_kj"] == pytest.approx(b["full_potential_kj"], abs=1e-4)
     assert a["selfcheck_max_abs_error_kj"] < 1e-3
+
+
+def test_fit_labels_its_printed_statistics(tmp_path, butane_pdb, butane_itp, capsys):
+    """Item 7: the printed minima and barriers are the fitted CORRECTION
+    curve's, and used to be unlabelled -- read as the torsion's own."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 14.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    printed = capsys.readouterr().out
+    assert "fitted correction curve" in printed
+    assert "NOT the torsion profile" in printed
+    assert "QM reference profile" in printed
+    # No bare, unqualified claim about a barrier survives.
+    assert "  minimum at" not in printed
+
+    payload = json.loads((out / "03_fit" / "fit.json").read_text())
+    assert "profile" not in payload
+    assert "correction_curve_profile" in payload
+    assert "qm_profile" in payload

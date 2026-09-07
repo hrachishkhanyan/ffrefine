@@ -94,6 +94,7 @@ def fit_summary(
     phi_deg: np.ndarray,
     target_kj: np.ndarray,
     provenance: dict | None = None,
+    qm_kj: np.ndarray | None = None,
 ) -> dict:
     """Build the JSON-serialisable fit record written to fit.json (spec 4.8).
 
@@ -112,6 +113,10 @@ def fit_summary(
             verbatim under ``"provenance"``. ``validate`` reads
             ``quad_1_based`` and ``frames_sha256`` back out of it to refuse
             applying this fit to a different torsion or a different scan.
+        qm_kj: the QM reference profile, kJ/mol, same shape as ``phi_deg``.
+            When given, its own minima and barriers are reported under
+            ``"qm_profile"``. Those are *torsion* barriers; the ones under
+            ``"correction_curve_profile"`` are not.
 
     Returns:
         A dict safe to pass to ``json.dumps``.
@@ -133,6 +138,7 @@ def fit_summary(
         )
 
     stats = profile_stats(phi_arr, result.predicted)
+    qm_stats = None if qm_kj is None else profile_stats(phi_arr, np.asarray(qm_kj, dtype=float))
     return {
         "provenance": dict(provenance or {}),
         "multiplicities": [int(m) for m in result.mults],
@@ -155,11 +161,39 @@ def fit_summary(
         "target_kj_per_mol": [float(v) for v in target_arr],
         "fitted_kj_per_mol": [float(v) for v in result.predicted],
         "residuals_kj_per_mol": [float(v) for v in result.residuals],
-        "profile": {
+        # NOT the torsion profile. These describe the fitted CORRECTION
+        # curve -- the fit of dE = QM - MM0 -- whose minima and barriers are
+        # unrelated to the molecule's actual torsion barriers. Reading them as
+        # "the syn barrier" is the mistake this key name exists to prevent.
+        "correction_curve_profile": {
+            "what_this_describes": (
+                "the fitted correction curve sum_n k_n [1 + cos(n phi - delta_n)], "
+                "i.e. the fit of dE = (E_QM - min E_QM) - (E_MM0 - min E_MM0). These "
+                "are NOT the torsion's own minima and barriers; the refined torsion "
+                "profile is MM plus this correction, reported by 'ffrefine validate'."
+            ),
             "minima_deg": stats.minima_deg,
             "minima_kj_per_mol": stats.minima_kj,
             "barriers_kj_per_mol": stats.barriers_kj,
             "global_minimum_deg": stats.global_min_deg,
             "max_barrier_kj_per_mol": stats.max_barrier_kj,
         },
+        **(
+            {}
+            if qm_stats is None
+            else {
+                "qm_profile": {
+                    "what_this_describes": (
+                        "the QM reference profile from 01_qm_scan/scan.json, as supplied. "
+                        "These ARE torsion minima and barriers, and are the numbers to "
+                        "compare against a literature expectation."
+                    ),
+                    "minima_deg": qm_stats.minima_deg,
+                    "minima_kj_per_mol": qm_stats.minima_kj,
+                    "barriers_kj_per_mol": qm_stats.barriers_kj,
+                    "global_minimum_deg": qm_stats.global_min_deg,
+                    "max_barrier_kj_per_mol": qm_stats.max_barrier_kj,
+                }
+            }
+        ),
     }

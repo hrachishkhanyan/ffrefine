@@ -192,7 +192,14 @@ Useful flags:
   reusable dihedral type.
 
 Physically expected for butane: a 3-fold profile, trans as the global minimum,
-gauche roughly 2.5-3.5 kJ/mol above trans, syn barrier 14-20 kJ/mol.
+gauche roughly 2.5-3.5 kJ/mol above trans, syn barrier 14-20 kJ/mol. **Check
+that against the QM profile, not against the fit's own minima and barriers.**
+`fit` reports two sets of numbers and labels them: the *fitted correction
+curve* is the fit of `dE = QM - MM0`, so its "largest correction swing" is the
+size of the repair, not a torsion barrier; the *QM reference profile* block is
+the one to compare with a literature expectation. `fit.json` keeps the same
+split under `correction_curve_profile` and `qm_profile`. The refined torsion
+profile itself is MM plus the correction, and `validate` is what reports it.
 
 ### 4. Validate
 

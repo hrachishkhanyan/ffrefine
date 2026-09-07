@@ -97,3 +97,39 @@ def test_profile_stats_rejects_shape_mismatch():
 def test_profile_stats_rejects_empty_input():
     with pytest.raises(ValidationError, match="empty"):
         profile_stats(np.array([]), np.array([]))
+
+
+# --------------------------------------------------------------------------
+# labelling (final review, item 7)
+# --------------------------------------------------------------------------
+
+
+def test_fit_summary_labels_the_correction_curve_not_the_torsion_profile():
+    """Item 7: the stats are of the fit of dE = QM - MM0 -- the correction --
+    not the torsion profile. The old key was a bare "profile", which a user
+    holding a "syn barrier 14-20 kJ/mol" expectation reads as the torsion's."""
+    phi = np.linspace(-180.0, 180.0, 24, endpoint=False)
+    target = 5.0 * (1.0 + np.cos(np.radians(3.0 * phi)))
+    result = fit_cosine_series(phi, target, [3])
+    payload = fit_summary(result, phi, target)
+    assert "profile" not in payload
+    block = payload["correction_curve_profile"]
+    assert "NOT the torsion" in block["what_this_describes"]
+    assert "max_barrier_kj_per_mol" in block
+    # No QM profile unless one is supplied.
+    assert "qm_profile" not in payload
+
+
+def test_fit_summary_reports_the_qm_profile_separately():
+    phi = np.linspace(-180.0, 180.0, 24, endpoint=False)
+    target = 5.0 * (1.0 + np.cos(np.radians(3.0 * phi)))
+    qm = 14.0 * (1.0 + np.cos(np.radians(3.0 * phi)))
+    result = fit_cosine_series(phi, target, [3])
+    payload = fit_summary(result, phi, target, qm_kj=qm)
+    qm_block = payload["qm_profile"]
+    assert "ARE torsion minima and barriers" in qm_block["what_this_describes"]
+    # The two blocks describe genuinely different curves.
+    assert qm_block["max_barrier_kj_per_mol"] == pytest.approx(28.0, abs=0.5)
+    assert payload["correction_curve_profile"]["max_barrier_kj_per_mol"] == pytest.approx(
+        10.0, abs=0.5
+    )
