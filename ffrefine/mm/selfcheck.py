@@ -9,9 +9,15 @@ precision (see ``ffrefine.mm.gromacs._write_g96_trajectory``) must be matched
 exactly, or the comparison measures the transport's precision rather than the
 correctness of the topology edit.
 
-Failing this means the topology edit did not do what was intended -- most
-often that explicit parameters did not suppress the [ dihedraltypes ] lookup as
-assumed.  On failure the pipeline aborts; it never proceeds to fitting.
+Failing this means the topology edit did not do what was intended.  On failure
+the pipeline aborts; it never proceeds to fitting.
+
+One case that used to reach that failure and be *misdiagnosed* is now refused
+up front by ``_reject_typed_terms``: a torsion set containing terms whose
+parameters live in [ dihedraltypes ] rather than on the line.  The analytic
+reference cannot be built for those at all, so the check would compare a real
+GROMACS energy against an analytic zero.  Explicit parameters *do* suppress the
+[ dihedraltypes ] lookup -- that was never the cause.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from ..io.topwriter import make_system_top, write_zeroed_topology
 from ..io.validate import validate_structure_topology
 from .analytic import torsion_set_energy
 from .gromacs import single_point_energies
+from .torsionset import collect_torsion_set
 
 log = logging.getLogger("ffrefine")
 
@@ -73,6 +80,60 @@ def _as_gromacs_saw_it(frames: np.ndarray) -> np.ndarray:
         The same coordinates, rounded to the g96 trajectory's precision.
     """
     return np.round(np.asarray(frames, dtype=float), _G96_COORD_DECIMALS)
+
+
+def _reject_typed_terms(topology: Topology, quad: tuple[int, int, int, int]) -> None:
+    """Refuse a torsion set containing terms with no explicit parameters.
+
+    ``torsion_set_energy`` contributes zero for any entry whose parameters
+    live in ``[ dihedraltypes ]`` rather than on the line, because this build
+    reads the molecule topology only and never the force field's type tables.
+    The section 4.5 check would then compare GROMACS's real torsion energy
+    against an analytic *zero* and fail -- with a diagnosis blaming the
+    topology edit.
+
+    That diagnosis was false.  Explicit parameters do suppress the
+    ``[ dihedraltypes ]`` lookup: a butane variant carrying
+    ``X CG321 CG321 X 9 0.0 20.0 3`` passes the check at 9.7e-6 kJ/mol on
+    GROMACS 2025.4 (pinned by
+    ``tests/test_selfcheck.py::test_dihedraltypes_entry_is_suppressed_by_explicit_params``).
+    The real limitation is that the analytic reference cannot be built for a
+    term whose parameters this build never read.  A CGenFF or GAFF molecule
+    ``.itp`` that relies on type lookup is the normal case, so the message has
+    to say exactly that.
+
+    Args:
+        topology: parsed topology.
+        quad: 1-based target quadruplet.
+
+    Raises:
+        ValidationError: any member of T carries no explicit parameters.
+    """
+    tset = collect_torsion_set(topology, quad)
+    typed = [d for d in tset if not d.params]
+    if not typed:
+        return
+    listed = "".join(f"      {d.ai} {d.aj} {d.ak} {d.al}   funct {d.funct}\n" for d in typed[:8])
+    if len(typed) > 8:
+        listed += f"      ... and {len(typed) - 8} more\n"
+    raise ValidationError(
+        f"cannot run the spec 4.5 self-consistency check on {topology.source}: "
+        f"{len(typed)} of the {len(tset)} proper dihedral term-line(s) about the central "
+        f"bond ({quad[1]}, {quad[2]}) carry no explicit parameters, so GROMACS takes them "
+        f"from [ dihedraltypes ]:\n"
+        f"{listed}"
+        "  This build reads the molecule topology only -- it never reads the force "
+        "field's [ dihedraltypes ] tables -- so it has no force constant, phase or "
+        "multiplicity for those terms and cannot build the analytic reference the check "
+        "compares against. It would compare GROMACS's real torsion energy against an "
+        "analytic zero.\n"
+        "  This is NOT a failure of the topology edit: explicit parameters do suppress "
+        "the [ dihedraltypes ] lookup (verified against GROMACS 2025.4).\n"
+        "  Remedy: give those [ dihedrals ] lines explicit parameters -- the phase, k and "
+        "multiplicity your force field assigns them -- in a copy of the topology, and "
+        "re-run against the copy. Your input file is never modified. See 'What this "
+        "build cannot read' in the README."
+    )
 
 
 @dataclass
@@ -148,6 +209,11 @@ def check_torsion_removal(
     for warning in validate_structure_topology(structure, topology, strict_names=strict_names):
         log.warning("structure/topology validation: %s", warning)
 
+    # Refuse typed terms BEFORE spending two GROMACS reruns on a comparison
+    # that cannot succeed, and before reporting a false cause. See
+    # _typed_terms_message for why the old post-hoc diagnosis was wrong.
+    _reject_typed_terms(topology, quad)
+
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -209,8 +275,10 @@ def check_torsion_removal(
             f"    analytic reference : {analytic_difference[worst]:.6f} kJ/mol\n"
             f"  {len(removed)} dihedral entries were zeroed about the central bond "
             f"({quad[1]}, {quad[2]}).\n"
-            "  The topology edit did not do what was intended -- most likely the "
-            "explicit zero parameters did not suppress the [ dihedraltypes ] lookup. "
+            "  The topology edit did not do what was intended. Every term about this "
+            "bond carries explicit parameters (checked before the run), so this is not a "
+            "[ dihedraltypes ] lookup leaking through. "
+            ""
             f"  Inspect {zero_itp} and the GROMACS logs under {workdir}. "
             "Fitting is aborted."
         )
