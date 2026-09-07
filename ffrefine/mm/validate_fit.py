@@ -27,7 +27,7 @@ from ..config import Binaries
 from ..geometry import dihedral_deg_frames
 from ..io.structure import Structure
 from ..io.topology import Topology
-from ..io.topwriter import make_system_top, write_refit_topology
+from ..io.topwriter import make_system_top, write_molecule_copy, write_refit_topology
 from ..io.validate import validate_structure_topology
 from .gromacs import single_point_energies
 from .torsionset import validate_quad
@@ -103,6 +103,7 @@ def validate_refit(
     distribute: bool = False,
     nthreads: int = 1,
     strict_names: bool = True,
+    ff_includes: list[str] | None = None,
 ) -> ValidationResult:
     """Compare MM against QM before and after applying the fitted parameters.
 
@@ -160,6 +161,10 @@ def validate_refit(
             argument on
             :func:`ffrefine.mm.selfcheck.check_torsion_removal`. Atom count
             and element ordering stay fatal either way.
+        ff_includes: force-field ``#include`` lines to emit ahead of the
+            molecule in both generated wrapper ``.top`` files (the CLI's
+            ``--ff-include``); see the identical argument on
+            :func:`ffrefine.mm.selfcheck.check_torsion_removal`.
 
     Returns:
         RMSE before and after, and the profiles behind them.
@@ -183,14 +188,14 @@ def validate_refit(
     workdir.mkdir(parents=True, exist_ok=True)
 
     before_itp = workdir / "before.itp"
-    before_itp.write_text(Path(topology.source).read_text())
+    write_molecule_copy(topology.source, before_itp)
     before_top = workdir / "before.top"
-    make_system_top(before_itp, before_top, topology.name)
+    make_system_top(before_itp, before_top, topology.name, ff_includes)
 
     after_itp = workdir / "after.itp"
     write_refit_topology(topology, quad, k, delta_deg, mult, after_itp, distribute=distribute)
     after_top = workdir / "after.top"
-    make_system_top(after_itp, after_top, topology.name)
+    make_system_top(after_itp, after_top, topology.name, ff_includes)
 
     e_before = single_point_energies(
         binaries, before_top, structure, frames, workdir / "before", "before", nthreads

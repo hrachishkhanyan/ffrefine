@@ -1,7 +1,13 @@
 import numpy as np
 import pytest
 from ffrefine.io.topology import read_topology
-from ffrefine.io.topwriter import make_system_top, write_refit_topology, write_zeroed_topology
+from ffrefine.io.topwriter import (
+    make_system_top,
+    strip_system_sections,
+    write_molecule_copy,
+    write_refit_topology,
+    write_zeroed_topology,
+)
 from ffrefine.mm.torsionset import collect_torsion_set
 
 
@@ -151,3 +157,105 @@ def test_make_system_top(tmp_path, butane_itp):
     assert "mol.itp" in text
     assert "[ molecules ]" in text
     assert "BUT" in text
+
+
+SYSTEM_TAIL = """
+
+[ system ]
+butane in vacuum
+
+[ molecules ]
+BUT     1
+"""
+
+
+def _butane_top(tmp_path, butane_itp):
+    """A molecule .top: butane plus its own [ system ] / [ molecules ]."""
+    src = tmp_path / "butane.top"
+    src.write_text(butane_itp.read_text() + SYSTEM_TAIL, newline="\n")
+    return src
+
+
+def test_strip_system_sections_drops_both_and_keeps_the_rest(tmp_path, butane_itp):
+    src = _butane_top(tmp_path, butane_itp)
+    kept, dropped = strip_system_sections(src.read_text().splitlines())
+    assert dropped == ["system", "molecules"]
+    body = "\n".join(kept)
+    assert "[ system ]" not in body
+    assert "[ molecules ]" not in body
+    assert "butane in vacuum" not in body
+    # Everything the molecule needs survives untouched.
+    assert "[ moleculetype ]" in body
+    assert "[ atomtypes ]" in body
+    assert "[ dihedrals ]" in body
+
+
+def test_strip_system_sections_is_a_no_op_for_a_plain_itp(butane_itp):
+    kept, dropped = strip_system_sections(butane_itp.read_text().splitlines())
+    assert dropped == []
+    assert kept == butane_itp.read_text().splitlines()
+
+
+def test_molecule_top_input_yields_a_single_molecule_wrapper(tmp_path, butane_itp):
+    """Item 4: spec section 2 promises -p accepts a molecule .top.
+
+    Before the fix the source was copied verbatim, so the wrapper declared the
+    molecule twice and grompp aborted with "number of coordinates in
+    coordinate file (14) does not match topology (28)".
+    """
+    src = _butane_top(tmp_path, butane_itp)
+    copy = tmp_path / "full.itp"
+    dropped = write_molecule_copy(src, copy)
+    assert dropped == ["system", "molecules"]
+
+    top = tmp_path / "full.top"
+    make_system_top(copy, top, "BUT")
+    combined = copy.read_text() + top.read_text()
+    assert combined.count("[ molecules ]") == 1
+    assert combined.count("[ system ]") == 1
+
+
+def test_zeroed_and_refit_outputs_carry_no_system_sections(tmp_path, butane_itp):
+    """Both rewriters feed make_system_top, so neither may pass those through."""
+    t = read_topology(_butane_top(tmp_path, butane_itp))
+    zeroed = tmp_path / "zeroed.itp"
+    write_zeroed_topology(t, (1, 5, 8, 11), zeroed)
+    refit = tmp_path / "refit.itp"
+    write_refit_topology(t, (1, 5, 8, 11), np.array([1.0]), np.array([0.0]), np.array([3]), refit)
+    for path in (zeroed, refit):
+        text = path.read_text()
+        assert "[ system ]" not in text, path.name
+        assert "[ molecules ]" not in text, path.name
+        assert "[ moleculetype ]" in text, path.name
+
+
+def test_make_system_top_emits_ff_includes_before_the_molecule(tmp_path, butane_itp):
+    """Item 4: the `includes` parameter was wired to nothing."""
+    itp = tmp_path / "mol.itp"
+    itp.write_text(butane_itp.read_text(), newline="\n")
+    top = tmp_path / "topol.top"
+    make_system_top(itp, top, "BUT", ["charmm36.ff/forcefield.itp", "extra.itp"])
+    text = top.read_text()
+    assert '#include "charmm36.ff/forcefield.itp"' in text
+    assert '#include "extra.itp"' in text
+    # Order matters to grompp: force field first, molecule after, system last.
+    assert (
+        text.index("charmm36.ff/forcefield.itp")
+        < text.index("extra.itp")
+        < text.index("mol.itp")
+        < text.index("[ system ]")
+    )
+
+
+def test_writers_emit_lf_line_endings(tmp_path, butane_itp):
+    """Item 15: consistent with ffrefine.mm.gromacs, which passes newline at
+    every one of its write sites."""
+    t = read_topology(butane_itp)
+    zeroed = tmp_path / "zeroed.itp"
+    write_zeroed_topology(t, (1, 5, 8, 11), zeroed)
+    refit = tmp_path / "refit.itp"
+    write_refit_topology(t, (1, 5, 8, 11), np.array([1.0]), np.array([0.0]), np.array([3]), refit)
+    top = tmp_path / "topol.top"
+    make_system_top(zeroed, top, "BUT")
+    for path in (zeroed, refit, top):
+        assert b"\r\n" not in path.read_bytes(), path.name

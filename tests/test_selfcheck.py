@@ -195,3 +195,77 @@ def test_dihedraltypes_entry_is_suppressed_by_explicit_params(
         Binaries(gmx=gmx_bin), read_topology(butane_itp), (1, 5, 8, 11), s, frames, tmp_path / "p"
     )
     assert np.allclose(r.full_potential_kj, plain.full_potential_kj, atol=0.0, rtol=0.0)
+
+
+SYSTEM_TAIL = """
+
+[ system ]
+butane in vacuum
+
+[ molecules ]
+BUT     1
+"""
+
+
+@pytest.mark.needs_gmx
+def test_molecule_top_input_reaches_grompp(tmp_path, butane_pdb, butane_itp, gmx_bin):
+    """Item 4: spec section 2 says -p takes an .itp *or a .top*.
+
+    Pre-fix the source was copied verbatim into full.itp and then wrapped, so
+    the system declared BUT twice and grompp aborted with "number of
+    coordinates in coordinate file (14) does not match topology (28)".
+    """
+    from ffrefine.config import Binaries
+
+    top = tmp_path / "butane.top"
+    top.write_text(butane_itp.read_text() + SYSTEM_TAIL, newline="\n")
+    s = read_pdb(butane_pdb)
+    t = read_topology(top)
+    r = selfcheck.check_torsion_removal(
+        Binaries(gmx=gmx_bin), t, (1, 5, 8, 11), s, s.coords[None, :, :], tmp_path / "wd"
+    )
+    assert r.passed
+    # And the same answer a plain .itp gives -- the tail was cosmetic.
+    plain = selfcheck.check_torsion_removal(
+        Binaries(gmx=gmx_bin),
+        read_topology(butane_itp),
+        (1, 5, 8, 11),
+        s,
+        s.coords[None, :, :],
+        tmp_path / "plain",
+    )
+    assert r.full_potential_kj == pytest.approx(plain.full_potential_kj, abs=0.0, rel=0.0)
+
+
+@pytest.mark.needs_gmx
+def test_ff_include_supplies_missing_atomtypes(tmp_path, butane_pdb, butane_itp, gmx_bin):
+    """Item 4: make_system_top's `includes` parameter was wired to nothing.
+
+    butane.itp is split into a force-field half ([ defaults ] + [ atomtypes ])
+    and a molecule half. The molecule half alone cannot be grompp'd -- grompp
+    rejects it with "Atomtype CG331 not found" -- so this passes only if
+    --ff-include actually reaches the generated wrapper .top.
+    """
+    from ffrefine.config import Binaries
+
+    text = butane_itp.read_text()
+    head, _, tail = text.partition("[ moleculetype ]")
+    assert tail, "fixture layout changed"
+    ff = tmp_path / "ff.itp"
+    ff.write_text(head, newline="\n")
+    mol = tmp_path / "mol.itp"
+    mol.write_text("[ moleculetype ]" + tail, newline="\n")
+
+    s = read_pdb(butane_pdb)
+    t = read_topology(mol)
+    r = selfcheck.check_torsion_removal(
+        Binaries(gmx=gmx_bin),
+        t,
+        (1, 5, 8, 11),
+        s,
+        s.coords[None, :, :],
+        tmp_path / "wd",
+        ff_includes=[str(ff)],
+    )
+    assert r.passed
+    assert f'#include "{ff}"' in (tmp_path / "wd" / "full.top").read_text()

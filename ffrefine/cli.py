@@ -219,6 +219,17 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="downgrade atom-name mismatches to warnings",
     )
+    parser.add_argument(
+        "--ff-include",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "force field .itp to #include ahead of the molecule in the generated "
+            "wrapper .top; repeatable, in order. Needed when the molecule topology "
+            "has no [ atomtypes ] of its own."
+        ),
+    )
 
 
 def _add_torsion(parser: argparse.ArgumentParser) -> None:
@@ -405,6 +416,23 @@ def _warn(message: str) -> None:
         log.warning(message)
     else:
         print(f"warning: {message}", file=sys.stderr)
+
+
+def _ff_includes(args: argparse.Namespace) -> list[str]:
+    """Resolve ``--ff-include`` paths for the generated wrapper ``.top``.
+
+    The wrapper lives in the stage directory, not the user's cwd, so a plain
+    relative path the user typed would not resolve there.  A value naming a
+    file we can actually see is therefore absolutised; anything else is passed
+    through verbatim, because the common case
+    (``charmm36.ff/forcefield.itp``) is resolved by grompp against GMXLIB and
+    must not be rewritten.
+    """
+    out: list[str] = []
+    for value in getattr(args, "ff_include", None) or []:
+        candidate = Path(value)
+        out.append(str(candidate.resolve()) if candidate.exists() else str(value))
+    return out
 
 
 def _binaries(args: argparse.Namespace) -> Binaries:
@@ -607,7 +635,12 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
             "a torsion profile: " + _SCAN_REMEDY
         )
 
-    settings = {"quad": list(quad), "nframes": int(frames.shape[0])}
+    ff_includes = _ff_includes(args)
+    settings = {
+        "quad": list(quad),
+        "nframes": int(frames.shape[0]),
+        "ff_includes": ff_includes,
+    }
     digest = hash_inputs(inputs, settings)
     if args.resume and stage_is_current(args.outdir, "mm_scan", digest):
         print(f"mmscan: skipping, {_energies_path(args)} is current (--resume)")
@@ -624,6 +657,7 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         workdir,
         args.nthreads,
         strict_names=not args.no_strict_names,
+        ff_includes=ff_includes,
     )
     print(
         f"torsion {quad}: spec 4.5 self-consistency check passed over "
@@ -857,7 +891,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
             f"{scan_path}: {qm.size} QM energies but {frames.shape[0]} geometries"
         )
 
-    settings = {"quad": list(quad), "distribute": bool(args.distribute)}
+    ff_includes = _ff_includes(args)
+    settings = {
+        "quad": list(quad),
+        "distribute": bool(args.distribute),
+        "ff_includes": ff_includes,
+    }
     digest = hash_inputs([args.topology, scan_path, fit_path], settings)
     if args.resume and stage_is_current(args.outdir, "final", digest):
         print(f"validate: skipping, {Path(args.outdir) / STAGE_DIRS['final']} is current")
@@ -879,6 +918,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         distribute=args.distribute,
         nthreads=args.nthreads,
         strict_names=not args.no_strict_names,
+        ff_includes=ff_includes,
     )
 
     print(

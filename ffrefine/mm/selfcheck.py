@@ -33,7 +33,7 @@ from ..errors import ValidationError
 from ..geometry import dihedral_deg_frames
 from ..io.structure import Structure
 from ..io.topology import Topology
-from ..io.topwriter import make_system_top, write_zeroed_topology
+from ..io.topwriter import make_system_top, write_molecule_copy, write_zeroed_topology
 from ..io.validate import validate_structure_topology
 from .analytic import torsion_set_energy
 from .gromacs import single_point_energies
@@ -169,6 +169,7 @@ def check_torsion_removal(
     nthreads: int = 1,
     tolerance: float = DEFAULT_TOLERANCE,
     strict_names: bool = True,
+    ff_includes: list[str] | None = None,
 ) -> SelfCheckResult:
     """Verify that zeroing removed exactly the intended torsion terms.
 
@@ -191,6 +192,10 @@ def check_torsion_removal(
             :func:`ffrefine.io.validate.validate_structure_topology` names in
             its own error message -- actually reaches this call, instead of
             being overridden by a strict re-check here.
+        ff_includes: force-field ``#include`` lines to emit ahead of the
+            molecule in the generated wrapper ``.top`` (the CLI's
+            ``--ff-include``). Needed when the molecule topology has no
+            ``[ atomtypes ]`` of its own.
 
     Returns:
         The check result when it passes.
@@ -218,14 +223,14 @@ def check_torsion_removal(
     workdir.mkdir(parents=True, exist_ok=True)
 
     full_itp = workdir / "full.itp"
-    full_itp.write_text(Path(topology.source).read_text())
+    write_molecule_copy(topology.source, full_itp)
     full_top = workdir / "full.top"
-    make_system_top(full_itp, full_top, topology.name)
+    make_system_top(full_itp, full_top, topology.name, ff_includes)
 
     zero_itp = workdir / "zeroed.itp"
     removed = write_zeroed_topology(topology, quad, zero_itp)
     zero_top = workdir / "zeroed.top"
-    make_system_top(zero_itp, zero_top, topology.name)
+    make_system_top(zero_itp, zero_top, topology.name, ff_includes)
 
     e_full = single_point_energies(
         binaries, full_top, structure, frames, workdir / "full", "full", nthreads

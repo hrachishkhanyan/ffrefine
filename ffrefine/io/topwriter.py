@@ -7,6 +7,7 @@ Rewriting is line-oriented: everything the parser does not model -- comments,
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -15,9 +16,84 @@ from ..mm.torsionset import EntryKey as _EntryKey
 from ..mm.torsionset import collect_torsion_set, distinct_entry_keys
 from .topology import Dihedral, Topology
 
+log = logging.getLogger("ffrefine")
+
 Quad = tuple[int, int, int, int]
 
 ZEROED_TEMPLATE = "{ai:6d}{aj:6d}{ak:6d}{al:6d}{funct:7d}{phi0:12.4f}{k:12.5f}{mult:6d}"
+
+
+_WRAPPER_SECTIONS = frozenset({"system", "molecules"})
+"""Sections :func:`make_system_top` supplies itself, so a molecule copy must
+not also carry them."""
+
+
+def strip_system_sections(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Drop ``[ system ]`` and ``[ molecules ]`` blocks from a topology's lines.
+
+    Spec section 2 promises ``-p`` accepts "``.itp`` or ``.top`` for the
+    molecule", and a molecule ``.top`` normally ends with those two sections.
+    Every grompp-facing copy this module writes is wrapped by
+    :func:`make_system_top`, which appends its own pair; without this strip the
+    wrapped system declares the molecule twice and grompp rejects it with
+    ``number of coordinates in coordinate file (14) does not match topology
+    (28)``.
+
+    Applied to the written outputs as well as the grompp inputs, so a file
+    ffrefine names ``.itp`` really is a molecule include file.  The user's own
+    input is never modified.
+
+    Args:
+        lines: topology lines, comments included.
+
+    Returns:
+        ``(kept_lines, dropped_section_names)``.  ``dropped_section_names``
+        is empty for a plain molecule ``.itp``, which is the common case.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    skipping = False
+    for raw in lines:
+        body = raw.split(";", 1)[0].strip()
+        if body.startswith("[") and body.endswith("]"):
+            name = body[1:-1].strip().lower()
+            skipping = name in _WRAPPER_SECTIONS
+            if skipping:
+                dropped.append(name)
+                continue
+        if skipping:
+            continue
+        kept.append(raw)
+    return kept, dropped
+
+
+def write_molecule_copy(source: str | Path, out_path: str | Path) -> list[str]:
+    """Copy a topology file, dropping the sections ``make_system_top`` supplies.
+
+    Used for the "unmodified" grompp inputs (the section 4.5 full topology and
+    the section 4.9 before topology), which are otherwise byte-for-byte copies
+    of the user's file.  Reads the *source text*, not the parsed
+    ``raw_lines``, so ``#ifdef`` branches this build did not take are still
+    handed to grompp, which does its own preprocessing.
+
+    Args:
+        source: the user's topology file; never modified.
+        out_path: destination.
+
+    Returns:
+        The names of any sections dropped.
+    """
+    lines, dropped = strip_system_sections(Path(source).read_text().splitlines())
+    Path(out_path).write_text("\n".join(lines) + "\n", newline="\n")
+    if dropped:
+        log.info(
+            "%s: dropped [ %s ] from the molecule copy %s; the generated wrapper .top "
+            "supplies its own (spec section 2: -p accepts a molecule .top)",
+            Path(source).name,
+            " ] [ ".join(dropped),
+            Path(out_path).name,
+        )
+    return dropped
 
 
 def _entry_key(d: Dihedral) -> _EntryKey:
@@ -128,8 +204,8 @@ def write_zeroed_topology(topology: Topology, quad: Quad, out_path: str | Path) 
         ]
         for key in targets
     }
-    lines = _rewrite_dihedrals(topology, targets, replacement)
-    Path(out_path).write_text("\n".join(lines) + "\n")
+    lines, _ = strip_system_sections(_rewrite_dihedrals(topology, targets, replacement))
+    Path(out_path).write_text("\n".join(lines) + "\n", newline="\n")
     return tset
 
 
@@ -193,8 +269,8 @@ def write_refit_topology(
             for kk, d, n in zip(np.atleast_1d(k), np.atleast_1d(delta_deg), np.atleast_1d(mult))
         ]
 
-    lines = _rewrite_dihedrals(topology, targets, replacement)
-    Path(out_path).write_text("\n".join(lines) + "\n")
+    lines, _ = strip_system_sections(_rewrite_dihedrals(topology, targets, replacement))
+    Path(out_path).write_text("\n".join(lines) + "\n", newline="\n")
 
 
 def make_system_top(
@@ -205,15 +281,27 @@ def make_system_top(
 ) -> None:
     """Write a minimal .top wrapping an .itp so grompp can process it.
 
+    The included molecule file must NOT carry ``[ system ]`` or
+    ``[ molecules ]`` of its own -- this function supplies both, and a
+    duplicate makes grompp build the molecule twice.  Every caller therefore
+    routes its copy through :func:`write_molecule_copy`,
+    :func:`write_zeroed_topology` or :func:`write_refit_topology`, all of
+    which strip those sections.
+
     Args:
         itp_path: molecule .itp; referenced by name, so keep it beside the .top.
         out_path: destination .top.
         molname: the [ moleculetype ] name.
-        includes: force field includes to emit before the molecule include.
+        includes: force field includes to emit before the molecule include,
+            in order, each as written by the user's ``--ff-include``. Paths
+            are emitted verbatim so a GMXLIB-relative name such as
+            ``charmm36.ff/forcefield.itp`` still resolves; the CLI absolutises
+            anything that names a file it can see, because this wrapper lives
+            in the stage directory rather than the user's cwd.
     """
     lines = ["; generated by ffrefine -- do not edit", ""]
     for inc in includes or []:
         lines.append(f'#include "{inc}"')
     lines.append(f'#include "{Path(itp_path).name}"')
     lines += ["", "[ system ]", f"{molname} in vacuum", "", "[ molecules ]", f"{molname}    1", ""]
-    Path(out_path).write_text("\n".join(lines))
+    Path(out_path).write_text("\n".join(lines), newline="\n")

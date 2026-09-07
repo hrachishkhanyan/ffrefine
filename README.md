@@ -50,7 +50,10 @@ does not fabricate one.
 - `-s/--structure`: `.pdb`, `.gro` or `.xyz`, one molecule, **atom order
   identical to the topology**.
 - `-p/--topology`: the molecule's `.itp` or `.top` (CHARMM36/CGenFF or GAFF
-  style).
+  style). A molecule `.top` carrying its own `[ system ]` and `[ molecules ]`
+  works: those two sections are dropped from the working copies ffrefine builds,
+  because the wrapper it generates for `grompp` supplies its own. Read "What
+  this build cannot read" below before pointing this at a real force field.
 - `--dihedral i,j,k,l`: the target torsion, **1-based** atom indices matching
   the topology's `[ atoms ]` numbering. This is the only index convention the
   user ever sees; the conversion to 0-based array indices happens internally at
@@ -58,6 +61,44 @@ does not fabricate one.
 
 Input files are never modified. Everything is written under `--outdir`, and
 normalized copies of the inputs land in `00_input/`.
+
+## What this build cannot read
+
+The topology parser reads **one file**, and it reads only what is written in
+that file. Three common topologies therefore do not work, and all three fail
+with a clear message rather than a wrong number. This is a stated scope
+boundary, not a bug list.
+
+**1. Target dihedrals whose parameters come from `[ dihedraltypes ]`.**
+This is the normal shape of a CGenFF or GAFF molecule `.itp`: the
+`[ dihedrals ]` lines carry `i j k l 9` and nothing else, and GROMACS looks the
+force constants up by atom type. ffrefine never reads those type tables, so it
+cannot build the independent analytic reference the mandatory spec 4.5
+self-check compares GROMACS against -- it would be comparing a real torsion
+energy against zero. `mmscan` detects this *before* running GROMACS and refuses,
+naming the offending lines.
+
+To proceed, write those `[ dihedrals ]` lines out with their explicit `phi0`,
+`k` and multiplicity (the values your force field assigns them) in a **copy** of
+the topology, and run against the copy. Explicit parameters do suppress the
+`[ dihedraltypes ]` lookup -- that is verified against GROMACS 2025.4 by
+`tests/test_selfcheck.py::test_dihedraltypes_entry_is_suppressed_by_explicit_params`,
+not assumed.
+
+**2. Topologies that need force-field `#include`s to be complete.** A molecule
+`.itp` that has no `[ atomtypes ]` of its own, because it expects
+`charmm36.ff/forcefield.itp` to have been included first, cannot be turned into
+a runnable system by ffrefine alone. Pass the include with `--ff-include`, which
+is emitted ahead of the molecule in the generated wrapper `.top`; the path is
+handed to `grompp` verbatim, so relative paths resolve against the stage
+directory.
+
+**3. Anything that requires following an `#include`.** `#include` lines are
+copied through verbatim and never followed. A `.top` whose `[ atoms ]` lives in
+an `#include`d `.itp` parses to "no `[ atoms ]` section found". Point `-p` at the
+file that actually contains the `[ moleculetype ]` you want to refit. Note the
+same limitation applies to `--resume`: see the `--resume` bullet under Common
+flags.
 
 ## Worked example: n-butane
 
@@ -189,13 +230,24 @@ difference with the fitted series overlaid, and the residuals.
 ## Common flags
 
 Every subcommand accepts `--config file.json`, `--outdir`, `--nthreads`,
-`--resume`, `--dry-run`, `--verbose`, `--gmx-bin`, `--xtb-bin`, `--orca-bin`
-and `--no-strict-names`.
+`--resume`, `--dry-run`, `--verbose`, `--gmx-bin`, `--xtb-bin`, `--orca-bin`,
+`--ff-include` and `--no-strict-names`.
 
 - `--config` values are overridden by anything given on the command line. A
   `"binaries": {"gmx": "..."}` object is honoured alongside the flat keys.
+  `--ff-include` is command-line only.
+- `--ff-include path.itp` adds a `#include` ahead of the molecule in the wrapper
+  `.top` ffrefine generates for `grompp`. Repeatable; emitted in the order given.
+  Use it when the molecule topology has no `[ atomtypes ]` of its own. A value
+  naming a file ffrefine can see is made absolute, since the wrapper lives in the
+  stage directory; anything else is passed through untouched so GMXLIB-relative
+  names like `charmm36.ff/forcefield.itp` still resolve.
 - `--resume` skips a stage whose recorded input hashes still match. A manifest
   that is missing, corrupt, or built from different inputs always recomputes.
+  **The hash covers the top-level topology file only.** `#include` directives are
+  not followed, so editing an `#include`d `.itp` -- or the force field named by
+  `--ff-include` -- leaves the hash unchanged and the stage is skipped as current.
+  Re-run without `--resume` after changing an included file.
 - `--dry-run` validates the inputs, reports what would run, and creates nothing
   at all -- not even the output directory.
 - `--no-strict-names` downgrades an atom-name mismatch between structure and
