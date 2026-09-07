@@ -31,6 +31,14 @@ class Structure:
         coords: shape (natoms, 3) in nanometres.
         title: free-text title from the file.
         box: shape (3,) box vector lengths in nm, or None.
+        names_are_synthetic: the source format carries no atom names and
+            ``names`` was manufactured from the element symbols (XYZ).  Such
+            names can never match a topology, so
+            :func:`ffrefine.io.validate.validate_structure_topology` skips the
+            name comparison for them and
+            :func:`ffrefine.io.validate.adopt_topology_naming` replaces them
+            with the topology's own.  Elements and atom *order* are still
+            checked, which is what actually has to be right.
     """
 
     names: list[str]
@@ -40,6 +48,7 @@ class Structure:
     coords: np.ndarray
     title: str = ""
     box: np.ndarray | None = field(default=None)
+    names_are_synthetic: bool = False
 
     @property
     def natoms(self) -> int:
@@ -141,7 +150,15 @@ def read_gro(path: str | Path) -> Structure:
 
 
 def read_xyz(path: str | Path) -> Structure:
-    """Read an XYZ file (Angstrom) into nm."""
+    """Read an XYZ file (Angstrom) into nm.
+
+    XYZ carries element symbols and coordinates and nothing else: no atom
+    names, no residues.  The ``names`` this builds (``C1``, ``H2``, ...) are
+    therefore placeholders and are flagged as such via
+    ``Structure.names_are_synthetic`` -- they could never match a topology,
+    and before that flag existed the default strict-name check made every
+    ``.xyz`` input fatal.
+    """
     try:
         lines = Path(path).read_text().splitlines()
     except OSError as exc:
@@ -170,6 +187,7 @@ def read_xyz(path: str | Path) -> Structure:
         elements=elements,
         coords=np.array(xyz, dtype=float) * ANGSTROM_TO_NM,
         title=lines[1].strip(),
+        names_are_synthetic=True,
     )
 
 

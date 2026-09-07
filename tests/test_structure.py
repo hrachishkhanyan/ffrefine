@@ -1,7 +1,10 @@
 import numpy as np
 import pytest
-from ffrefine.errors import ParseError
+from ffrefine.errors import ParseError, ValidationError
 from ffrefine.io import structure as st
+from ffrefine.io.structure import read_pdb, read_structure, read_xyz
+from ffrefine.io.topology import read_topology
+from ffrefine.io.validate import adopt_topology_naming, validate_structure_topology
 
 PDB_TEXT = """\
 TITLE     n-butane
@@ -117,3 +120,126 @@ def test_guess_element_from_name():
     assert st.guess_element("C1") == "C"
     assert st.guess_element("H11") == "H"
     assert st.guess_element("CL2") == "Cl"
+
+
+# --------------------------------------------------------------------------
+# XYZ (final review, item 5 -- deferred ledger item 99: this was shipping
+# as an advertised interface with no tests at all, hiding a live defect)
+# --------------------------------------------------------------------------
+
+
+def test_read_xyz_parses_elements_and_converts_to_nm(tmp_path):
+    path = tmp_path / "two.xyz"
+    path.write_text(
+        "2\nwater fragment\nO  0.000000  0.000000  0.000000\nH  0.960000  0.000000  0.000000\n"
+    )
+    s = read_xyz(path)
+    assert s.natoms == 2
+    assert s.elements == ["O", "H"]
+    assert s.title == "water fragment"
+    # 0.96 Angstrom -> 0.096 nm
+    assert s.coords[1][0] == pytest.approx(0.096)
+    assert s.coords.shape == (2, 3)
+
+
+def test_read_xyz_flags_its_names_as_synthetic(tmp_path):
+    path = tmp_path / "one.xyz"
+    path.write_text("1\n\nCl 1.0 2.0 3.0\n")
+    s = read_xyz(path)
+    assert s.names_are_synthetic is True
+    assert s.names == ["Cl1"]
+    assert s.elements == ["Cl"]
+
+
+def test_read_xyz_rejects_a_short_body(tmp_path):
+    path = tmp_path / "bad.xyz"
+    path.write_text("3\ntitle\nC 0 0 0\n")
+    with pytest.raises(ParseError):
+        read_xyz(path)
+
+
+def test_read_xyz_rejects_a_malformed_line(tmp_path):
+    path = tmp_path / "bad.xyz"
+    path.write_text("1\ntitle\nC 0 0\n")
+    with pytest.raises(ParseError):
+        read_xyz(path)
+
+
+def test_read_xyz_rejects_a_non_numeric_count(tmp_path):
+    path = tmp_path / "bad.xyz"
+    path.write_text("banana\ntitle\nC 0 0 0\n")
+    with pytest.raises(ParseError):
+        read_xyz(path)
+
+
+def test_read_structure_dispatches_on_xyz(butane_xyz):
+    s = read_structure(butane_xyz)
+    assert s.natoms == 14
+    assert s.names_are_synthetic is True
+
+
+def test_read_structure_rejects_an_unknown_suffix(tmp_path):
+    path = tmp_path / "mol.mol2"
+    path.write_text("whatever\n")
+    with pytest.raises(ParseError, match="unsupported structure format"):
+        read_structure(path)
+
+
+def test_xyz_agrees_with_the_pdb_it_came_from(butane_xyz, butane_pdb):
+    x = read_xyz(butane_xyz)
+    p = read_pdb(butane_pdb)
+    assert x.elements == p.elements
+    assert np.allclose(x.coords, p.coords, atol=1e-6)
+
+
+def test_xyz_against_a_topology_is_not_fatal_under_strict_names(butane_xyz, butane_itp):
+    """Item 5: 'C1'/'H2' can never match a topology, so the default strict-name
+    check made every .xyz input fatal:
+
+        error: atom name mismatch (13 atoms): atom 2: structure 'H2' vs
+        topology 'H11'; ...
+    """
+    s = read_xyz(butane_xyz)
+    t = read_topology(butane_itp)
+    warnings = validate_structure_topology(s, t, strict_names=True)
+    assert any("carries no atom names" in w for w in warnings)
+    assert not any("atom name mismatch" in w for w in warnings)
+
+
+def test_xyz_still_catches_a_wrong_element_order(tmp_path, butane_itp):
+    """Skipping the name check must not weaken the check that matters."""
+    path = tmp_path / "swapped.xyz"
+    elements = ["H", "C"] + ["H"] * 12  # atom 1 is carbon in the topology
+    lines = ["14", "swapped"] + [f"{e} 0.0 0.0 {i * 0.1}" for i, e in enumerate(elements)]
+    path.write_text("\n".join(lines) + "\n")
+    s = read_xyz(path)
+    t = read_topology(butane_itp)
+    with pytest.raises(ValidationError, match="element mismatch"):
+        validate_structure_topology(s, t, strict_names=False)
+
+
+def test_xyz_still_catches_a_wrong_atom_count(tmp_path, butane_itp):
+    path = tmp_path / "short.xyz"
+    path.write_text("2\nshort\nC 0 0 0\nC 0 0 1\n")
+    s = read_xyz(path)
+    t = read_topology(butane_itp)
+    with pytest.raises(ValidationError, match="atom count mismatch"):
+        validate_structure_topology(s, t)
+
+
+def test_adopt_topology_naming_replaces_synthetic_names(butane_xyz, butane_itp):
+    s = read_xyz(butane_xyz)
+    t = read_topology(butane_itp)
+    adopted = adopt_topology_naming(s, t)
+    assert adopted.names == [a.name for a in t.atoms]
+    assert adopted.resnames == [a.resname for a in t.atoms]
+    assert adopted.names_are_synthetic is False
+    # Coordinates untouched, and the original is not mutated.
+    assert np.allclose(adopted.coords, s.coords)
+    assert s.names[0] == "C1"
+
+
+def test_adopt_topology_naming_leaves_real_names_alone(butane_pdb, butane_itp):
+    s = read_pdb(butane_pdb)
+    t = read_topology(butane_itp)
+    assert adopt_topology_naming(s, t) is s

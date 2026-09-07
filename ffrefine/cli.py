@@ -98,7 +98,7 @@ from .io.prm import write_prm_block
 from .io.structure import Structure, read_structure
 from .io.topology import Topology, read_topology
 from .io.topwriter import write_refit_topology
-from .io.validate import validate_structure_topology
+from .io.validate import adopt_topology_naming, validate_structure_topology
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
 from .mm.validate_fit import validate_refit
@@ -474,6 +474,10 @@ def _load_inputs(args: argparse.Namespace) -> tuple[Structure, Topology, Quad]:
         structure, topology, strict_names=not args.no_strict_names
     ):
         _warn(warning)
+    # XYZ carries no atom names, so the reader's placeholders would reach
+    # grompp and never match the topology. Order is already checked above, so
+    # the topology's own naming is the right one to use from here on.
+    structure = adopt_topology_naming(structure, topology)
 
     quads = getattr(args, "dihedral", None) or []
     if not quads:

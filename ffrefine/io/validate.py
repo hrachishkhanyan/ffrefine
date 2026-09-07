@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..errors import ValidationError
 from .structure import Structure, guess_element
 from .topology import Topology
@@ -42,6 +44,10 @@ def validate_structure_topology(
         structure: parsed coordinates.
         topology: parsed topology.
         strict_names: treat an atom-name mismatch as fatal rather than a warning.
+            Ignored for a structure whose names are synthetic (see
+            ``Structure.names_are_synthetic``): those names come from the
+            reader, not the user's file, so failing on them would only ever
+            report the reader's own placeholder against the topology.
 
     Returns:
         Non-fatal warning strings.
@@ -69,8 +75,18 @@ def validate_structure_topology(
                     f"structure says {actual}, topology mass {atom.mass} implies "
                     f"{expected}. Atom order must be identical in both files."
                 )
-        if satom_name != atom.name:
+        if not structure.names_are_synthetic and satom_name != atom.name:
             name_mismatches.append(f"atom {i}: structure {satom_name!r} vs topology {atom.name!r}")
+
+    if structure.names_are_synthetic:
+        warnings.append(
+            "the structure format carries no atom names, so the names compared here "
+            "were manufactured from element symbols and the name check was skipped. "
+            "Atom count, element ordering and atom ORDER are still enforced, and they "
+            "are what has to be right: a name check could not have caught a reordered "
+            "file either. The topology's own atom naming is adopted for the files "
+            "handed to GROMACS."
+        )
 
     if name_mismatches:
         detail = "; ".join(name_mismatches[:10])
@@ -81,3 +97,46 @@ def validate_structure_topology(
             )
         warnings.append(message)
     return warnings
+
+
+def adopt_topology_naming(structure: Structure, topology: Topology) -> Structure:
+    """Return a copy of ``structure`` carrying the topology's atom naming.
+
+    For a format with no atom names of its own (XYZ), the reader manufactures
+    ``C1``, ``H2``, ... .  Those reach ``grompp`` in the generated coordinate
+    and rerun-trajectory files, where they can never match the topology.  The
+    two files are required to be in the same atom order anyway (checked by
+    :func:`validate_structure_topology`, which must be called first), so the
+    topology's names, residue names and residue ids are simply the right ones
+    to use.
+
+    A structure whose names are real is returned unchanged, so this is safe to
+    call unconditionally.
+
+    Args:
+        structure: parsed coordinates.
+        topology: parsed topology; supplies the naming.
+
+    Returns:
+        Either ``structure`` itself, or a copy with topology naming and
+        ``names_are_synthetic`` cleared.
+
+    Raises:
+        ValidationError: the two disagree on atom count -- call
+            :func:`validate_structure_topology` first, which reports that
+            properly.
+    """
+    if not structure.names_are_synthetic:
+        return structure
+    if structure.natoms != topology.natoms:
+        raise ValidationError(
+            f"cannot adopt topology naming: structure has {structure.natoms} atoms, "
+            f"topology has {topology.natoms}"
+        )
+    return replace(
+        structure,
+        names=[a.name for a in topology.atoms],
+        resnames=[a.resname for a in topology.atoms],
+        resids=[a.resnr for a in topology.atoms],
+        names_are_synthetic=False,
+    )

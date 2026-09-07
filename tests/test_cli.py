@@ -967,3 +967,61 @@ def test_validate_refuses_a_fit_made_on_other_geometries(tmp_path, butane_pdb, b
     scan_path.write_text(json.dumps(scan))
     assert main(["validate"] + _base_args(butane_pdb, butane_itp, out)) == 1
     assert "different geometries" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# .xyz input (final review, item 5)
+# --------------------------------------------------------------------------
+
+
+def test_xyz_input_is_usable_by_default(tmp_path, butane_xyz, butane_itp, capsys):
+    """Item 5: --structure a .xyz used to be fatal without --no-strict-names,
+    because the reader's synthetic 'H2' can never match the topology's 'H11'."""
+    argv = [
+        "mmscan",
+        "-s",
+        str(butane_xyz),
+        "-p",
+        str(butane_itp),
+        "--dihedral",
+        "1,5,8,11",
+        "--outdir",
+        str(tmp_path / "o"),
+        "--dry-run",
+    ]
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert "atom name mismatch" not in captured.err
+    assert "carries no atom names" in captured.err
+
+
+@pytest.mark.needs_gmx
+def test_xyz_input_runs_mmscan_and_matches_the_pdb(
+    tmp_path, butane_xyz, butane_pdb, butane_itp, gmx_bin
+):
+    """The .xyz path must reach GROMACS and give the same answer as the .pdb.
+
+    Naming is adopted from the topology, so the generated coordinate file and
+    rerun trajectory carry names grompp recognises.
+    """
+    from_xyz = tmp_path / "xyz_out"
+    from_pdb = tmp_path / "pdb_out"
+    for source, outdir in ((butane_xyz, from_xyz), (butane_pdb, from_pdb)):
+        argv = [
+            "mmscan",
+            "-s",
+            str(source),
+            "-p",
+            str(butane_itp),
+            "--dihedral",
+            "1,5,8,11",
+            "--outdir",
+            str(outdir),
+            "--gmx-bin",
+            gmx_bin,
+        ]
+        assert main(argv) == 0
+    a = json.loads((from_xyz / "02_mm_scan" / "energies.json").read_text())
+    b = json.loads((from_pdb / "02_mm_scan" / "energies.json").read_text())
+    assert a["full_potential_kj"] == pytest.approx(b["full_potential_kj"], abs=1e-4)
+    assert a["selfcheck_max_abs_error_kj"] < 1e-3
