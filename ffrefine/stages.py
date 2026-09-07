@@ -72,11 +72,18 @@ def hash_file(path: str | Path) -> str:
 
     Returns:
         Lowercase hex digest.
+
+    Raises:
+        ValidationError: ``path`` does not exist, is a directory, or is not
+            readable.
     """
     digest = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValidationError(f"{path}: could not be read: {exc}") from exc
     return digest.hexdigest()
 
 

@@ -283,6 +283,80 @@ def test_multiple_dihedrals_is_a_clean_error(tmp_path, butane_pdb, butane_itp, c
 
 
 # --------------------------------------------------------------------------
+# missing/unreadable file paths (ruling R29): the commonest user error must
+# never surface a raw OSError traceback, on any path the user can name --
+# -s, -p or --config.
+# --------------------------------------------------------------------------
+
+
+def test_missing_structure_path_is_a_clean_error(tmp_path, butane_itp, capsys):
+    missing = tmp_path / "does_not_exist.gro"
+    code = main(
+        ["mmscan", "-s", str(missing), "-p", str(butane_itp)]
+        + ["--dihedral", "1,5,8,11", "--outdir", str(tmp_path / "o"), "--dry-run"]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert str(missing) in captured.err
+    assert captured.err.count("\n") == 1  # exactly one clean line, no traceback
+    assert "Traceback" not in captured.err
+    assert "FileNotFoundError" not in captured.err
+
+
+def test_missing_topology_path_is_a_clean_error(tmp_path, butane_pdb, capsys):
+    missing = tmp_path / "does_not_exist.itp"
+    code = main(
+        ["mmscan", "-s", str(butane_pdb), "-p", str(missing)]
+        + ["--dihedral", "1,5,8,11", "--outdir", str(tmp_path / "o"), "--dry-run"]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert str(missing) in captured.err
+    assert captured.err.count("\n") == 1
+    assert "Traceback" not in captured.err
+    assert "FileNotFoundError" not in captured.err
+
+
+def test_missing_config_path_is_a_clean_error(tmp_path, butane_pdb, butane_itp, capsys):
+    missing = tmp_path / "does_not_exist.json"
+    code = main(
+        ["mmscan", "-s", str(butane_pdb), "-p", str(butane_itp)]
+        + ["--dihedral", "1,5,8,11", "--config", str(missing)]
+        + ["--outdir", str(tmp_path / "o"), "--dry-run"]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert str(missing) in captured.err
+    assert captured.err.count("\n") == 1
+    assert "Traceback" not in captured.err
+    assert "FileNotFoundError" not in captured.err
+
+
+def test_directory_given_as_topology_is_a_clean_error(tmp_path, butane_pdb, capsys):
+    """A directory where a file is expected is the same class of error as missing."""
+    a_directory = tmp_path / "a_directory.itp"
+    a_directory.mkdir()
+    code = main(
+        ["mmscan", "-s", str(butane_pdb), "-p", str(a_directory)]
+        + ["--dihedral", "1,5,8,11", "--outdir", str(tmp_path / "o"), "--dry-run"]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert str(a_directory) in captured.err
+    assert captured.err.count("\n") == 1
+    assert "Traceback" not in captured.err
+    assert "IsADirectoryError" not in captured.err
+
+
+# --------------------------------------------------------------------------
 # --config (spec section 3: CLI overrides file values)
 # --------------------------------------------------------------------------
 

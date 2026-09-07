@@ -66,7 +66,11 @@ def read_pdb(path: str | Path) -> Structure:
     elements: list[str] = []
     xyz: list[list[float]] = []
     title = ""
-    for line in Path(path).read_text().splitlines():
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        raise ParseError(f"{path}: could not be read: {exc}") from exc
+    for line in text.splitlines():
         if line.startswith("TITLE"):
             title = line[10:].strip()
         elif line.startswith(("ATOM", "HETATM")):
@@ -95,7 +99,10 @@ def read_pdb(path: str | Path) -> Structure:
 
 def read_gro(path: str | Path) -> Structure:
     """Read a GRO file (already in nm).  Fixed-width fields per the format spec."""
-    lines = Path(path).read_text().splitlines()
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError as exc:
+        raise ParseError(f"{path}: could not be read: {exc}") from exc
     if len(lines) < 3:
         raise ParseError(f"{path}: file too short to be a GRO")
     title = lines[0].strip()
@@ -135,7 +142,10 @@ def read_gro(path: str | Path) -> Structure:
 
 def read_xyz(path: str | Path) -> Structure:
     """Read an XYZ file (Angstrom) into nm."""
-    lines = Path(path).read_text().splitlines()
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError as exc:
+        raise ParseError(f"{path}: could not be read: {exc}") from exc
     if len(lines) < 2:
         raise ParseError(f"{path}: file too short to be an XYZ")
     try:

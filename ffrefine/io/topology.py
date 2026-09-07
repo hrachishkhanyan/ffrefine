@@ -143,11 +143,15 @@ def read_topology(path: str | Path, defines: set[str] | None = None) -> Topology
         The parsed topology.
 
     Raises:
-        ParseError: on malformed input or a missing [ atoms ] section.
+        ParseError: the file could not be read (missing, a directory, or
+            unreadable), on malformed input, or a missing [ atoms ] section.
     """
     path = Path(path)
     defines = set(defines or ())
-    all_lines = path.read_text().splitlines()
+    try:
+        all_lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise ParseError(f"{path}: could not be read: {exc}") from exc
     raw_lines: list[str] = []
 
     section = ""
