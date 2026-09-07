@@ -157,6 +157,12 @@ def fit_summary(
         "asymmetry_kj_per_mol": float(asymmetry_metric(phi_arr, target_arr)),
         "n_points": int(phi_arr.size),
         "n_parameters": int(result.n_params),
+        # Equal to n_parameters for a well-posed fit. Less means the design
+        # matrix was rank deficient and numpy returned a minimum-norm
+        # solution: these coefficients are then one arbitrary choice among
+        # many that fit equally well.
+        "design_matrix_rank": int(result.rank),
+        "design_matrix_full_rank": bool(result.rank == result.n_params),
         "phi_deg": [float(v) for v in phi_arr],
         "target_kj_per_mol": [float(v) for v in target_arr],
         "fitted_kj_per_mol": [float(v) for v in result.predicted],

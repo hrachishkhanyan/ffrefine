@@ -13,6 +13,7 @@ With ``free_phase`` the basis gains sine terms and the conversion becomes
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -20,6 +21,8 @@ import numpy as np
 
 from ..geometry import wrap_deg
 from .basis import design_matrix
+
+log = logging.getLogger("ffrefine")
 
 
 @dataclass
@@ -37,6 +40,14 @@ class FitResult:
         predicted: fitted values at the input angles, kJ/mol.
         free_phase: whether sine terms were used.
         n_params: free parameters, for BIC.
+        rank: the effective rank ``np.linalg.lstsq`` found for the weighted
+            design matrix. Equal to ``n_params`` for a well-posed fit; less
+            than that means the basis was not independent over the surviving
+            points and ``lstsq`` returned a minimum-norm solution rather than
+            a unique one -- the coefficients are then one arbitrary choice
+            among infinitely many that fit equally well. Recorded rather than
+            discarded because this project's signature failure is a
+            plausible-looking number that is silently wrong.
     """
 
     mults: np.ndarray
@@ -49,6 +60,7 @@ class FitResult:
     predicted: np.ndarray
     free_phase: bool
     n_params: int
+    rank: int = -1
 
 
 def fit_cosine_series(
@@ -80,7 +92,22 @@ def fit_cosine_series(
     else:
         w = np.asarray(weights, dtype=float)
     sw = np.sqrt(w)
-    coeffs, *_ = np.linalg.lstsq(x * sw[:, None], y * sw, rcond=None)
+    coeffs, _residues, rank, _sv = np.linalg.lstsq(x * sw[:, None], y * sw, rcond=None)
+    rank = int(rank)
+    if rank < x.shape[1]:
+        # lstsq does not fail on a rank-deficient system: it silently returns
+        # the minimum-norm solution, which fits just as well and means much
+        # less. The CLI's `kept <= max_params` guard covers the realistic
+        # triggers, so this is insurance -- but it is recorded in fit.json and
+        # said out loud rather than thrown away.
+        log.warning(
+            "least-squares design matrix is rank deficient: rank %d for %d columns over "
+            "%d weighted point(s). numpy returned a minimum-norm solution, so these "
+            "coefficients are one arbitrary choice among many that fit equally well.",
+            rank,
+            x.shape[1],
+            int(np.count_nonzero(w)),
+        )
 
     constant = float(coeffs[0])
     n = len(mults)
@@ -110,6 +137,7 @@ def fit_cosine_series(
         predicted=predicted,
         free_phase=free_phase,
         n_params=int(coeffs.size),
+        rank=rank,
     )
 
 

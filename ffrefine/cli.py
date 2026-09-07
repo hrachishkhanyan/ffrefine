@@ -107,6 +107,7 @@ from .stages import (
     STAGE_DIRS,
     hash_array,
     hash_inputs,
+    log_to_run_log,
     setup_logging,
     stage_dir,
     stage_is_current,
@@ -967,9 +968,23 @@ def cmd_fit(args: argparse.Namespace) -> int:
     candidates = rank_candidates(
         phi, target, args.multiplicities, weights=weights, free_phase=args.free_phase
     )
-    print(format_ranking_table(candidates))
+    table = format_ranking_table(candidates)
+    print(table)
+    # Spec section 8: the durable record is run.log. The table was stdout-only,
+    # so a resumed or redirected run kept no evidence of what was ranked or
+    # why. file_only keeps stderr from showing it a second time.
+    log_to_run_log("BIC ranking of candidate multiplicity subsets:\n" + table)
     chosen = select_model(candidates)
     result = chosen.result
+    log_to_run_log(
+        f"fit settings: quad {list(quad)}, candidates {list(args.multiplicities)}, "
+        f"emax {args.emax:g} kJ/mol, "
+        f"{'uniform' if args.boltzmann is None else f'boltzmann {args.boltzmann:g} K'} "
+        f"weighting, free_phase {bool(args.free_phase)}, distribute "
+        f"{bool(args.distribute)}; {kept} of {qm.size} point(s) used, {discarded} discarded; "
+        f"selected {list(chosen.mults)}, design-matrix rank {result.rank} of "
+        f"{result.n_params} parameter(s)"
+    )
     print(
         f"\nselected multiplicities {list(chosen.mults)}: RMSE {result.rmse:.4f} kJ/mol, "
         f"max deviation {result.max_dev:.4f} kJ/mol"
@@ -995,11 +1010,38 @@ def cmd_fit(args: argparse.Namespace) -> int:
     )
 
     outdir = stage_dir(args.outdir, "fit")
+    # Spec 4.8 asks fit.json to carry every number. That includes the settings
+    # that shaped the fit, not just its results: without them a fit.json cannot
+    # be reproduced or judged, and the BIC ranking existed only on stdout.
     provenance = {
         "quad_1_based": list(quad),
         "frames_sha256": frames_digest,
         "scan_json": str(scan_path),
         "energies_json": str(energies_path),
+        "ffrefine_version": __version__,
+        "candidate_multiplicities": [int(m) for m in args.multiplicities],
+        "emax_kj_per_mol": float(args.emax),
+        "weighting": (
+            "uniform" if args.boltzmann is None else f"boltzmann at {float(args.boltzmann):g} K"
+        ),
+        "boltzmann_temperature_k": None if args.boltzmann is None else float(args.boltzmann),
+        "n_points_total": int(qm.size),
+        "n_points_discarded_by_emax": discarded,
+        "n_points_used": kept,
+        "free_phase": bool(args.free_phase),
+        "distribute": bool(args.distribute),
+        "asymmetry_kj_per_mol": float(metric),
+        "asymmetry_tolerance_kj_per_mol": float(DEFAULT_ASYMMETRY_TOLERANCE),
+        "bic_ranking": [
+            {
+                "multiplicities": [int(m) for m in c.mults],
+                "n_parameters": int(c.n_params),
+                "rmse_kj_per_mol": float(c.rmse),
+                "bic": float(c.bic),
+            }
+            for c in candidates
+        ],
+        "selected_multiplicities": [int(m) for m in chosen.mults],
     }
     (outdir / "fit.json").write_text(
         json.dumps(fit_summary(result, phi, target, provenance, qm_kj=qm), indent=2) + "\n"

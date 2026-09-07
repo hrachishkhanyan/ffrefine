@@ -1102,3 +1102,82 @@ def test_resume_reruns_when_a_secondary_output_was_deleted(tmp_path, butane_pdb,
     prm.unlink()
     assert main(["fit"] + args + ["--resume"]) == 0
     assert prm.is_file()
+
+
+def test_fit_json_records_every_setting_that_shaped_it(tmp_path, butane_pdb, butane_itp):
+    """Item 11 / spec 4.8 ("every number"): emax, the weighting scheme, the
+    discarded-point count, distribute, free_phase and the BIC ranking were
+    stdout-only or nowhere."""
+    out = tmp_path / "out"
+    phi = _grid()
+    qm = 60.0 * (1.0 + np.cos(np.radians(3.0 * phi)))  # some points above emax
+    _write_stage_inputs(out, phi, qm)
+    argv = _base_args(butane_pdb, butane_itp, out) + [
+        "--emax",
+        "50",
+        "--boltzmann",
+        "400",
+        "--distribute",
+        "--multiplicities",
+        "1,2,3",
+    ]
+    assert main(["fit"] + argv) == 0
+    prov = json.loads((out / "03_fit" / "fit.json").read_text())["provenance"]
+
+    assert prov["emax_kj_per_mol"] == pytest.approx(50.0)
+    assert prov["weighting"] == "boltzmann at 400 K"
+    assert prov["boltzmann_temperature_k"] == pytest.approx(400.0)
+    assert prov["candidate_multiplicities"] == [1, 2, 3]
+    assert prov["distribute"] is True
+    assert prov["free_phase"] is False
+    assert prov["n_points_total"] == len(phi)
+    assert prov["n_points_discarded_by_emax"] + prov["n_points_used"] == len(phi)
+    assert prov["n_points_discarded_by_emax"] > 0
+    assert "asymmetry_kj_per_mol" in prov
+    assert prov["ffrefine_version"]
+
+    ranking = prov["bic_ranking"]
+    assert len(ranking) == 7  # every non-empty subset of {1,2,3}
+    assert {"multiplicities", "n_parameters", "rmse_kj_per_mol", "bic"} <= set(ranking[0])
+    assert (
+        prov["selected_multiplicities"]
+        == json.loads((out / "03_fit" / "fit.json").read_text())["multiplicities"]
+    )
+
+
+def test_fit_json_records_the_design_matrix_rank(tmp_path, butane_pdb, butane_itp):
+    """Item 12: np.linalg.lstsq's rank was discarded. A rank below the column
+    count means a minimum-norm solution, i.e. one arbitrary answer among many."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    payload = json.loads((out / "03_fit" / "fit.json").read_text())
+    assert payload["design_matrix_rank"] == payload["n_parameters"]
+    assert payload["design_matrix_full_rank"] is True
+
+
+def test_run_log_carries_the_bic_ranking_and_fit_settings(tmp_path, butane_pdb, butane_itp):
+    """Item 11: the ranking table existed only on stdout, so a redirected or
+    resumed run kept no record of what was ranked."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    text = (out / "run.log").read_text()
+    assert "BIC ranking of candidate multiplicity subsets" in text
+    assert "multiplicities" in text and "BIC" in text
+    assert "fit settings:" in text
+    assert "design-matrix rank" in text
+
+
+def test_run_log_only_material_is_not_echoed_to_stderr(tmp_path, butane_pdb, butane_itp, capsys):
+    """The table is already printed to stdout in a nicer form; showing it on
+    stderr as well would give the user two copies."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    captured = capsys.readouterr()
+    assert "BIC ranking of candidate" not in captured.err
+    assert captured.out.count("multiplicities") >= 1

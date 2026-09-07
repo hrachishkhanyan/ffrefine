@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pytest
 from ffrefine.fit.basis import design_matrix
@@ -104,3 +106,33 @@ def test_residuals_and_predicted_are_consistent():
     assert r.residuals == pytest.approx(target - r.predicted, abs=1e-12)
     assert r.rmse == pytest.approx(np.sqrt(np.mean(r.residuals**2)), abs=1e-12)
     assert r.max_dev == pytest.approx(np.max(np.abs(r.residuals)), abs=1e-12)
+
+
+def test_fit_records_the_design_matrix_rank():
+    """Item 12: lstsq's rank was discarded."""
+    phi = np.linspace(-180.0, 180.0, 24, endpoint=False)
+    target = 5.0 * (1.0 + np.cos(np.radians(3.0 * phi)))
+    r = fit_cosine_series(phi, target, [1, 2, 3])
+    assert r.rank == r.n_params == 4
+
+
+def test_rank_deficiency_is_recorded_and_warned(caplog):
+    """Two distinct points cannot determine a 4-parameter model: lstsq returns
+    a minimum-norm solution that fits perfectly and means little."""
+    phi = np.array([0.0, 90.0, 180.0, 270.0])
+    target = np.array([1.0, 2.0, 3.0, 4.0])
+    weights = np.array([1.0, 1.0, 0.0, 0.0])  # only two points survive
+    # ffrefine.cli.setup_logging sets propagate=False on this logger, and test
+    # order decides whether that has happened yet; force it so caplog sees the
+    # record either way.
+    logger = logging.getLogger("ffrefine")
+    previous = logger.propagate
+    logger.propagate = True
+    try:
+        with caplog.at_level("WARNING", logger="ffrefine"):
+            r = fit_cosine_series(phi, target, [1, 2, 3], weights=weights)
+    finally:
+        logger.propagate = previous
+    assert r.rank < r.n_params
+    assert r.rmse == pytest.approx(0.0, abs=1e-9)  # fits the survivors exactly
+    assert "rank deficient" in caplog.text

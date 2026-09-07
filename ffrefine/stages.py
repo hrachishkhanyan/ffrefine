@@ -291,8 +291,33 @@ def setup_logging(outdir: str | Path, verbose: bool = False) -> None:
 
     console = logging.StreamHandler()
     console.setFormatter(fmt)
+    console.addFilter(_FileOnlyFilter())
     log.addHandler(console)
 
     file_handler = logging.FileHandler(outdir / "run.log", encoding="utf-8")
     file_handler.setFormatter(fmt)
     log.addHandler(file_handler)
+
+
+class _FileOnlyFilter(logging.Filter):
+    """Drop records marked ``file_only`` so they reach run.log but not stderr.
+
+    Used for material a stage already prints to stdout in a nicer form (the
+    BIC ranking table): it belongs in the durable log, but echoing it on
+    stderr as well would show the user the same table twice.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "file_only", False)
+
+
+def log_to_run_log(message: str) -> None:
+    """Record ``message`` in ``run.log`` without echoing it to the console.
+
+    A no-op before :func:`setup_logging` has run (a ``--dry-run`` writes
+    nothing at all), since the logger then has no handlers.
+
+    Args:
+        message: text to record; may span several lines.
+    """
+    logging.getLogger("ffrefine").info("%s", message, extra={"file_only": True})
