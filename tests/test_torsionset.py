@@ -39,10 +39,41 @@ def test_target_entries_match_reversed_direction(butane_itp):
     assert len(find_target_entries(t, (11, 8, 5, 1))) == 2
 
 
-def test_impropers_never_included(butane_itp):
-    t = read_topology(butane_itp)
+def test_impropers_never_included(tmp_path, butane_itp):
+    """Spec section 9.4: impropers (funct 2 and 4) are never in T.
+
+    Item 18: this used to run against the plain butane fixture, which has no
+    impropers at all, so the assertion could not fail -- verified by mutating
+    ``collect_torsion_set`` to include ``topology.impropers``, which the old
+    body still passed. It now uses the synthetic funct-4 entry from
+    ``test_topwriter.py::test_impropers_survive_zeroing`` -- one that shares
+    the target's exact atom indices AND its central bond, so nothing but the
+    funct distinguishes it -- plus a funct-2 sibling.
+    """
+    text = butane_itp.read_text().replace(
+        "[ dihedrals ]\n",
+        "[ dihedrals ]\n"
+        "    1   5   8  11      4    0.000    10.00000     2  ; synthetic improper\n"
+        "    6   5   8   9      2    0.000    10.00000     2  ; synthetic improper\n",
+    )
+    src = tmp_path / "with_impropers.itp"
+    src.write_text(text, newline="\n")
+    t = read_topology(src)
+    assert len(t.impropers) == 2, "fixture did not actually add impropers"
+    assert {d.funct for d in t.impropers} == {2, 4}
+    # Both impropers sit on the target central bond, so only the funct keeps
+    # them out of T.
+    assert all(d.central_bond == (5, 8) for d in t.impropers)
+
     tset = collect_torsion_set(t, (1, 5, 8, 11))
     assert all(d.funct not in (2, 4) for d in tset)
+    assert len(tset) == 10  # unchanged: the impropers were not swept in
+    assert all(d not in tset for d in t.impropers)
+
+    # find_target_entries shares the same source, so it must agree.
+    targets = find_target_entries(t, (1, 5, 8, 11))
+    assert len(targets) == 2
+    assert all(d.funct == 9 for d in targets)
 
 
 def test_methyl_torsions_excluded(butane_itp):

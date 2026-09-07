@@ -22,8 +22,12 @@ class ProfileStats:
         barriers_kj: barrier height between each pair of consecutive minima
             (wrapping around the periodic boundary), kJ/mol.
         global_min_deg: angular position of the lowest-energy minimum.
-        max_barrier_kj: the largest entry in barriers_kj, or 0.0 if there is
-            at most one minimum.
+        max_barrier_kj: the largest entry in barriers_kj, or 0.0 when
+            barriers_kj is empty -- which happens only when *no* minimum was
+            detected. A single minimum still yields one barrier: the pairing
+            wraps that minimum to itself, giving the full swing from it to the
+            profile's maximum. The previous wording ("at most one minimum")
+            was wrong about the single-minimum case.
     """
 
     minima_deg: list[float]
@@ -40,6 +44,15 @@ def profile_stats(phi_deg: np.ndarray, energy_kj: np.ndarray) -> ProfileStats:
     to detect minima wraps around the array ends: a minimum sitting at or
     near +/-180 is compared against the samples on the far side of the wrap
     and is not missed by an interior-only scan.
+
+    **That wrap assumes the samples span a full period.** ``np.roll`` joins
+    the last sample to the first unconditionally, so for a *partial* scan --
+    say 0 to 180 degrees only -- the two endpoints are treated as neighbours
+    even though they are not, and a spurious minimum (and the barrier
+    computed across that seam) can appear. Nothing here can detect the
+    difference between a partial scan and a full one with a large gap, so
+    this is a documented precondition rather than a check: pass a profile
+    covering the whole period.
 
     Args:
         phi_deg: dihedral values in degrees, any order.

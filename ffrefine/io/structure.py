@@ -57,7 +57,24 @@ class Structure:
 
 
 def guess_element(atom_name: str, mass: float | None = None) -> str:
-    """Infer an element symbol from an atom name, optionally checked by mass."""
+    """Infer an element symbol from an atom name.
+
+    Args:
+        atom_name: the name as written in the structure file. Leading digits
+            are stripped, then a two-letter prefix is matched against the
+            known two-letter elements before falling back to the first letter.
+        mass: **ignored.** Accepted only so callers that have a mass to hand
+            can pass it without a conditional. Deciding an element from a mass
+            is a separate check and lives in
+            :func:`ffrefine.io.validate._element_from_mass`, which
+            :func:`ffrefine.io.validate.validate_structure_topology` uses to
+            cross-check this function's answer. The docstring previously
+            claimed the mass was used here; it never was.
+
+    Returns:
+        The element symbol, capitalised (e.g. "C", "Cl"), or "X" for a name
+        with nothing left after stripping digits.
+    """
     name = atom_name.strip().lstrip("0123456789")
     if not name:
         return "X"
