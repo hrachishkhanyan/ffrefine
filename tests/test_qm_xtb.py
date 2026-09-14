@@ -52,3 +52,26 @@ def test_scan_input_is_written_with_lf(tmp_path):
 def test_scan_input_rejects_a_repeated_atom(tmp_path):
     with pytest.raises(ValidationError):
         write_scan_input(tmp_path / "scan.inp", (1, 5, 5, 11), 0.0, 345.0, 24)
+
+
+def test_scan_input_emits_target_before_freeze_dihedrals(tmp_path):
+    """$scan's ``1:`` addresses the first dihedral constraint in $constrain.
+    If the target quad's constraint line were emitted after freeze lines,
+    reordering would silently scan the wrong bond with exit 0, producing
+    a scientifically wrong result that looks correct to automated checks.
+    Assert the target appears before every freeze entry."""
+    text = write_scan_input(
+        tmp_path / "scan.inp",
+        (1, 5, 8, 11),
+        0.0,
+        345.0,
+        24,
+        freeze=[(2, 6, 7, 9), (3, 4, 5, 10)],
+    )
+    constrain, _ = text.split("$scan")
+    lines = constrain.split("\n")
+    dihedral_lines = [i for i, line in enumerate(lines) if "dihedral:" in line]
+    # First dihedral line is the target (1,5,8,11); the rest are freeze entries.
+    assert "1,5,8,11" in lines[dihedral_lines[0]]
+    assert "2,6,7,9" in lines[dihedral_lines[1]]
+    assert "3,4,5,10" in lines[dihedral_lines[2]]
