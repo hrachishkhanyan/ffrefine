@@ -72,6 +72,31 @@ def test_merge_pairs_by_angle_not_by_index():
     relative = merged.energy_kj - merged.energy_kj.min()
     assert relative[0] == pytest.approx(0.0, abs=1e-9)
     assert relative[3] == pytest.approx(20.69, abs=0.1)
+    # Forward's 180 deg point has no reverse partner within tolerance (its
+    # nearest reverse angle is 60 deg away): under correct angle pairing it
+    # is reported unpaired. Index pairing would instead pair every forward
+    # point with something and this list would come back empty.
+    assert merged.unpaired_forward_deg == pytest.approx([180.0])
+
+
+def test_merge_does_not_erase_a_barrier_by_pairing_on_index():
+    """Nearest-angle and same-index pairing diverge starkly on this profile.
+
+    The reverse leg traverses backwards (as a real reverse scan does), so its
+    phi_deg is the forward leg's reversed. Under correct angle pairing,
+    forward's 0 deg point pairs with reverse's 0 deg entry (energy 90), so the
+    merged energy at 0 deg is 90. Under index pairing, forward's 0 deg (index
+    0) would instead pair with reverse's FIRST entry -- 180 deg, energy 0 --
+    and "take the lower energy" would write 0 onto the 0 deg point, erasing
+    the 100 kJ/mol barrier between the 0 deg and 180 deg ends of the profile.
+    """
+    frames = np.zeros((3, 4, 3))
+    fwd = ScanLeg(frames, np.array([100.0, 50.0, 0.0]), np.array([0.0, 90.0, 180.0]), "forward")
+    rev = ScanLeg(frames, np.array([0.0, 50.0, 90.0]), np.array([180.0, 90.0, 0.0]), "reverse")
+
+    merged = merge_bidirectional(fwd, rev, tol_deg=5.0)
+
+    assert merged.energy_kj == pytest.approx([90.0, 50.0, 0.0])
 
 
 def test_merge_takes_the_lower_energy_at_each_paired_point():
