@@ -1,0 +1,6 @@
+$constrain
+  force constant=1.0
+  dihedral: 1,5,8,11,auto
+$scan
+  1: 0.0,360.0,4
+$end
