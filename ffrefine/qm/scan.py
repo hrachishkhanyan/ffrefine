@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..errors import ValidationError
-from ..geometry import dihedral_deg_frames, wrap_deg
+from ..geometry import dihedral_deg_frames, kabsch_rmsd, wrap_deg
 
 Quad = tuple[int, int, int, int]
 
@@ -179,3 +179,115 @@ def merge_bidirectional(forward: ScanLeg, reverse: ScanLeg, tol_deg: float) -> M
         unpaired_forward_deg=unpaired_forward,
         unpaired_reverse_deg=unpaired_reverse,
     )
+
+
+MAD_TO_SIGMA = 1.4826
+"""Scales a median absolute deviation to a standard-deviation-equivalent for normal data."""
+
+MIN_POINTS_FOR_OUTLIER = 4
+"""Fewest adjacent gaps from which calling one an outlier is meaningful."""
+
+UNIFORM_STEP_FACTOR = 3.0
+"""When every step is identical, a hop is one this many times the median step."""
+
+
+@dataclass
+class Hop:
+    """A suspected conformational hop between two adjacent scan frames.
+
+    Attributes:
+        index: the later frame of the pair (so the hop is between
+            ``index - 1`` and ``index``, or between the last frame and frame 0
+            when ``index`` is 0 and the scan is cyclic).
+        phi_deg: that frame's measured dihedral.
+        rmsd_nm: the aligned heavy-atom RMSD across the pair.
+        threshold_nm: the outlier threshold it exceeded.
+    """
+
+    index: int
+    phi_deg: float
+    rmsd_nm: float
+    threshold_nm: float
+
+
+def find_hops(
+    frames_nm: np.ndarray,
+    heavy_indices: list[int],
+    phi_deg: np.ndarray,
+    k_mad: float = 5.0,
+    cyclic: bool = True,
+) -> list[Hop]:
+    """Flag adjacent frames that look like a conformational hop (spec 4.3).
+
+    **Why this is an outlier test and not a threshold.**  In a relaxed torsion
+    scan, adjacent frames differ by the scanned dihedral *by construction*, so
+    the aligned heavy-atom RMSD between them is never zero and no absolute
+    cutoff carries meaning across molecules -- a large flexible molecule's
+    normal step dwarfs a small rigid one's genuine hop.  What a hop actually
+    looks like is a *spike* against the run of typical steps, so the statistic
+    has to be relative to those steps and robust to the very outliers it is
+    hunting.  Hence ``median + k * 1.4826 * MAD``.
+
+    Hydrogens are excluded because a rotating methyl produces a large RMSD
+    every step without any conformational change; spec 4.3 says heavy-atom
+    RMSD for exactly this reason.
+
+    The tool reports and continues (spec 4.3): a hop makes the profile
+    unfittable by a smooth periodic function, but whether to re-scan, freeze
+    another dihedral or accept it is the user's call, not this function's.
+
+    Args:
+        frames_nm: shape (nframes, natoms, 3).
+        heavy_indices: 0-based indices of the non-hydrogen atoms.
+        phi_deg: measured angles, shape (nframes,), for reporting.
+        k_mad: how many scaled MADs above the median counts as a hop.
+        cyclic: also compare the last frame with the first.  Correct for the
+            default full-turn grid, where they are one step apart in angle;
+            pass False for a partial scan, where they are not adjacent at all.
+
+    Returns:
+        The flagged hops, in frame order.  Empty when there are too few gaps
+        to judge an outlier, or when every gap is identical.
+    """
+    frames = np.asarray(frames_nm, float)
+    if len(frames) < 2 or not heavy_indices:
+        return []
+
+    pairs = [(i - 1, i) for i in range(1, len(frames))]
+    if cyclic and len(frames) > 2:
+        pairs.append((len(frames) - 1, 0))
+
+    rmsds = np.array(
+        [kabsch_rmsd(frames[a][heavy_indices], frames[b][heavy_indices]) for a, b in pairs]
+    )
+    if len(rmsds) < MIN_POINTS_FOR_OUTLIER:
+        return []
+
+    median = float(np.median(rmsds))
+    mad = float(np.median(np.abs(rmsds - median)))
+    spread = k_mad * MAD_TO_SIGMA * mad
+    if spread > 0.0:
+        threshold = median + spread
+    elif median > 0.0:
+        # Every adjacent step is exactly the same size, so the MAD sets no
+        # scale.  That is the *easiest* baseline to judge against, not an
+        # impossible one: bailing out here would blind the detector precisely
+        # when the scan is cleanest, so a hop becomes any step materially
+        # larger than the uniform one.
+        threshold = median * UNIFORM_STEP_FACTOR
+    else:
+        # Every frame is identical -- no motion at all, so nothing is a hop.
+        return []
+
+    hops = []
+    for (_, later), rmsd in zip(pairs, rmsds):
+        if rmsd > threshold:
+            hops.append(
+                Hop(
+                    index=int(later),
+                    phi_deg=float(phi_deg[later]),
+                    rmsd_nm=float(rmsd),
+                    threshold_nm=float(threshold),
+                )
+            )
+    return sorted(hops, key=lambda h: h.index)

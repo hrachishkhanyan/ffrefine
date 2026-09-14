@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 
 from ffrefine.errors import ValidationError
-from ffrefine.qm.scan import ScanLeg, measure_angles, merge_bidirectional
+from ffrefine.qm.scan import Hop, ScanLeg, find_hops, measure_angles, merge_bidirectional
 from ffrefine.qm.xtb import parse_scan_log
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "butane" / "xtb"
@@ -166,3 +166,104 @@ def test_merge_keeps_the_frame_belonging_to_the_chosen_energy():
     merged = merge_bidirectional(fwd, rev, tol_deg=5.0)
 
     assert merged.frames_nm[0] == pytest.approx(rev_frames[0])
+
+
+def _sweep(n: int = 12, natoms: int = 8, jitter: float = 0.0, seed: int = 0) -> np.ndarray:
+    """Frames sweeping a full turn: half the atoms rotate about z.
+
+    Two properties matter and both are easy to get wrong.  The motion is
+    **non-rigid** (only half the atoms move), because Kabsch alignment removes
+    rigid motion entirely -- a whole-molecule translation would produce an RMSD
+    of zero no matter how large it is.  And it is **periodic**, so the last
+    frame sits one step from the first, which is what a real torsion scan looks
+    like and what makes the cyclic wrap check meaningful.
+    """
+    rng = np.random.default_rng(seed)
+    base = rng.normal(size=(natoms, 3)) * 0.1
+    half = natoms // 2
+    out = []
+    for step in range(n):
+        angle = 2.0 * np.pi * step / n
+        frame = base.copy()
+        c, s = np.cos(angle), np.sin(angle)
+        x, y = base[half:, 0].copy(), base[half:, 1].copy()
+        frame[half:, 0] = c * x - s * y
+        frame[half:, 1] = s * x + c * y
+        if jitter:
+            frame = frame + rng.normal(size=(natoms, 3)) * jitter
+        out.append(frame)
+    return np.stack(out)
+
+
+def _phi(frames: np.ndarray) -> np.ndarray:
+    return np.linspace(-180.0, 180.0, len(frames), endpoint=False)
+
+
+def test_find_hops_is_silent_on_a_smooth_scan():
+    """A clean sweep has uniform steps and no hops."""
+    frames = _sweep()
+    assert find_hops(frames, list(range(frames.shape[1])), _phi(frames)) == []
+
+
+def test_find_hops_is_silent_on_a_jittered_scan():
+    """Real scans wobble; wobble is not a hop.  Exercises the MAD branch."""
+    frames = _sweep(jitter=0.002)
+    assert find_hops(frames, list(range(frames.shape[1])), _phi(frames)) == []
+
+
+def test_find_hops_flags_a_planted_spike():
+    """Half the atoms jump between frames 6 and 7 -- a non-rigid rearrangement.
+
+    Also the regression for the uniform-step case: a clean sweep has identical
+    adjacent RMSDs, so the MAD is exactly zero.  An implementation that bails
+    out when MAD is zero would find nothing here, which is backwards -- a
+    perfectly uniform run of steps is the *easiest* baseline to spot a spike
+    against, not an impossible one.
+    """
+    frames = _sweep()
+    half = frames.shape[1] // 2
+    frames[7:, :half] += 0.5
+
+    hops = find_hops(frames, list(range(frames.shape[1])), _phi(frames), cyclic=False)
+
+    assert [h.index for h in hops] == [7]
+    assert hops[0].rmsd_nm > hops[0].threshold_nm
+
+
+def test_find_hops_ignores_hydrogens():
+    """Spec 4.3 says heavy-atom RMSD; a spinning methyl is not a hop."""
+    frames = _sweep(natoms=8)
+    frames[5:, 4:] += 2.0  # only the atoms we will exclude move
+    heavy = [0, 1, 2, 3]
+
+    assert find_hops(frames, heavy, _phi(frames), cyclic=False) == []
+
+
+def test_find_hops_checks_the_wrap_pair_only_when_cyclic():
+    """A full-turn scan's last and first frames are one step apart in angle."""
+    frames = _sweep()
+    half = frames.shape[1] // 2
+    frames[-1, :half] += 0.5
+
+    cyclic = {
+        h.index for h in find_hops(frames, list(range(frames.shape[1])), _phi(frames), cyclic=True)
+    }
+    linear = {
+        h.index for h in find_hops(frames, list(range(frames.shape[1])), _phi(frames), cyclic=False)
+    }
+
+    assert 0 in cyclic  # the wrap pair (last frame -> frame 0)
+    assert 0 not in linear  # ... and only when asked for
+
+
+def test_find_hops_survives_identical_frames():
+    """No motion at all: median and MAD are both zero, and nothing is a hop."""
+    frames = np.zeros((6, 4, 3))
+    assert find_hops(frames, [0, 1, 2, 3], _phi(frames), cyclic=False) == []
+
+
+def test_find_hops_needs_enough_points_to_judge_an_outlier():
+    """Two frames give one gap; calling it an outlier against itself is nonsense."""
+    frames = np.zeros((2, 4, 3))
+    frames[1, :2] += 5.0
+    assert find_hops(frames, [0, 1, 2, 3], np.array([0.0, 90.0]), cyclic=False) == []
