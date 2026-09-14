@@ -251,3 +251,46 @@ def test_multimodel_pdb_uses_lf_line_endings(tmp_path, butane_pdb):
     out = tmp_path / "traj.pdb"
     st.write_multimodel_pdb(out, s, np.stack([s.coords, s.coords]))
     assert b"\r\n" not in out.read_bytes()
+
+
+def test_write_xyz_roundtrips_through_read_xyz(tmp_path, butane_pdb):
+    from ffrefine.io.structure import read_pdb, read_xyz, write_xyz
+
+    original = read_pdb(butane_pdb)
+    out = tmp_path / "mol.xyz"
+    write_xyz(out, original, comment="butane test")
+
+    back = read_xyz(out)
+    assert back.natoms == original.natoms
+    assert back.elements == original.elements
+    assert back.coords == pytest.approx(original.coords, abs=1e-6)
+
+
+def test_write_xyz_is_in_angstrom_and_lf(tmp_path, butane_pdb):
+    from ffrefine.io.structure import read_pdb, write_xyz
+
+    s = read_pdb(butane_pdb)
+    out = tmp_path / "mol.xyz"
+    write_xyz(out, s, comment="c")
+
+    raw = out.read_bytes()
+    assert b"\r\n" not in raw
+    lines = out.read_text().splitlines()
+    assert lines[0].strip() == str(s.natoms)
+    assert lines[1] == "c"
+    # First atom's x in Angstrom is ten times the nm value.
+    assert float(lines[2].split()[1]) == pytest.approx(s.coords[0][0] * 10.0, abs=1e-6)
+
+
+def test_write_xyz_accepts_explicit_coords(tmp_path, butane_pdb):
+    """Scan frames are passed as a separate array, not via structure.coords."""
+    import numpy as np
+
+    from ffrefine.io.structure import read_pdb, read_xyz, write_xyz
+
+    s = read_pdb(butane_pdb)
+    shifted = s.coords + 0.5
+    out = tmp_path / "mol.xyz"
+    write_xyz(out, s, coords=shifted)
+
+    assert read_xyz(out).coords == pytest.approx(shifted, abs=1e-6)

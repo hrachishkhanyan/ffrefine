@@ -83,12 +83,9 @@ def butane_xyz(tmp_path, butane_pdb) -> Path:
     apart: an .xyz carries elements and coordinates only, which is exactly the
     point of the tests that use it.
     """
-    from ffrefine.io.structure import ANGSTROM_TO_NM, read_pdb
+    from ffrefine.io.structure import read_pdb, write_xyz
 
     s = read_pdb(butane_pdb)
-    lines = [str(s.natoms), "butane, from butane.pdb"]
-    for element, (x, y, z) in zip(s.elements, s.coords / ANGSTROM_TO_NM):
-        lines.append(f"{element:<2s} {x:>12.6f} {y:>12.6f} {z:>12.6f}")
     out = tmp_path / "butane.xyz"
-    out.write_text("\n".join(lines) + "\n", newline="\n")
+    write_xyz(out, s, comment="butane, from butane.pdb")
     return out

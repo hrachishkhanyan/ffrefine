@@ -12,9 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from ..errors import ParseError
-
-ANGSTROM_TO_NM: float = 0.1
-"""Length convention for PDB/XYZ.  Energy conversions live in units.py."""
+from ..units import ANGSTROM_TO_NM  # re-exported: historically defined here
 
 _TWO_LETTER = {"CL", "BR", "NA", "MG", "ZN", "CA", "FE", "SI", "LI", "AL"}
 
@@ -255,3 +253,35 @@ def write_multimodel_pdb(path: str | Path, structure: Structure, frames: np.ndar
     # newline="\n" for consistency with every other file ffrefine hands to
     # GROMACS (see ffrefine.mm.gromacs and ffrefine.io.topwriter).
     Path(path).write_text("\n".join(out) + "\n", newline="\n")
+
+
+def write_xyz(
+    path: str | Path,
+    structure: Structure,
+    coords: np.ndarray | None = None,
+    comment: str = "",
+) -> None:
+    """Write one geometry as a plain .xyz in Angstrom.
+
+    xtb and ORCA both read this format and both work in Angstrom, while
+    ffrefine carries coordinates in nm, so the conversion happens here via
+    :data:`ffrefine.units.ANGSTROM_TO_NM` -- the project's single conversion
+    point (spec section 9.8).
+
+    Atom order is the structure's, which is the topology's, which is what xtb
+    will echo back in ``xtbscan.log``.  Nothing downstream re-derives the
+    order, so it must not be permuted here.
+
+    Args:
+        path: destination file.
+        structure: supplies element symbols and the atom count.
+        coords: shape (natoms, 3) in nm; defaults to ``structure.coords``.
+        comment: the second line of the file, free text.
+    """
+    xyz = structure.coords if coords is None else np.asarray(coords, float)
+    if xyz.shape != (structure.natoms, 3):
+        raise ValueError(f"coords shape {xyz.shape} incompatible with {structure.natoms} atoms")
+    lines = [str(structure.natoms), comment]
+    for element, (x, y, z) in zip(structure.elements, xyz / ANGSTROM_TO_NM):
+        lines.append(f"{element:<2s} {x:>14.8f} {y:>14.8f} {z:>14.8f}")
+    Path(path).write_text("\n".join(lines) + "\n", newline="\n")
