@@ -224,6 +224,49 @@ def test_run_scan_refuses_a_short_scan(tmp_path, butane_pdb, monkeypatch):
         )
 
 
+def test_run_scan_refuses_identical_frames(tmp_path, butane_pdb, monkeypatch):
+    """R44: xtb can stall the relaxed-scan optimiser (seen under -P > 1 in this
+    environment) and still exit 0, report RELAXED SCAN, and write a log with
+    exactly the requested frame count -- every existing check passes even
+    though the geometry never moved. A real relaxed scan moves atoms at every
+    grid point by construction, so N identical frames is direct proof the
+    scan did not run and must be refused, not returned as data.
+    """
+    import shutil as _shutil
+
+    import ffrefine.qm.xtb as mod
+
+    class _Proc:
+        stdout = "RELAXED SCAN\nnormal termination of xtb"
+        stderr = ""
+        returncode = 0
+
+    def _fake(argv, workdir, log_stem, **kwargs):
+        # Four copies of the fixture's first frame: same atom count and
+        # frame count as requested below, but zero geometric motion.
+        first_frame = "\n".join(
+            (FIXTURES / "xtbscan_forward_4pt.log").read_text().splitlines()[0:16]
+        )
+        stalled_log = "\n".join([first_frame] * 4) + "\n"
+        (Path(workdir) / "xtbscan.log").write_text(stalled_log, newline="\n")
+        return _Proc()
+
+    monkeypatch.setattr(mod, "run_command", _fake)
+    s = read_pdb(butane_pdb)
+    with pytest.raises(ExternalToolError, match="identical|stall"):
+        run_scan(
+            Binaries(xtb="/usr/bin/true"),
+            s,
+            (1, 5, 8, 11),
+            tmp_path,
+            start_deg=0.0,
+            end_deg=360.0,
+            npoints=4,
+            charge=0,
+            uhf=0,
+        )
+
+
 @pytest.mark.needs_xtb
 def test_run_scan_drives_real_xtb(tmp_path, butane_pdb, xtb_bin):
     """Spec 4.3's runtime verification, as a test rather than as prose.

@@ -301,4 +301,17 @@ def run_scan(
             f"{log_path} has {frames_nm.shape[1]} atoms per frame, but the structure has "
             f"{structure.natoms}"
         )
+    # R44: xtb can report RELAXED SCAN, exit 0, and write a log with exactly the
+    # requested frame count while the constrained optimiser stalled and never
+    # moved the geometry past its pre-scan value -- every check above passes on
+    # that output. A real relaxed scan moves the atoms at every grid point by
+    # construction, so frames identical to the first are direct proof the scan
+    # did not run and must be refused rather than returned as data.
+    if len(frames_nm) > 1 and np.all(frames_nm[1:] == frames_nm[0]):
+        raise ExternalToolError(
+            f"all {len(frames_nm)} frames in {log_path} are identical to the input "
+            "geometry; the scan reported success but never moved the structure. This "
+            "has been seen when the xtb relaxed-scan optimiser stalls under -P values "
+            "greater than 1. Re-run with --nthreads 1."
+        )
     return frames_nm, energy_kj
