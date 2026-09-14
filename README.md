@@ -309,6 +309,18 @@ type -- applied as a CHARMM type it would hit every quadruplet matching those
 atom types. The emitted `.prm` block carries a loud warning to that effect
 unless `--distribute` was used.
 
+**The `.prm` block covers one dihedral type, not the whole torsion set.** Even
+with `--distribute`, `03_fit/dihedral.prm` emits a single type signature -- the
+target quadruplet's. The `N_T` quadruplets about the bond generally span
+several types (on the butane fixture, 9 quadruplets span three), so the block
+carries only the share belonging to that one type and does **not** reproduce
+`03_fit/dihedral.itp`. The block states its own coverage and lists the
+combinations it omits. Use the `.itp` for GROMACS; treat the `.prm` as a
+starting point for a CHARMM parameterisation. Emitting the other signatures is
+deliberately out of scope: a generic CGenFF type such as
+`HGA2-CG321-CG321-HGA2` would, if redefined, perturb every molecule containing
+that motif.
+
 **Vacuum throughout.** The MM reference is gas phase, so the QM scan must be
 too. No implicit solvent enters the torsion profile, and a torsion fitted in
 vacuum is not automatically the right torsion in water.

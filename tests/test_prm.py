@@ -257,3 +257,82 @@ def test_distribution_count_is_quadruplets_not_term_lines(butane_itp):
     t = read_topology(butane_itp)
     assert len(collect_torsion_set(t, (1, 5, 8, 11))) == 10
     assert distribution_count(t, (1, 5, 8, 11)) == 9
+
+
+def _charmm_type_key(types: tuple[str, ...]) -> tuple[str, ...]:
+    """A CHARMM dihedral type is direction-insensitive: A-B-C-D == D-C-B-A."""
+    return min(types, tuple(reversed(types)))
+
+
+def _types_of(topology, key) -> tuple[str, ...]:
+    return tuple(topology.atoms[i - 1].atype for i in key[:4])
+
+
+def test_prm_distribute_note_does_not_claim_the_block_reproduces_the_itp(tmp_path, butane_itp):
+    """Ruling R40: one type signature is emitted, so the block is NOT the .itp.
+
+    The note asserted "CHARMM sums this type over every matching quadruplet, as
+    GROMACS does, so the two must agree" while listing all 9 quadruplets under
+    "Quadruplets covered".  Only ``CG331-CG321-CG321-CG331`` is emitted, and on
+    butane it matches 1 of those 9 -- so a user pasting the block gets one ninth
+    of the torsional correction the claim promises.  The Kchi number is right;
+    the claim of equivalence is what has to go.
+    """
+    t = read_topology(butane_itp)
+    text = write_prm_block(
+        t,
+        (1, 5, 8, 11),
+        np.array([5.0]),
+        np.array([0.0]),
+        np.array([3]),
+        tmp_path / "o.prm",
+        distribute=True,
+    )
+    assert "so the two must agree" not in text
+    assert "Quadruplets covered" not in text
+
+
+def test_prm_distribute_note_names_the_single_type_it_emits_and_its_share(tmp_path, butane_itp):
+    """The reader must be able to see what fraction of T this entry covers."""
+    t = read_topology(butane_itp)
+    text = write_prm_block(
+        t,
+        (1, 5, 8, 11),
+        np.array([5.0]),
+        np.array([0.0]),
+        np.array([3]),
+        tmp_path / "o.prm",
+        distribute=True,
+    )
+    assert "CG331-CG321-CG321-CG331" in text
+    # 1 quadruplet of the 9 carries the emitted type.
+    assert "1 of the 9" in text
+
+
+def test_prm_distribute_note_names_every_type_it_does_not_emit(tmp_path, butane_itp):
+    """Each type combination about the bond that is left out must be named.
+
+    Generalised rather than hard-coded: whatever type signatures the fixture's
+    torsion set spans, every one the block does not emit has to appear in the
+    note, so the omission cannot be silent.
+    """
+    t = read_topology(butane_itp)
+    text = write_prm_block(
+        t,
+        (1, 5, 8, 11),
+        np.array([5.0]),
+        np.array([0.0]),
+        np.array([3]),
+        tmp_path / "o.prm",
+        distribute=True,
+    )
+    emitted = _charmm_type_key(_types_of(t, (1, 5, 8, 11)))
+    omitted = {
+        _charmm_type_key(_types_of(t, key))
+        for key in distinct_entry_keys(t, (1, 5, 8, 11))
+        if _charmm_type_key(_types_of(t, key)) != emitted
+    }
+    # The fixture must actually exercise the gap, or this test proves nothing.
+    assert omitted
+    for types in omitted:
+        assert "-".join(types) in text
