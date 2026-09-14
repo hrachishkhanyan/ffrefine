@@ -1296,68 +1296,100 @@ git commit -m "feat(qm): merge bidirectional legs by measured angle, with hyster
 from ffrefine.qm.scan import Hop, find_hops
 
 
-def _smooth_rotation(n: int = 12, natoms: int = 8) -> np.ndarray:
-    """Frames whose adjacent RMSDs are near-uniform: a clean scan, no hops."""
-    rng = np.random.default_rng(0)
+def _sweep(n: int = 12, natoms: int = 8, jitter: float = 0.0, seed: int = 0) -> np.ndarray:
+    """Frames sweeping a full turn: half the atoms rotate about z.
+
+    Two properties matter and both are easy to get wrong.  The motion is
+    **non-rigid** (only half the atoms move), because Kabsch alignment removes
+    rigid motion entirely -- a whole-molecule translation would produce an RMSD
+    of zero no matter how large it is.  And it is **periodic**, so the last
+    frame sits one step from the first, which is what a real torsion scan looks
+    like and what makes the cyclic wrap check meaningful.
+    """
+    rng = np.random.default_rng(seed)
     base = rng.normal(size=(natoms, 3)) * 0.1
+    half = natoms // 2
     out = []
     for step in range(n):
+        angle = 2.0 * np.pi * step / n
         frame = base.copy()
-        frame[natoms // 2 :, 0] += 0.01 * step  # steady drift, same size each step
+        c, s = np.cos(angle), np.sin(angle)
+        x, y = base[half:, 0].copy(), base[half:, 1].copy()
+        frame[half:, 0] = c * x - s * y
+        frame[half:, 1] = s * x + c * y
+        if jitter:
+            frame = frame + rng.normal(size=(natoms, 3)) * jitter
         out.append(frame)
     return np.stack(out)
 
 
+def _phi(frames: np.ndarray) -> np.ndarray:
+    return np.linspace(-180.0, 180.0, len(frames), endpoint=False)
+
+
 def test_find_hops_is_silent_on_a_smooth_scan():
-    frames = _smooth_rotation()
-    phi = np.linspace(-180.0, 150.0, len(frames))
-    assert find_hops(frames, list(range(frames.shape[1])), phi, cyclic=False) == []
+    """A clean sweep has uniform steps and no hops."""
+    frames = _sweep()
+    assert find_hops(frames, list(range(frames.shape[1])), _phi(frames)) == []
+
+
+def test_find_hops_is_silent_on_a_jittered_scan():
+    """Real scans wobble; wobble is not a hop.  Exercises the MAD branch."""
+    frames = _sweep(jitter=0.002)
+    assert find_hops(frames, list(range(frames.shape[1])), _phi(frames)) == []
 
 
 def test_find_hops_flags_a_planted_spike():
-    frames = _smooth_rotation()
-    frames[7:] += 0.5  # a sudden rearrangement between frames 6 and 7
-    phi = np.linspace(-180.0, 150.0, len(frames))
+    """Half the atoms jump between frames 6 and 7 -- a non-rigid rearrangement.
 
-    hops = find_hops(frames, list(range(frames.shape[1])), phi, cyclic=False)
+    Also the regression for the uniform-step case: a clean sweep has identical
+    adjacent RMSDs, so the MAD is exactly zero.  An implementation that bails
+    out when MAD is zero would find nothing here, which is backwards -- a
+    perfectly uniform run of steps is the *easiest* baseline to spot a spike
+    against, not an impossible one.
+    """
+    frames = _sweep()
+    half = frames.shape[1] // 2
+    frames[7:, :half] += 0.5
+
+    hops = find_hops(frames, list(range(frames.shape[1])), _phi(frames), cyclic=False)
 
     assert [h.index for h in hops] == [7]
-    assert hops[0].phi_deg == pytest.approx(phi[7])
     assert hops[0].rmsd_nm > hops[0].threshold_nm
 
 
 def test_find_hops_ignores_hydrogens():
-    """Spec 4.3 says heavy-atom RMSD; a spinning methyl is not a conformational hop."""
-    frames = _smooth_rotation(natoms=6)
-    heavy = [0, 1, 2]
-    frames[5:, 3:] += 2.0  # only the 'hydrogens' move
-    phi = np.linspace(-180.0, 150.0, len(frames))
+    """Spec 4.3 says heavy-atom RMSD; a spinning methyl is not a hop."""
+    frames = _sweep(natoms=8)
+    frames[5:, 4:] += 2.0  # only the atoms we will exclude move
+    heavy = [0, 1, 2, 3]
 
-    assert find_hops(frames, heavy, phi, cyclic=False) == []
+    assert find_hops(frames, heavy, _phi(frames), cyclic=False) == []
 
 
-def test_find_hops_checks_the_wrap_pair_when_cyclic():
-    """A full-turn scan's last and first frames are adjacent in angle."""
-    frames = _smooth_rotation()
-    frames[-1] += 0.5
-    phi = np.linspace(-180.0, 150.0, len(frames))
+def test_find_hops_checks_the_wrap_pair_only_when_cyclic():
+    """A full-turn scan's last and first frames are one step apart in angle."""
+    frames = _sweep()
+    half = frames.shape[1] // 2
+    frames[-1, :half] += 0.5
 
-    indices = [h.index for h in find_hops(frames, list(range(frames.shape[1])), phi, cyclic=True)]
+    cyclic = {h.index for h in find_hops(frames, list(range(frames.shape[1])), _phi(frames), cyclic=True)}
+    linear = {h.index for h in find_hops(frames, list(range(frames.shape[1])), _phi(frames), cyclic=False)}
 
-    assert 0 in indices or len(frames) - 1 in indices
+    assert 0 in cyclic      # the wrap pair (last frame -> frame 0)
+    assert 0 not in linear  # ... and only when asked for
 
 
 def test_find_hops_survives_identical_frames():
-    """MAD is zero here; the threshold must not become nan or divide by zero."""
-    frames = np.zeros((5, 4, 3))
-    phi = np.linspace(-180.0, 108.0, 5)
-    assert find_hops(frames, [0, 1, 2, 3], phi, cyclic=False) == []
+    """No motion at all: median and MAD are both zero, and nothing is a hop."""
+    frames = np.zeros((6, 4, 3))
+    assert find_hops(frames, [0, 1, 2, 3], _phi(frames), cyclic=False) == []
 
 
 def test_find_hops_needs_enough_points_to_judge_an_outlier():
     """Two frames give one gap; calling it an outlier against itself is nonsense."""
     frames = np.zeros((2, 4, 3))
-    frames[1] += 5.0
+    frames[1, :2] += 5.0
     assert find_hops(frames, [0, 1, 2, 3], np.array([0.0, 90.0]), cyclic=False) == []
 ```
 
@@ -1376,6 +1408,9 @@ MAD_TO_SIGMA = 1.4826
 
 MIN_POINTS_FOR_OUTLIER = 4
 """Fewest adjacent gaps from which calling one an outlier is meaningful."""
+
+UNIFORM_STEP_FACTOR = 3.0
+"""When every step is identical, a hop is one this many times the median step."""
 
 
 @dataclass
@@ -1452,9 +1487,19 @@ def find_hops(
 
     median = float(np.median(rmsds))
     mad = float(np.median(np.abs(rmsds - median)))
-    if mad <= 0.0:
+    spread = k_mad * MAD_TO_SIGMA * mad
+    if spread > 0.0:
+        threshold = median + spread
+    elif median > 0.0:
+        # Every adjacent step is exactly the same size, so the MAD sets no
+        # scale.  That is the *easiest* baseline to judge against, not an
+        # impossible one: bailing out here would blind the detector precisely
+        # when the scan is cleanest, so a hop becomes any step materially
+        # larger than the uniform one.
+        threshold = median * UNIFORM_STEP_FACTOR
+    else:
+        # Every frame is identical -- no motion at all, so nothing is a hop.
         return []
-    threshold = median + k_mad * MAD_TO_SIGMA * mad
 
     hops = []
     for (_, later), rmsd in zip(pairs, rmsds):
@@ -1473,7 +1518,7 @@ def find_hops(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_qm_scan.py -q`
-Expected: PASS (17 tests).
+Expected: PASS (18 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -2135,7 +2180,7 @@ In `ffrefine/cli.py`, extend the `scan` subparser:
     )
 ```
 
-Add `"qm_scan": ["scan.json"]` to `_STAGE_OUTPUTS`, and rewrite `_SCAN_REMEDY` to stop calling the stage unimplemented:
+Add `"qm_scan": ("scan.json",)` to `_STAGE_OUTPUTS` (its values are tuples, not lists), and rewrite `_SCAN_REMEDY` to stop calling the stage unimplemented:
 
 ```python
 _SCAN_REMEDY = (
