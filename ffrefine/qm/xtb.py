@@ -15,7 +15,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ..errors import ValidationError
+import numpy as np
+
+from ..errors import ParseError, ValidationError
+from ..units import angstrom_to_nm, hartree_to_kj
 
 Quad = tuple[int, int, int, int]
 
@@ -91,3 +94,92 @@ def write_scan_input(
     text = "\n".join(lines) + "\n"
     Path(path).write_text(text, newline="\n")
     return text
+
+
+def parse_scan_log(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read an ``xtbscan.log`` into coordinates and energies.
+
+    The file is a plain multi-frame XYZ: an atom-count line, a comment line of
+    the form ``energy: -13.665127531525 xtb: 6.7.1 (edcfbbe)``, then one line
+    per atom with the element symbol and Angstrom coordinates.  Format
+    confirmed against xtb 6.7.1 output, committed under ``fixtures/butane/xtb``.
+
+    Every failure mode here is a *loud* one on purpose: a killed xtb leaves a
+    truncated final frame, and silently returning the frames that did parse
+    would hand the fit a profile with a missing grid point and no indication
+    anything went wrong.
+
+    Args:
+        path: the log file.
+
+    Returns:
+        ``(frames_nm, energy_kj)`` with shapes ``(nframes, natoms, 3)`` in
+        nanometres and ``(nframes,)`` in kJ/mol.  Energies are absolute, not
+        referenced to a minimum.
+
+    Raises:
+        ParseError: the file is empty, a frame is truncated, a comment line
+            carries no ``energy:``, or the atom count varies between frames.
+    """
+    path = Path(path)
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise ParseError(f"could not read {path}: {exc}") from exc
+
+    frames: list[list[list[float]]] = []
+    energies: list[float] = []
+    natoms: int | None = None
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip():
+            i += 1
+            continue
+        try:
+            count = int(lines[i].split()[0])
+        except (ValueError, IndexError) as exc:
+            raise ParseError(f"{path}: expected an atom count at line {i + 1}") from exc
+        if natoms is None:
+            natoms = count
+        elif count != natoms:
+            raise ParseError(
+                f"{path}: atom count changes from {natoms} to {count} at line {i + 1}; "
+                "every frame must describe the same molecule"
+            )
+        if i + 1 >= len(lines):
+            raise ParseError(f"{path}: truncated -- no comment line after line {i + 1}")
+        comment = lines[i + 1]
+        if "energy:" not in comment:
+            raise ParseError(
+                f"{path}: line {i + 2} carries no 'energy:' value: {comment.strip()!r}"
+            )
+        try:
+            energies.append(float(comment.split("energy:")[1].split()[0]))
+        except (ValueError, IndexError) as exc:
+            raise ParseError(f"{path}: unreadable energy on line {i + 2}") from exc
+
+        body = lines[i + 2 : i + 2 + count]
+        if len(body) != count:
+            raise ParseError(
+                f"{path}: truncated -- frame {len(frames) + 1} declares {count} atoms "
+                f"but only {len(body)} follow. xtb probably did not finish."
+            )
+        frame = []
+        for offset, line in enumerate(body):
+            parts = line.split()
+            if len(parts) < 4:
+                raise ParseError(f"{path}: incomplete atom line {i + 3 + offset}: {line!r}")
+            try:
+                frame.append([float(v) for v in parts[1:4]])
+            except ValueError as exc:
+                raise ParseError(
+                    f"{path}: unreadable coordinates on line {i + 3 + offset}"
+                ) from exc
+        frames.append(frame)
+        i += 2 + count
+
+    if not frames:
+        raise ParseError(f"{path}: no frames found; xtb wrote no scan output")
+    return angstrom_to_nm(np.array(frames, dtype=float)), hartree_to_kj(
+        np.array(energies, dtype=float)
+    )

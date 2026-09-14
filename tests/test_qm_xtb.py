@@ -1,7 +1,17 @@
 import pytest
+from pathlib import Path
 
-from ffrefine.errors import ValidationError
-from ffrefine.qm.xtb import scan_grid, write_scan_input
+import numpy as np
+
+from ffrefine.errors import ParseError, ValidationError
+from ffrefine.qm.xtb import parse_scan_log, scan_grid, write_scan_input
+
+FIXTURES = Path(__file__).parent.parent / "fixtures" / "butane" / "xtb"
+
+
+@pytest.fixture
+def forward_log() -> Path:
+    return FIXTURES / "xtbscan_forward_4pt.log"
 
 
 def test_scan_grid_excludes_the_duplicated_endpoint():
@@ -75,3 +85,62 @@ def test_scan_input_emits_target_before_freeze_dihedrals(tmp_path):
     assert "1,5,8,11" in lines[dihedral_lines[0]]
     assert "2,6,7,9" in lines[dihedral_lines[1]]
     assert "3,4,5,10" in lines[dihedral_lines[2]]
+
+
+def test_parse_scan_log_reads_every_frame(forward_log):
+    frames_nm, energy_kj = parse_scan_log(forward_log)
+    assert frames_nm.shape == (4, 14, 3)
+    assert energy_kj.shape == (4,)
+
+
+def test_parse_scan_log_converts_hartree_to_kj(forward_log):
+    """First frame's recorded energy is -13.665127531525 Eh."""
+    _, energy_kj = parse_scan_log(forward_log)
+    assert energy_kj[0] == pytest.approx(-13.665127531525 * 2625.499639, rel=1e-12)
+
+
+def test_parse_scan_log_converts_angstrom_to_nm(forward_log):
+    """The log's first atom is at x = -1.92585140500682 Angstrom."""
+    frames_nm, _ = parse_scan_log(forward_log)
+    assert frames_nm[0][0][0] == pytest.approx(-0.192585140500682, abs=1e-12)
+
+
+def test_parse_scan_log_recovers_the_butane_profile(forward_log):
+    """Sanity: relative energies must reproduce the probe's kJ/mol profile."""
+    _, energy_kj = parse_scan_log(forward_log)
+    relative = energy_kj - energy_kj.min()
+    assert relative == pytest.approx([0.0, 10.741, 10.740, 20.691], abs=0.01)
+
+
+def test_parse_scan_log_rejects_a_truncated_frame(tmp_path):
+    """A killed xtb leaves a partial frame; that must not parse as valid."""
+    path = tmp_path / "xtbscan.log"
+    path.write_text("3\n energy: -1.0 xtb: 6.7.1\nC 0.0 0.0 0.0\nH 1.0 0.0 0.0\n", newline="\n")
+    with pytest.raises(ParseError, match="truncated|incomplete"):
+        parse_scan_log(path)
+
+
+def test_parse_scan_log_rejects_a_missing_energy_comment(tmp_path):
+    path = tmp_path / "xtbscan.log"
+    path.write_text("1\nno energy here\nC 0.0 0.0 0.0\n", newline="\n")
+    with pytest.raises(ParseError, match="energy"):
+        parse_scan_log(path)
+
+
+def test_parse_scan_log_rejects_a_varying_atom_count(tmp_path):
+    """Frames must all describe the same molecule."""
+    path = tmp_path / "xtbscan.log"
+    path.write_text(
+        "1\n energy: -1.0 xtb: x\nC 0.0 0.0 0.0\n"
+        "2\n energy: -2.0 xtb: x\nC 0.0 0.0 0.0\nH 1.0 0.0 0.0\n",
+        newline="\n",
+    )
+    with pytest.raises(ParseError, match="atom count"):
+        parse_scan_log(path)
+
+
+def test_parse_scan_log_rejects_an_empty_file(tmp_path):
+    path = tmp_path / "xtbscan.log"
+    path.write_text("", newline="\n")
+    with pytest.raises(ParseError):
+        parse_scan_log(path)
