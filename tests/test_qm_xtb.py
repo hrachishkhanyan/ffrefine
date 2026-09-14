@@ -3,8 +3,10 @@ from pathlib import Path
 
 import numpy as np
 
-from ffrefine.errors import ParseError, ValidationError
-from ffrefine.qm.xtb import parse_scan_log, scan_grid, write_scan_input
+from ffrefine.config import Binaries
+from ffrefine.errors import ExternalToolError, ParseError, ValidationError
+from ffrefine.io.structure import read_pdb
+from ffrefine.qm.xtb import parse_scan_log, run_scan, scan_grid, write_scan_input
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "butane" / "xtb"
 
@@ -144,3 +146,114 @@ def test_parse_scan_log_rejects_an_empty_file(tmp_path):
     path.write_text("", newline="\n")
     with pytest.raises(ParseError):
         parse_scan_log(path)
+
+
+def test_run_scan_without_xtb_names_the_override_flag(tmp_path, butane_pdb):
+    s = read_pdb(butane_pdb)
+    with pytest.raises(Exception, match="xtb-bin"):
+        run_scan(
+            Binaries(xtb=None),
+            s,
+            (1, 5, 8, 11),
+            tmp_path,
+            start_deg=0.0,
+            end_deg=345.0,
+            npoints=24,
+            charge=0,
+            uhf=0,
+        )
+
+
+def test_run_scan_refuses_when_no_scan_log_appears(tmp_path, butane_pdb, monkeypatch):
+    """If the $scan block were rejected, xtb can exit 0 having written nothing.
+
+    That is the spec 4.3 failure this check exists for: a silent no-op must not
+    be mistaken for a scan.
+    """
+    import ffrefine.qm.xtb as mod
+
+    class _Proc:
+        stdout = "normal termination of xtb"
+        stderr = ""
+        returncode = 0
+
+    monkeypatch.setattr(mod, "run_command", lambda *a, **k: _Proc())
+    s = read_pdb(butane_pdb)
+    with pytest.raises(ExternalToolError, match=r"\$scan|xtbscan.log"):
+        run_scan(
+            Binaries(xtb="/usr/bin/true"),
+            s,
+            (1, 5, 8, 11),
+            tmp_path,
+            start_deg=0.0,
+            end_deg=345.0,
+            npoints=24,
+            charge=0,
+            uhf=0,
+        )
+
+
+def test_run_scan_refuses_a_short_scan(tmp_path, butane_pdb, monkeypatch):
+    """24 points requested, 4 returned, means the scan did not do what was asked."""
+    import shutil as _shutil
+
+    import ffrefine.qm.xtb as mod
+
+    class _Proc:
+        stdout = "RELAXED SCAN\nnormal termination of xtb"
+        stderr = ""
+        returncode = 0
+
+    def _fake(argv, workdir, log_stem, **kwargs):
+        _shutil.copy(FIXTURES / "xtbscan_forward_4pt.log", Path(workdir) / "xtbscan.log")
+        return _Proc()
+
+    monkeypatch.setattr(mod, "run_command", _fake)
+    s = read_pdb(butane_pdb)
+    with pytest.raises(ExternalToolError, match="24"):
+        run_scan(
+            Binaries(xtb="/usr/bin/true"),
+            s,
+            (1, 5, 8, 11),
+            tmp_path,
+            start_deg=0.0,
+            end_deg=345.0,
+            npoints=24,
+            charge=0,
+            uhf=0,
+        )
+
+
+@pytest.mark.needs_xtb
+def test_run_scan_drives_real_xtb(tmp_path, butane_pdb, xtb_bin):
+    """Spec 4.3's runtime verification, as a test rather than as prose.
+
+    Four points keeps this near 15 s; the default 24-point grid takes ~80 s.
+
+    nthreads=1, not the brief's 4: on this xtb 6.7.1 build under WSL2, ``-P 4``
+    makes the relaxed-scan optimizer silently stall (every point converges
+    back to the pre-scan geometry, span 0.0) in roughly half of repeated
+    runs, while -P 1 and -P 2 were reliable across every trial taken. That is
+    exactly the quiet no-op spec 4.3 warns about, just triggered by xtb's own
+    threading rather than by a rejected $scan block -- so it is precisely
+    what this test's span assertion exists to catch, not a reason to weaken
+    it. See task-4-report.md for the reproduction data.
+    """
+    s = read_pdb(butane_pdb)
+    frames_nm, energy_kj = run_scan(
+        Binaries(xtb=xtb_bin),
+        s,
+        (1, 5, 8, 11),
+        tmp_path,
+        start_deg=0.0,
+        end_deg=360.0,
+        npoints=4,
+        charge=0,
+        uhf=0,
+        nthreads=1,
+    )
+    assert frames_nm.shape == (4, s.natoms, 3)
+    assert energy_kj.shape == (4,)
+    # Butane's syn barrier is real chemistry, not a smoke test.
+    span = energy_kj.max() - energy_kj.min()
+    assert 14.0 < span < 26.0

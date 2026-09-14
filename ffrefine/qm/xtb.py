@@ -17,7 +17,10 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from ..errors import ParseError, ValidationError
+from ..config import Binaries
+from ..errors import ExternalToolError, ParseError, ValidationError
+from ..io.structure import Structure, write_xyz
+from ..runner import run_command
 from ..units import angstrom_to_nm, hartree_to_kj
 
 Quad = tuple[int, int, int, int]
@@ -183,3 +186,119 @@ def parse_scan_log(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     return angstrom_to_nm(np.array(frames, dtype=float)), hartree_to_kj(
         np.array(energies, dtype=float)
     )
+
+
+SCAN_LOG_NAME = "xtbscan.log"
+"""Filename xtb writes its relaxed-scan trajectory to, inside the working directory."""
+
+
+def run_scan(
+    binaries: Binaries,
+    structure: Structure,
+    quad: Quad,
+    workdir: str | Path,
+    *,
+    start_deg: float,
+    end_deg: float,
+    npoints: int,
+    charge: int,
+    uhf: int,
+    gfn: int = 2,
+    nthreads: int = 1,
+    freeze: Iterable[Quad] = (),
+    force_constant: float = 1.0,
+    coords_nm: np.ndarray | None = None,
+    log_stem: str = "xtb_scan",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run one relaxed-scan leg and return its geometries and energies.
+
+    Each leg gets its own ``workdir`` because xtb always writes
+    ``xtbscan.log`` into the current directory: running a forward and a
+    reverse leg in one directory would silently overwrite the first.
+
+    Spec 4.3 requires the ``$scan`` syntax be verified against the installed
+    xtb at runtime rather than assumed.  ``xtb --help`` documents no xcontrol
+    block at all (checked on 6.7.1), so verification here is behavioural: the
+    run must report a relaxed scan, must leave a log, and that log must hold
+    exactly the requested number of frames.  A rejected block can otherwise
+    leave xtb exiting 0 having quietly optimised the input geometry once.
+
+    Args:
+        binaries: resolved external programs; ``xtb`` must be set.
+        structure: supplies elements and the default geometry.
+        quad: 1-based target dihedral.
+        workdir: directory to run in; created if absent.
+        start_deg, end_deg, npoints: the scan range (see :func:`scan_grid`).
+        charge: total molecular charge, passed as ``--chrg``.
+        uhf: number of unpaired electrons, passed as ``--uhf``.
+        gfn: GFN parameterisation, passed as ``--gfn``.
+        nthreads: passed as ``-P`` (spec section 8).
+        freeze: extra dihedrals held fixed.
+        force_constant: constraint force constant.
+        coords_nm: starting geometry in nm; defaults to ``structure.coords``.
+            The reverse leg passes the forward leg's final frame.
+        log_stem: base name for the runner's .cmd/.stdout/.stderr files.
+
+    Returns:
+        ``(frames_nm, energy_kj)`` as from :func:`parse_scan_log`.
+
+    Raises:
+        FFRefineError: xtb is not available.
+        ExternalToolError: xtb failed, wrote no scan log, or returned a
+            different number of frames than were requested.
+    """
+    exe = binaries.require("xtb")
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    mol = workdir / "mol.xyz"
+    write_xyz(mol, structure, coords_nm, comment=f"ffrefine scan input, torsion {quad}")
+    inp = workdir / "scan.inp"
+    write_scan_input(inp, quad, start_deg, end_deg, npoints, force_constant, freeze)
+
+    proc = run_command(
+        [
+            exe,
+            mol.name,
+            "--opt",
+            "tight",
+            "--input",
+            inp.name,
+            "--chrg",
+            str(charge),
+            "--uhf",
+            str(uhf),
+            "--gfn",
+            str(gfn),
+            "-P",
+            str(nthreads),
+        ],
+        workdir,
+        log_stem,
+    )
+
+    log_path = workdir / SCAN_LOG_NAME
+    if not log_path.exists():
+        raise ExternalToolError(
+            f"xtb exited 0 but wrote no {SCAN_LOG_NAME} in {workdir}, so no relaxed scan "
+            f"ran. The $scan block in {inp.name} was most likely rejected by this xtb "
+            f"build. Check {log_stem}.stdout for what it made of the input."
+        )
+    if "RELAXED SCAN" not in (proc.stdout or ""):
+        raise ExternalToolError(
+            f"xtb wrote {SCAN_LOG_NAME} but never reported 'RELAXED SCAN'; the $scan block "
+            f"in {inp.name} was not honoured. See {log_stem}.stdout."
+        )
+
+    frames_nm, energy_kj = parse_scan_log(log_path)
+    if len(energy_kj) != npoints:
+        raise ExternalToolError(
+            f"requested {npoints} scan points but {log_path} holds {len(energy_kj)}. "
+            "The scan did not complete, so the profile would have a hole in it."
+        )
+    if frames_nm.shape[1] != structure.natoms:
+        raise ExternalToolError(
+            f"{log_path} has {frames_nm.shape[1]} atoms per frame, but the structure has "
+            f"{structure.natoms}"
+        )
+    return frames_nm, energy_kj

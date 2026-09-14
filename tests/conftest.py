@@ -39,6 +39,15 @@ def gmx_bin() -> str:
 
 
 @pytest.fixture
+def xtb_bin() -> str:
+    """Path to xtb, or skip the test when xtb is unavailable."""
+    exe = shutil.which("xtb")
+    if exe is None:
+        pytest.skip("xtb not on PATH")
+    return exe
+
+
+@pytest.fixture
 def rotated_frames() -> Callable[[Structure, int], np.ndarray]:
     """Factory building frames that sample a molecule's target torsion.
 

@@ -27,4 +27,8 @@ target-version = ["py310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["needs_gmx: requires a working gmx binary"]
+markers = [
+  "needs_gmx: requires a working gmx binary",
+  "needs_xtb: requires a working xtb binary",
+  "needs_orca: requires a working orca binary",
+]
