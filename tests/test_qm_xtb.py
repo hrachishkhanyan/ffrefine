@@ -6,7 +6,13 @@ import numpy as np
 from ffrefine.config import Binaries
 from ffrefine.errors import ExternalToolError, ParseError, ValidationError
 from ffrefine.io.structure import read_pdb
-from ffrefine.qm.xtb import parse_scan_log, run_scan, scan_grid, write_scan_input
+from ffrefine.qm.xtb import (
+    derive_charge,
+    parse_scan_log,
+    run_scan,
+    scan_grid,
+    write_scan_input,
+)
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "butane" / "xtb"
 
@@ -300,3 +306,61 @@ def test_run_scan_drives_real_xtb(tmp_path, butane_pdb, xtb_bin):
     # Butane's syn barrier is real chemistry, not a smoke test.
     span = energy_kj.max() - energy_kj.min()
     assert 14.0 < span < 26.0
+
+
+def test_derive_charge_reads_the_topology_sum(butane_itp):
+    from ffrefine.io.topology import read_topology
+
+    assert derive_charge(read_topology(butane_itp)) == 0
+
+
+def test_derive_charge_rounds_a_near_integer_sum(butane_itp):
+    """CGenFF charges print to 3-4 decimals, so the sum is rarely exact."""
+    from ffrefine.io.topology import read_topology
+
+    top = read_topology(butane_itp)
+    top.atoms[0].charge += 0.999
+    assert derive_charge(top) == 1
+
+
+def test_derive_charge_handles_a_negative_ion(butane_itp):
+    """Rounding must work on both sides of zero, not just upward."""
+    from ffrefine.io.topology import read_topology
+
+    top = read_topology(butane_itp)
+    top.atoms[0].charge -= 1.002
+    assert derive_charge(top) == -1
+
+
+def test_derive_charge_refuses_a_sum_that_is_not_near_an_integer(butane_itp):
+    from ffrefine.io.topology import read_topology
+
+    top = read_topology(butane_itp)
+    top.atoms[0].charge += 0.4
+    with pytest.raises(ValidationError, match="0.4"):
+        derive_charge(top)
+
+
+def test_derive_charge_refusal_names_the_escape_hatch(butane_itp):
+    """A user blocked by this needs to be told how to proceed, not just stopped."""
+    from ffrefine.io.topology import read_topology
+
+    top = read_topology(butane_itp)
+    top.atoms[0].charge += 0.4
+    with pytest.raises(ValidationError, match="--charge"):
+        derive_charge(top)
+
+
+def test_derive_charge_override_wins(butane_itp):
+    from ffrefine.io.topology import read_topology
+
+    assert derive_charge(read_topology(butane_itp), override=-1) == -1
+
+
+def test_derive_charge_override_wins_even_over_a_refusable_sum(butane_itp):
+    """The override is the escape hatch the refusal advertises, so it must not re-check."""
+    from ffrefine.io.topology import read_topology
+
+    top = read_topology(butane_itp)
+    top.atoms[0].charge += 0.4
+    assert derive_charge(top, override=0) == 0
