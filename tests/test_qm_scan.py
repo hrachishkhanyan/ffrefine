@@ -13,6 +13,7 @@ from ffrefine.qm.scan import (
     find_hydrogen_bonds,
     hbond_changes,
     hbond_donors_and_acceptors,
+    heavy_atom_indices,
     measure_angles,
     merge_bidirectional,
 )
@@ -568,3 +569,23 @@ def test_hbond_changes_is_silent_on_butane(butane_pdb, butane_itp):
     s = read_pdb(butane_pdb)
     frames = np.stack([s.coords, s.coords + 0.01])
     assert hbond_changes(frames, read_topology(butane_itp), np.array([0.0, 15.0])) == []
+
+
+def test_heavy_atom_indices_are_zero_based_and_skip_hydrogens():
+    """find_hops indexes numpy frames with these, so they are 0-based."""
+    assert heavy_atom_indices(_glycol_topology()) == [0, 1, 2, 3]
+
+
+def test_heavy_atom_indices_trust_the_mass_over_a_misleading_name():
+    """A hydrogen whose name does not say so is still a hydrogen.
+
+    find_hops excludes hydrogens because a spinning methyl throws a large RMSD
+    every step without any conformational change happening.  An atom misread as
+    heavy puts that rotation straight back into the statistic the hop test is
+    built on, so this has to use the same mass-first rule the donor search
+    does.  guess_element reads the name only and would call this one heavy.
+    """
+    top = _glycol_topology()
+    top.atoms[4].name = "X5"  # H5's name no longer says hydrogen; its mass still does
+
+    assert heavy_atom_indices(top) == [0, 1, 2, 3]

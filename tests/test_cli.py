@@ -226,10 +226,13 @@ def test_run_accepts_the_fit_flags():
 # --------------------------------------------------------------------------
 
 
-def test_scan_reports_not_implemented(capsys):
+def test_scan_no_longer_reports_itself_unimplemented(capsys):
+    """Milestone 4 implemented it, so it fails on the missing input, not on itself."""
     code = main(["scan", "-s", "a.pdb", "-p", "a.itp", "--dihedral", "1,5,8,11"])
     assert code != 0
-    assert "milestone 4" in capsys.readouterr().err.lower()
+    err = capsys.readouterr().err.lower()
+    assert "milestone 4" not in err
+    assert "a.pdb" in err
 
 
 def test_charges_reports_not_implemented(capsys):
@@ -239,13 +242,14 @@ def test_charges_reports_not_implemented(capsys):
 
 
 def test_unimplemented_subcommands_write_nothing(tmp_path, butane_pdb, butane_itp):
-    """They must not be mistakable for working: no outdir, no files, exit != 0."""
+    """They must not be mistakable for working: no outdir, no files, exit != 0.
+
+    ``scan`` left this list when milestone 4 implemented it, so only ``charges``
+    remains.  It takes no --dihedral, because spec section 5 selects atoms
+    rather than a torsion.
+    """
     out = tmp_path / "out"
-    # ``charges`` takes no --dihedral (spec section 5 selects atoms, not a torsion).
-    for argv in (
-        ["scan", "--dihedral", "1,5,8,11"],
-        ["charges"],
-    ):
+    for argv in (["charges"],):
         code = main(argv + ["-s", str(butane_pdb), "-p", str(butane_itp), "--outdir", str(out)])
         assert code != 0
         assert not out.exists()
@@ -578,7 +582,10 @@ def test_fit_without_a_scan_is_a_clean_error(tmp_path, butane_pdb, butane_itp, c
     assert code == 1
     err = capsys.readouterr().err
     assert "scan.json" in err
-    assert "milestone 4" in err.lower()
+    # The remedy now points at a stage that exists, instead of apologising for one
+    # that did not.
+    assert "ffrefine scan" in err
+    assert "milestone 4" not in err.lower()
 
 
 def test_fit_without_mm_energies_is_a_clean_error(tmp_path, butane_pdb, butane_itp, capsys):
@@ -744,12 +751,14 @@ def test_validate_without_scan_geometries_is_a_clean_error(
 
 
 def test_run_says_which_stages_it_skipped(tmp_path, butane_pdb, butane_itp, capsys):
+    """Only charges is skipped now; milestone 4 moved scan into the chain."""
     out = tmp_path / "out"
     code = main(["run"] + _base_args(butane_pdb, butane_itp, out) + ["--dry-run"])
     assert code == 0
     printed = capsys.readouterr().out.lower()
-    assert "scan" in printed and "milestone 4" in printed
     assert "charges" in printed and "milestone 5" in printed
+    assert "milestone 4" not in printed
+    assert "=== scan ===" in printed
 
 
 # --------------------------------------------------------------------------

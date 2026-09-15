@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import logging
 import shutil
 import sys
@@ -95,7 +96,7 @@ from .fit.selection import (
 )
 from .fit.weights import DEFAULT_EMAX, DEFAULT_TEMPERATURE, boltzmann_weights, uniform_weights
 from .io.prm import write_prm_block
-from .io.structure import Structure, read_structure
+from .io.structure import Structure, read_structure, write_multimodel_pdb
 from .io.topology import Topology, read_topology
 from .io.topwriter import write_refit_topology
 from .io.validate import adopt_topology_naming, validate_structure_topology
@@ -103,6 +104,15 @@ from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
 from .mm.validate_fit import validate_refit
 from .plots import plot_fit, plot_mm_zeroed, plot_qm_profile, plot_residuals, plot_validation
+from .qm.scan import (
+    ScanLeg,
+    find_hops,
+    hbond_changes,
+    heavy_atom_indices,
+    measure_angles,
+    merge_bidirectional,
+)
+from .qm.xtb import derive_charge, run_scan, scan_grid
 from .stages import (
     STAGE_DIRS,
     hash_array,
@@ -263,6 +273,41 @@ def _add_torsion(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_scan_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the QM scan flags (also needed by ``run``, which chains the scan)."""
+    parser.add_argument("--step", type=float, help="scan step in degrees (default: 15)")
+    parser.add_argument("--charge", type=int, help="molecular charge (default: from the topology)")
+    parser.add_argument("--uhf", type=int, default=0, help="unpaired electrons (default: 0)")
+    parser.add_argument("--gfn", type=int, default=2, help="xtb GFN parameterisation (default: 2)")
+    parser.add_argument(
+        "--bidirectional",
+        dest="bidirectional",
+        action="store_true",
+        default=True,
+        help="scan forward then back, taking the lower energy (default)",
+    )
+    parser.add_argument(
+        "--no-bidirectional",
+        dest="bidirectional",
+        action="store_false",
+        help="scan in one direction only",
+    )
+    parser.add_argument(
+        "--hysteresis-tol",
+        type=float,
+        default=4.0,
+        help="warn when the two directions differ by more than this, kJ/mol (default: 4)",
+    )
+    parser.add_argument(
+        "--freeze-dihedral",
+        action="append",
+        type=_dihedral_arg,
+        default=None,
+        metavar="i,j,k,l",
+        help="hold another dihedral fixed; repeatable",
+    )
+
+
 def _add_fit_flags(parser: argparse.ArgumentParser) -> None:
     """Add the fit-stage flags (also needed by ``run``, which chains the fit)."""
     parser.add_argument(
@@ -297,10 +342,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"ffrefine {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    scan = sub.add_parser("scan", help="QM relaxed torsion scan (milestone 4, NOT IMPLEMENTED)")
+    scan = sub.add_parser("scan", help="QM relaxed torsion scan (xtb)")
     _add_common(scan)
     _add_torsion(scan)
-    scan.add_argument("--step", type=float, help="scan step in degrees (default: 15)")
+    _add_scan_flags(scan)
 
     mmscan = sub.add_parser("mmscan", help="GROMACS single points with and without the torsion")
     _add_common(mmscan)
@@ -321,6 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run every implemented stage in order")
     _add_common(run)
     _add_torsion(run)
+    _add_scan_flags(run)
     _add_fit_flags(run)
 
     return parser
@@ -582,6 +628,7 @@ def _energies_path(args: argparse.Namespace) -> Path:
 
 
 _STAGE_OUTPUTS: dict[str, tuple[str, ...]] = {
+    "qm_scan": ("scan.json",),
     "mm_scan": ("energies.json",),
     "fit": ("fit.json", "dihedral.itp", "dihedral.prm"),
     "final": ("validation.json", "molecule_refined.itp", "after.itp"),
@@ -606,10 +653,9 @@ def _stage_outputs(args: argparse.Namespace, stage: str) -> list[str | Path]:
 
 
 _SCAN_REMEDY = (
-    "Run 'ffrefine scan' first -- but that stage is milestone 4 and is not implemented "
-    "in this build, so supply the file yourself: a JSON object with 'energy_kj' (QM "
-    "energies in kJ/mol, one per frame) and 'frames_nm' (an (nframes, natoms, 3) array "
-    "of coordinates in nanometres, in topology atom order)."
+    "Run 'ffrefine scan' first to produce it, or supply the file yourself: a JSON object "
+    "with 'energy_kj' (QM energies in kJ/mol, one per frame) and 'frames_nm' (an "
+    "(nframes, natoms, 3) array of coordinates in nanometres, in topology atom order)."
 )
 
 
@@ -766,6 +812,192 @@ def cmd_not_implemented(name: str, milestone: int) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _xtb_version(binaries: Binaries) -> str:
+    """Best-effort xtb version string for the provenance block; never fatal.
+
+    Provenance that failed the run it is describing would be worse than no
+    provenance at all, so every failure here degrades to ``"unknown"``.
+    """
+    try:
+        proc = subprocess.run(
+            [binaries.require("xtb"), "--version"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError, FFRefineError):
+        return "unknown"
+    for line in (proc.stdout or "").splitlines():
+        if "version" in line.lower():
+            return line.strip()
+    return "unknown"
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """Run the xtb relaxed torsion scan and write ``01_qm_scan/scan.json``.
+
+    This is the stage that closes the pipeline: before it existed, the README
+    told users to hand-write ``scan.json``.
+
+    Bidirectional scanning runs a second leg backwards from the first leg's
+    final geometry and takes the lower energy at each grid point (spec 4.3).
+    The two legs are paired by *measured angle*, never by array index -- see
+    :func:`ffrefine.qm.scan.merge_bidirectional` for why that distinction
+    decides whether a torsion barrier survives.
+    """
+    step = args.step if args.step is not None else 15.0
+    if args.dry_run:
+        structure, topology, quad = _load_inputs(args)
+        start, end, npoints = scan_grid(step)
+        legs = 2 if args.bidirectional else 1
+        print(
+            f"would scan torsion {quad} of {topology.name} ({structure.natoms} atoms) "
+            f"over {npoints} points from {start} to {end} degrees, {legs} leg(s), "
+            f"into {args.outdir}"
+        )
+        return 0
+
+    structure, topology, quad = _prepare(args)
+    start, end, npoints = scan_grid(step)
+    charge = derive_charge(topology, args.charge)
+    freeze = tuple(args.freeze_dihedral or ())
+
+    settings = {
+        "quad": list(quad),
+        "step_deg": step,
+        "charge": charge,
+        "uhf": args.uhf,
+        "gfn": args.gfn,
+        "bidirectional": bool(args.bidirectional),
+        "freeze": [list(f) for f in freeze],
+    }
+    digest = hash_inputs([args.topology, args.structure], settings)
+    if args.resume and stage_is_current(
+        args.outdir, "qm_scan", digest, _stage_outputs(args, "qm_scan")
+    ):
+        print(f"scan: skipping, {_scan_path(args)} is current (--resume)")
+        return 0
+
+    binaries = _binaries(args)
+    workdir = stage_dir(args.outdir, "qm_scan")
+
+    forward_frames, forward_energy = run_scan(
+        binaries,
+        structure,
+        quad,
+        workdir / "forward",
+        start_deg=start,
+        end_deg=end,
+        npoints=npoints,
+        charge=charge,
+        uhf=args.uhf,
+        gfn=args.gfn,
+        nthreads=args.nthreads,
+        freeze=freeze,
+        log_stem="xtb_forward",
+    )
+    forward = ScanLeg(
+        forward_frames, forward_energy, measure_angles(forward_frames, quad), "forward"
+    )
+
+    merged = None
+    if args.bidirectional:
+        reverse_frames, reverse_energy = run_scan(
+            binaries,
+            structure,
+            quad,
+            workdir / "reverse",
+            start_deg=end,
+            end_deg=start,
+            npoints=npoints,
+            charge=charge,
+            uhf=args.uhf,
+            gfn=args.gfn,
+            nthreads=args.nthreads,
+            freeze=freeze,
+            coords_nm=forward_frames[-1],
+            log_stem="xtb_reverse",
+        )
+        reverse = ScanLeg(
+            reverse_frames, reverse_energy, measure_angles(reverse_frames, quad), "reverse"
+        )
+        merged = merge_bidirectional(forward, reverse, tol_deg=step / 2.0)
+        frames_nm, energy_kj, phi_deg = merged.frames_nm, merged.energy_kj, merged.phi_deg
+        if merged.max_hysteresis_kj > args.hysteresis_tol:
+            _warn(
+                f"forward and reverse scans differ by up to "
+                f"{merged.max_hysteresis_kj:.2f} kJ/mol (worst at "
+                f"{merged.worst_angle_deg:.1f} degrees), above the "
+                f"{args.hysteresis_tol:g} kJ/mol tolerance. The scan is not reversible "
+                "here, so the profile depends on the direction it was walked; treat the "
+                "barrier heights with suspicion."
+            )
+        if merged.unpaired_forward_deg or merged.unpaired_reverse_deg:
+            _warn(
+                f"{len(merged.unpaired_forward_deg)} forward and "
+                f"{len(merged.unpaired_reverse_deg)} reverse points had no partner within "
+                f"{step / 2.0:g} degrees, so those grid points come from one direction only."
+            )
+    else:
+        frames_nm, energy_kj, phi_deg = forward.frames_nm, forward.energy_kj, forward.phi_deg
+
+    hops = find_hops(frames_nm, heavy_atom_indices(topology), phi_deg)
+    for hop in hops:
+        _warn(
+            f"possible conformational hop at {hop.phi_deg:.1f} degrees (frame {hop.index}): "
+            f"heavy-atom RMSD {hop.rmsd_nm:.4f} nm against a {hop.threshold_nm:.4f} nm "
+            "outlier threshold. A smooth cosine series fitted through a hop is meaningless."
+        )
+    hbonds = hbond_changes(frames_nm, topology, phi_deg)
+    for change in hbonds:
+        _warn(
+            f"hydrogen bonding changed at {change.phi_deg:.1f} degrees (frame "
+            f"{change.index}): formed {sorted(change.formed)}, broke {sorted(change.broken)}. "
+            "That stabilisation is not the torsional potential; fitting through it writes "
+            "an electrostatic interaction into the dihedral term."
+        )
+
+    write_multimodel_pdb(workdir / "scan.pdb", structure, frames_nm)
+    payload = {
+        "quad": list(quad),
+        "nframes": int(frames_nm.shape[0]),
+        "phi_deg": [float(v) for v in phi_deg],
+        "energy_kj": [float(v) for v in energy_kj],
+        "frames_nm": [[[float(c) for c in atom] for atom in frame] for frame in frames_nm],
+        "frames_sha256": hash_array(frames_nm),
+        "provenance": {
+            "xtb_version": _xtb_version(binaries),
+            "charge": charge,
+            "uhf": int(args.uhf),
+            "gfn": int(args.gfn),
+            "step_deg": float(step),
+            "npoints": int(npoints),
+            "bidirectional": bool(args.bidirectional),
+            "hysteresis_tol_kj": float(args.hysteresis_tol),
+            "max_hysteresis_kj": float(merged.max_hysteresis_kj) if merged else None,
+            "worst_hysteresis_angle_deg": float(merged.worst_angle_deg) if merged else None,
+            "source_per_point": merged.source if merged else ["forward"] * len(energy_kj),
+            "freeze": [list(f) for f in freeze],
+            "hops": [{"frame": h.index, "phi_deg": h.phi_deg, "rmsd_nm": h.rmsd_nm} for h in hops],
+            "hbond_changes": [
+                {
+                    "frame": c.index,
+                    "phi_deg": c.phi_deg,
+                    "formed": [list(b) for b in sorted(c.formed)],
+                    "broken": [list(b) for b in sorted(c.broken)],
+                }
+                for c in hbonds
+            ],
+        },
+    }
+    _scan_path(args).write_text(json.dumps(payload, indent=2) + "\n", newline="\n")
+    write_manifest(args.outdir, "qm_scan", digest, {"quad": list(quad), "npoints": npoints})
+
+    relative = energy_kj - energy_kj.min()
+    print(
+        f"torsion {quad}: {npoints}-point relaxed scan complete, span "
+        f"{relative.max():.2f} kJ/mol, written to {_scan_path(args)}"
+    )
+    return 0
 
 
 def cmd_mmscan(args: argparse.Namespace) -> int:
@@ -1230,14 +1462,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """Run every implemented stage in order, naming the ones it cannot run."""
     print(
-        "ffrefine run: this build implements milestones 1-3, so it chains "
-        "mmscan -> fit -> validate and SKIPS two stages:\n"
-        "  scan    (QM relaxed torsion scan, xtb) -- milestone 4, not implemented\n"
-        "  charges (ESP/RESP charges, ORCA)       -- milestone 5, not implemented\n"
-        "The QM scan must therefore be supplied as 01_qm_scan/scan.json; charges are "
-        "left exactly as the input topology has them."
+        "ffrefine run: this build chains scan -> mmscan -> fit -> validate and "
+        "SKIPS one stage:\n"
+        "  charges (ESP/RESP charges, ORCA) -- milestone 5, not implemented\n"
+        "Charges are left exactly as the input topology has them."
     )
-    for name, handler in (("mmscan", cmd_mmscan), ("fit", cmd_fit), ("validate", cmd_validate)):
+    for name, handler in (
+        ("scan", cmd_scan),
+        ("mmscan", cmd_mmscan),
+        ("fit", cmd_fit),
+        ("validate", cmd_validate),
+    ):
         print(f"\n=== {name} ===")
         code = handler(args)
         if code != 0:
@@ -1261,7 +1496,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = build_parser().parse_args(argv)
     handlers = {
-        "scan": lambda a: cmd_not_implemented("scan", 4),
+        "scan": cmd_scan,
         "charges": lambda a: cmd_not_implemented("charges", 5),
         "mmscan": cmd_mmscan,
         "fit": cmd_fit,
@@ -1271,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # Unimplemented stages are dispatched before any config handling or
         # file reading, so they cannot half-run and cannot create an outdir.
-        if args.command in ("scan", "charges"):
+        if args.command == "charges":
             return handlers[args.command](args)
         if args.dry_run:
             _reset_logging()

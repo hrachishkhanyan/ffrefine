@@ -511,3 +511,23 @@ def hbond_changes(
                 HBondChange(index=i, phi_deg=float(phi_deg[i]), formed=formed, broken=broken)
             )
     return changes
+
+
+def heavy_atom_indices(topology: Topology) -> list[int]:
+    """0-based indices of the non-hydrogen atoms, for :func:`find_hops`.
+
+    The element comes from the mass first, exactly as :func:`_element_of` does
+    for the donor search, and for the same reason: a name is not authoritative.
+    It matters more here than it looks.  ``find_hops`` excludes hydrogens
+    because a rotating methyl throws a large aligned RMSD at every step without
+    any conformational change happening, so a hydrogen misread as heavy puts
+    that rotation straight back into the statistic the hop test is built on.
+
+    Args:
+        topology: the parsed molecule.
+
+    Returns:
+        0-based indices, because the caller uses them to index the coordinate
+        array rather than to name topology atoms.
+    """
+    return [i for i, atom in enumerate(topology.atoms) if _element_of(topology, atom.nr) != "H"]
