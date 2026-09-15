@@ -51,10 +51,15 @@ def scan_grid(step_deg: float) -> tuple[float, float, int]:
     return 0.0, 360.0 - step_deg, npoints
 
 
-def _constraint_line(quad: Sequence[int]) -> str:
+def _constraint_line(quad: Sequence[int], value: str = "auto") -> str:
+    """One ``$constrain`` dihedral line.
+
+    ``value`` is ``auto`` for a frozen dihedral, which holds it wherever the
+    input geometry put it, and the explicit start angle for the scanned one.
+    """
     if len(set(quad)) != 4:
         raise ValidationError(f"dihedral {tuple(quad)} repeats an atom index")
-    return "  dihedral: " + ",".join(str(i) for i in quad) + ",auto"
+    return "  dihedral: " + ",".join(str(i) for i in quad) + f",{value}"
 
 
 def write_scan_input(
@@ -68,11 +73,19 @@ def write_scan_input(
 ) -> str:
     """Write the xcontrol file driving a relaxed scan of ``quad``.
 
-    ``auto`` makes xtb take each constrained dihedral's starting value from the
-    input geometry, so the frozen dihedrals hold wherever the user's structure
-    put them.  The scanned dihedral is listed first and is the only one given a
-    ``$scan`` entry; ``freeze`` entries are constrained but never scanned,
-    which is the whole point of ``--freeze-dihedral`` (spec 4.3).
+    The scanned dihedral is constrained at ``start_deg`` explicitly, *not* at
+    ``auto``.  ``auto`` takes the value from the input geometry, and when that
+    disagrees with the grid start -- which it does whenever the user's
+    structure is not already sitting on the first grid point -- xtb honours
+    ``auto`` for the first frame and ramps from there.  The requested start
+    point is then never sampled and the input geometry's own angle is sampled
+    twice, which duplicates an abscissa and leaves the forward and reverse
+    legs impossible to pair by angle.  Seen on xtb 6.7.1 with butane: anti at
+    180 degrees, scanned 0 to 345, gave frames at both 180.00 and 179.92.
+
+    Frozen dihedrals keep ``auto``, because holding them wherever the user's
+    structure put them is exactly what ``--freeze-dihedral`` means.  They are
+    constrained but never scanned, which is the point of the flag (spec 4.3).
 
     Args:
         path: destination xcontrol file.
@@ -89,7 +102,11 @@ def write_scan_input(
     Raises:
         ValidationError: a quadruplet repeats an atom index.
     """
-    lines = ["$constrain", f"  force constant={force_constant}", _constraint_line(quad)]
+    lines = [
+        "$constrain",
+        f"  force constant={force_constant}",
+        _constraint_line(quad, f"{start_deg}"),
+    ]
     for other in freeze:
         lines.append(_constraint_line(other))
     lines.append("$scan")

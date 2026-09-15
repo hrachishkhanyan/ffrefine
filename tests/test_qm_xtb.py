@@ -42,10 +42,28 @@ def test_scan_input_matches_the_spec_block(tmp_path):
     text = write_scan_input(tmp_path / "scan.inp", (1, 5, 8, 11), 0.0, 345.0, 24)
     assert "$constrain" in text
     assert "force constant=1.0" in text
-    assert "dihedral: 1,5,8,11,auto" in text
+    assert "dihedral: 1,5,8,11,0.0" in text
     assert "$scan" in text
     assert "1: 0.0,345.0,24" in text
     assert text.rstrip().endswith("$end")
+
+
+def test_scanned_dihedral_states_the_start_angle_rather_than_auto(tmp_path):
+    """``auto`` takes the constraint from the input geometry, not from the grid.
+
+    When the two disagree, xtb honours ``auto`` for the first frame and ramps
+    from there, so the requested start point is never sampled and the input
+    geometry's angle is sampled twice.  Verified against xtb 6.7.1: butane
+    (anti, 180 degrees) scanned 0 to 345 returned a forward leg whose first
+    frame measured 180.00 and whose thirteenth measured 179.92 -- 0.076 degrees
+    apart.  That duplicated abscissa is what spec 4.3's "do not sample both
+    endpoints" rule exists to prevent, and it makes the forward and reverse
+    legs impossible to pair by angle.
+    """
+    text = write_scan_input(tmp_path / "scan.inp", (1, 5, 8, 11), 180.0, 165.0, 24)
+
+    assert "  dihedral: 1,5,8,11,180.0" in text
+    assert "1,5,8,11,auto" not in text
 
 
 def test_scan_input_adds_frozen_dihedrals_before_the_scan_block(tmp_path):
@@ -55,6 +73,8 @@ def test_scan_input_adds_frozen_dihedrals_before_the_scan_block(tmp_path):
         tmp_path / "scan.inp", (1, 5, 8, 11), 0.0, 345.0, 24, freeze=[(2, 1, 5, 8)]
     )
     constrain, scan = text.split("$scan")
+    # A frozen dihedral is held wherever the input geometry put it, which is
+    # exactly what auto means; only the scanned one needs an explicit value.
     assert "dihedral: 2,1,5,8,auto" in constrain
     assert "2,1,5,8" not in scan
     # Exactly one scan entry, numbered 1, referring to the target dihedral.
@@ -295,7 +315,7 @@ def test_run_scan_drives_real_xtb(tmp_path, butane_pdb, xtb_bin):
         (1, 5, 8, 11),
         tmp_path,
         start_deg=0.0,
-        end_deg=360.0,
+        end_deg=270.0,
         npoints=4,
         charge=0,
         uhf=0,
@@ -303,7 +323,11 @@ def test_run_scan_drives_real_xtb(tmp_path, butane_pdb, xtb_bin):
     )
     assert frames_nm.shape == (4, s.natoms, 3)
     assert energy_kj.shape == (4,)
-    # Butane's syn barrier is real chemistry, not a smoke test.
+    # Butane's syn barrier is real chemistry, not a smoke test.  The grid runs
+    # to 270, not 360: at 0-360 over four points the endpoints are the same
+    # angle, so syn is sampled twice and the anti minimum -- the bottom of the
+    # very barrier being measured -- is never sampled at all.  Measured angles
+    # here are 0, 90, -180, -90 and the span is about 20.7 kJ/mol.
     span = energy_kj.max() - energy_kj.min()
     assert 14.0 < span < 26.0
 
