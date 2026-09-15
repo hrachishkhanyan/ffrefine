@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from ffrefine.cli import main
+from ffrefine.cli import build_parser, main
 
 
 def test_scan_is_no_longer_reported_as_unimplemented(butane_pdb, butane_itp, tmp_path, capsys):
@@ -126,6 +126,7 @@ def test_scan_writes_a_scan_json_the_fit_pipeline_accepts(
     assert prov["step_deg"] == 90.0
     assert prov["bidirectional"] is False
     assert prov["xtb_version"]
+    assert prov["sp_refine_keywords"] is None  # --sp-refine is opt-in
     assert (outdir / "01_qm_scan" / "scan.pdb").exists()
 
 
@@ -229,3 +230,39 @@ def test_run_accepts_the_scan_flags(butane_pdb, butane_itp, tmp_path):
         ]
     )
     assert rc == 0
+
+
+def test_scan_accepts_the_sp_refine_flags():
+    args = build_parser().parse_args(
+        [
+            "scan",
+            "-s",
+            "a.pdb",
+            "-p",
+            "a.itp",
+            "--dihedral",
+            "1,5,8,11",
+            "--sp-refine",
+            "--orca-sp-keywords",
+            "! HF STO-3G",
+        ]
+    )
+    assert args.sp_refine is True
+    assert args.orca_sp_keywords == "! HF STO-3G"
+
+
+def test_run_also_accepts_sp_refine():
+    """run chains scan, so every flag cmd_scan reads has to reach it."""
+    args = build_parser().parse_args(
+        ["run", "-s", "a.pdb", "-p", "a.itp", "--dihedral", "1,5,8,11", "--sp-refine"]
+    )
+    assert args.sp_refine is True
+
+
+def test_scan_defaults_to_no_sp_refinement():
+    """The ORCA default is hybrid DFT on every frame; it must be opt-in."""
+    args = build_parser().parse_args(
+        ["scan", "-s", "a.pdb", "-p", "a.itp", "--dihedral", "1,5,8,11"]
+    )
+    assert args.sp_refine is False
+    assert args.orca_sp_keywords is None

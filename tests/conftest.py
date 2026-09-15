@@ -39,6 +39,15 @@ def gmx_bin() -> str:
 
 
 @pytest.fixture
+def orca_bin() -> str:
+    """Path to orca, or skip the test when ORCA is unavailable."""
+    exe = shutil.which("orca")
+    if exe is None:
+        pytest.skip("orca not on PATH")
+    return exe
+
+
+@pytest.fixture
 def xtb_bin() -> str:
     """Path to xtb, or skip the test when xtb is unavailable."""
     exe = shutil.which("xtb")

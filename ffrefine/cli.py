@@ -112,6 +112,7 @@ from .qm.scan import (
     measure_angles,
     merge_bidirectional,
 )
+from .qm.orca import DEFAULT_SP_KEYWORDS, refine_energies
 from .qm.xtb import derive_charge, run_scan, scan_grid
 from .stages import (
     STAGE_DIRS,
@@ -305,6 +306,16 @@ def _add_scan_flags(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="i,j,k,l",
         help="hold another dihedral fixed; repeatable",
+    )
+    parser.add_argument(
+        "--sp-refine",
+        action="store_true",
+        help="refine the xtb energies with ORCA single points on the same geometries",
+    )
+    parser.add_argument(
+        "--orca-sp-keywords",
+        default=None,
+        help=f"ORCA keyword line for --sp-refine (default: {DEFAULT_SP_KEYWORDS!r})",
     )
 
 
@@ -869,6 +880,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "gfn": args.gfn,
         "bidirectional": bool(args.bidirectional),
         "freeze": [list(f) for f in freeze],
+        "sp_refine": bool(args.sp_refine),
+        "sp_refine_keywords": args.orca_sp_keywords,
     }
     digest = hash_inputs([args.topology, args.structure], settings)
     if args.resume and stage_is_current(
@@ -940,6 +953,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
     else:
         frames_nm, energy_kj, phi_deg = forward.frames_nm, forward.energy_kj, forward.phi_deg
 
+    sp_keywords = None
+    if args.sp_refine:
+        sp_keywords = args.orca_sp_keywords or DEFAULT_SP_KEYWORDS
+        energy_kj = refine_energies(
+            binaries,
+            structure,
+            frames_nm,
+            workdir / "orca_sp",
+            sp_keywords,
+            charge=charge,
+            mult=args.uhf + 1,
+            nprocs=args.nthreads,
+        )
+        print(f"refined {len(energy_kj)} energies with ORCA ({sp_keywords})")
+
     hops = find_hops(frames_nm, heavy_atom_indices(topology), phi_deg)
     for hop in hops:
         _warn(
@@ -977,6 +1005,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "worst_hysteresis_angle_deg": float(merged.worst_angle_deg) if merged else None,
             "source_per_point": merged.source if merged else ["forward"] * len(energy_kj),
             "freeze": [list(f) for f in freeze],
+            "sp_refine_keywords": sp_keywords,
             "hops": [{"frame": h.index, "phi_deg": h.phi_deg, "rmsd_nm": h.rmsd_nm} for h in hops],
             "hbond_changes": [
                 {
