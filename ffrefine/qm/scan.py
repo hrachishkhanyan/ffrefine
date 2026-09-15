@@ -188,7 +188,17 @@ MIN_POINTS_FOR_OUTLIER = 4
 """Fewest adjacent gaps from which calling one an outlier is meaningful."""
 
 UNIFORM_STEP_FACTOR = 3.0
-"""When every step is identical, a hop is one this many times the median step."""
+"""When every step is the same size, a hop is one this many times the median step."""
+
+MOTION_FLOOR_NM = 1e-6
+"""Aligned RMSD below which a pair of frames counts as not having moved.
+
+Kabsch superposition of two *identical* geometries does not return 0.0; it
+returns the SVD's rounding residue, around 1e-17 nm.  Comparing a spread
+against exact zero therefore tests floating-point luck rather than physics.  A
+thousandth of a picometre sits eleven orders of magnitude above that residue
+and four below any conformational change worth reporting.
+"""
 
 
 @dataclass
@@ -247,7 +257,8 @@ def find_hops(
 
     Returns:
         The flagged hops, in frame order.  Empty when there are too few gaps
-        to judge an outlier, or when every gap is identical.
+        to judge an outlier, when every gap is the same size, or when the
+        frames never moved at all and the gaps are only rounding residue.
     """
     frames = np.asarray(frames_nm, float)
     if len(frames) < 2 or not heavy_indices:
@@ -264,20 +275,24 @@ def find_hops(
         return []
 
     median = float(np.median(rmsds))
+    if median <= MOTION_FLOOR_NM:
+        # Nothing moved: this whole run of RMSDs is superposition rounding
+        # residue rather than geometry.  Running the outlier test over it would
+        # always find a "hop" -- whichever pair happened to round up a few ulp
+        # above the others -- and report it across a displacement of 1e-17 nm.
+        return []
+
     mad = float(np.median(np.abs(rmsds - median)))
     spread = k_mad * MAD_TO_SIGMA * mad
-    if spread > 0.0:
+    if spread > MOTION_FLOOR_NM:
         threshold = median + spread
-    elif median > 0.0:
-        # Every adjacent step is exactly the same size, so the MAD sets no
-        # scale.  That is the *easiest* baseline to judge against, not an
-        # impossible one: bailing out here would blind the detector precisely
-        # when the scan is cleanest, so a hop becomes any step materially
-        # larger than the uniform one.
-        threshold = median * UNIFORM_STEP_FACTOR
     else:
-        # Every frame is identical -- no motion at all, so nothing is a hop.
-        return []
+        # Every adjacent step is the same size to within rounding, so the MAD
+        # sets no scale.  That is the *easiest* baseline to judge against, not
+        # an impossible one: bailing out here would blind the detector
+        # precisely when the scan is cleanest, so a hop becomes any step
+        # materially larger than the uniform one.
+        threshold = median * UNIFORM_STEP_FACTOR
 
     hops = []
     for (_, later), rmsd in zip(pairs, rmsds):
