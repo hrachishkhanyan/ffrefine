@@ -13,25 +13,33 @@ mandatory self-consistency check (spec section 4.5) verifies the edit against
 an independent analytic evaluation before any fitting happens, and aborts if it
 disagrees by more than 1e-3 kJ/mol.
 
-## Status: milestones 1-3 of 6
+## Status: milestones 1-4 of 6
 
 | Subcommand | State |
 |---|---|
+| `ffrefine scan` | works -- relaxed xtb torsion scan, bidirectional by default, reports conformational hops and hydrogen bonding, optional `--sp-refine` |
 | `ffrefine mmscan` | works -- MM single points with and without the torsion, plus the mandatory self-check |
 | `ffrefine fit` | works -- weighted linear cosine fit, BIC model selection, `.itp`/`.prm`/`fit.json`/plots |
 | `ffrefine validate` | works -- rebuild with the fitted series, re-run MM, report RMSE before and after |
-| `ffrefine run` | works -- chains the three above and says which stages it skipped |
-| `ffrefine scan` | **not implemented** (milestone 4, xtb). Exits 2, writes nothing. |
+| `ffrefine run` | works -- chains the four above and says which stage it skipped |
 | `ffrefine charges` | **not implemented** (milestone 5, ORCA ESP/RESP). Exits 2, writes nothing. |
 
 Also not implemented: CGenFF `.str` penalty parsing and automatic torsion
 selection (`--str`, milestone 6), the `final/report.md` summary document
-(milestone 6), and `--mm-relax` (spec 4.6, deferred with the QM scan because it
-operates on scan geometries).
+(milestone 6), and `--mm-relax` (spec 4.6).
 
-Because `scan` is missing, the QM half of the pipeline must be supplied by
-hand as `01_qm_scan/scan.json` -- see "Supplying a QM scan" below. The tool
-does not fabricate one.
+### What the scan does not do
+
+It **reports** conformational hops and intramolecular hydrogen bonds; it does
+not correct or reject a profile containing them. Both make a smooth cosine
+series the wrong model -- a hop is a discontinuity, and an internal hydrogen
+bond writes an electrostatic interaction into the dihedral term that the
+nonbonded terms then count a second time -- so a warning from either is a
+reason to re-scan from another conformer or with `--freeze-dihedral`, not
+something to fit through.
+
+`--sp-refine` defaults to `! wB97X-D3 def2-TZVP TightSCF`, a hybrid DFT single
+point on every frame of the grid. It is opt-in for that reason.
 
 ## Requirements
 
@@ -39,6 +47,11 @@ does not fabricate one.
   dependencies, and no chemistry libraries: every file format is parsed
   in-house.
 - GROMACS 2023 or newer on `PATH` (or `--gmx-bin /path/to/gmx`).
+- xtb 6.7 or newer on `PATH` (or `--xtb-bin /path/to/xtb`), for `ffrefine scan`.
+- ORCA only for `--sp-refine`. It is usually on no `PATH` at all, so reach it
+  with `--orca-bin /path/to/orca`. A shared ORCA build will not start unless
+  its own directory is on `LD_LIBRARY_PATH`; ffrefine sets that from
+  `orca_libdir`, which defaults to the directory holding the binary you named.
 - No network access is used at any point.
 
 ## Install
@@ -129,10 +142,24 @@ With no `01_qm_scan/scan.json` present, only the input structure's single frame
 is available, so this checks the topology edit but produces no profile. Supply
 a scan to get one.
 
-### 2. Supplying a QM scan
+### 2. Running the QM scan
 
-`ffrefine scan` (milestone 4) would write this file. Until then, write
-`butane_out/01_qm_scan/scan.json` yourself:
+    ffrefine scan         -s fixtures/butane/butane.pdb         -p fixtures/butane/butane.itp         --dihedral 1,5,8,11         --outdir butane_out
+
+This drives xtb over a full turn -- 24 points at the default 15 degree step --
+scanning forward, then back from the forward leg's final geometry, and keeping
+the lower energy at each grid point. The two legs are paired by *measured*
+angle rather than by array index, because a relaxed scan does not land exactly
+on the requested grid and index-pairing quietly compares different geometries.
+
+It writes `butane_out/01_qm_scan/scan.json`, a multi-model `scan.pdb` of the
+geometries, and warns about conformational hops, hydrogen-bond formation and
+forward/reverse hysteresis. The molecular charge comes from the topology's
+`[ atoms ]` sum unless `--charge` overrides it.
+
+**Bringing your own QM instead.** `mmscan`, `fit` and `validate` need the file,
+not the tool that produced it, so a scan from any package can be written to
+`butane_out/01_qm_scan/scan.json` by hand:
 
 ```json
 {
@@ -220,15 +247,16 @@ torsion at all.
 
     ffrefine run -s ... -p ... --dihedral 1,5,8,11 --outdir butane_out
 
-`run` chains `mmscan -> fit -> validate` and states up front that it is skipping
-`scan` (milestone 4) and `charges` (milestone 5).
+`run` chains `scan -> mmscan -> fit -> validate` and states up front that it is
+skipping `charges` (milestone 5).
 
 ## Output layout
 
     butane_out/
       00_input/     copies of the input structure and topology, plus model.json
                     (atom/bond/dihedral counts, fudgeQQ, fudgeLJ, the torsion set)
-      01_qm_scan/   scan.json -- supplied by you until milestone 4 lands
+      01_qm_scan/   scan.json, scan.pdb (the geometries as a multi-model PDB),
+                    forward/ and reverse/ xtb working directories and logs
       02_mm_scan/   mdp, tpr, edr, xvg, full.top, zeroed.top, GROMACS logs, and
                     energies.json (measured phi, full and zeroed potentials, the
                     self-check residual)
@@ -274,6 +302,31 @@ Every subcommand accepts `--config file.json`, `--outdir`, `--nthreads`,
   runs with `-maxwarn`, which suppresses its own atom-order guard, so this check
   is the only thing standing between a mis-ordered file and silently wrong
   energies.
+
+### Scan flags
+
+Accepted by `ffrefine scan`, and by `ffrefine run`, which chains it.
+
+- `--step` scan step in degrees (default 15, so 24 points). It must divide 360
+  into whole steps, or the run is refused rather than silently rounded.
+- `--charge` molecular charge. Default: the topology's `[ atoms ]` charge sum,
+  rounded to the nearest integer. A sum further than 0.05 from an integer is
+  refused, because it usually means an incomplete topology and guessing beats
+  nothing only until it does not.
+- `--uhf` unpaired electrons (default 0). **Not derived**: electron-count
+  parity cannot tell a triplet from a singlet diradical, so it stays explicit.
+- `--gfn` xtb GFN parameterisation (default 2).
+- `--bidirectional` / `--no-bidirectional` scan both ways and keep the lower
+  energy per point, or walk one direction only. Bidirectional is the default.
+- `--hysteresis-tol` warn when the two directions disagree by more than this
+  many kJ/mol (default 4). A profile that depends on the direction it was
+  walked has barrier heights you should not trust.
+- `--freeze-dihedral i,j,k,l` hold another torsion fixed for the whole scan.
+  Repeatable. The usual reason is to stop a second rotor following the first.
+- `--sp-refine` recompute each frame's energy with an ORCA single point,
+  keeping xtb's geometries. Improves the fit target without redoing the scan.
+- `--orca-sp-keywords` the ORCA keyword line for `--sp-refine`
+  (default `! wB97X-D3 def2-TZVP TightSCF`).
 
 Exit codes: `0` success, `1` a reported ffrefine error (printed as
 `error: ...`, never a traceback), `2` a usage error or an unimplemented
@@ -348,8 +401,13 @@ mixed-precision (float32) `.edr`, which puts an absolute floor of about
 
     pytest
 
-Tests that need GROMACS are marked `needs_gmx` and skip when `gmx` is not on
-`PATH`; run with GROMACS available to exercise them.
+Tests that need an external program are marked `needs_gmx`, `needs_xtb` or
+`needs_orca`, and skip when that binary is not on `PATH`. A skipped test is not
+a passing one: a plain green run on a machine with no `gmx`, `xtb` or `orca`
+has exercised none of the code that drives them, so run where they are
+available before trusting the result.
+
+    pytest -m "needs_gmx or needs_xtb or needs_orca"   # and check nothing skipped
 
 The load-bearing one is spec section 7.1's round trip, which covers the whole
 pipeline except xtb and ORCA: take the MM energies with the original
