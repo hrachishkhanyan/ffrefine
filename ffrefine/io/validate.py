@@ -22,14 +22,24 @@ _ELEMENT_MASSES = {
 }
 
 
-def _element_from_mass(mass: float) -> str | None:
-    """Nearest element by atomic mass, or None if nothing is within 0.5 amu."""
+def element_from_mass(mass: float) -> str | None:
+    """Nearest element by atomic mass, or None if nothing is within 0.5 amu.
+
+    The mass is the unambiguous authority on an atom's element.  Names are not:
+    ``NA`` matches the two-letter element table and reads as sodium when it is
+    very often a nitrogen, so callers that have a mass to hand should prefer
+    this over :func:`ffrefine.io.structure.guess_element`.
+    """
     best, best_diff = None, 0.5
     for sym, ref in _ELEMENT_MASSES.items():
         diff = abs(mass - ref)
         if diff < best_diff:
             best, best_diff = sym, diff
     return best
+
+
+_element_from_mass = element_from_mass
+"""Kept so this module's existing internal callers read unchanged."""
 
 
 def validate_structure_topology(

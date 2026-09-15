@@ -11,11 +11,15 @@ synthetic data without an external tool in the loop.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
 from ..errors import ValidationError
 from ..geometry import dihedral_deg_frames, kabsch_rmsd, wrap_deg
+from ..io.structure import guess_element
+from ..io.topology import Topology
+from ..io.validate import element_from_mass
 
 Quad = tuple[int, int, int, int]
 
@@ -306,3 +310,204 @@ def find_hops(
                 )
             )
     return sorted(hops, key=lambda h: h.index)
+
+
+HBOND_ELEMENTS = frozenset({"N", "O", "F"})
+"""Elements treated as hydrogen-bond donors (when carrying an H) and acceptors."""
+
+HBOND_MAX_H_ACCEPTOR_NM = 0.25
+"""Longest H...acceptor separation still counted as a hydrogen bond."""
+
+HBOND_MIN_ANGLE_DEG = 120.0
+"""Smallest donor-H...acceptor angle still counted as a hydrogen bond."""
+
+
+class HBond(NamedTuple):
+    """One intramolecular hydrogen bond, by 1-based topology atom index."""
+
+    donor: int
+    hydrogen: int
+    acceptor: int
+
+
+@dataclass
+class HBondChange:
+    """Hydrogen bonds that appeared or vanished between adjacent frames.
+
+    Attributes:
+        index: the later frame of the pair.
+        phi_deg: that frame's measured dihedral.
+        formed: bonds present at ``index`` but not at ``index - 1``.
+        broken: bonds present at ``index - 1`` but not at ``index``.
+    """
+
+    index: int
+    phi_deg: float
+    formed: set[HBond]
+    broken: set[HBond]
+
+
+def _element_of(topology: Topology, nr: int) -> str:
+    """Element of a topology atom, preferring its mass over its name.
+
+    ``guess_element`` reads the name only, and names are ambiguous in exactly
+    the way that matters here: ``NA`` matches the two-letter element table and
+    returns sodium for what is often a nitrogen, which would drop a real donor
+    or invent an acceptor that does not exist.  The mass is unambiguous, and
+    :func:`ffrefine.io.validate.validate_structure_topology` already treats it
+    as the authority, so this follows that precedent and falls back to the name
+    only when the topology carries no mass.
+    """
+    atom = topology.atoms[nr - 1]
+    if atom.mass is not None:
+        from_mass = element_from_mass(atom.mass)
+        if from_mass:
+            return from_mass
+    return guess_element(atom.name) or ""
+
+
+def hbond_donors_and_acceptors(
+    topology: Topology,
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """Find hydrogen-bond donors and acceptors from the topology's bonds.
+
+    Bonds come from the topology rather than from interatomic distances,
+    because distance-guessed connectivity would mistake a close contact for a
+    covalent bond in exactly the crowded geometries this detector cares about.
+
+    Args:
+        topology: the parsed molecule.
+
+    Returns:
+        ``(donors, acceptors)`` where each donor is ``(heavy_atom_nr,
+        hydrogen_nr)`` and acceptors are heavy-atom numbers; all 1-based.
+    """
+    donors: list[tuple[int, int]] = []
+    acceptors: list[int] = []
+    for atom in topology.atoms:
+        element = _element_of(topology, atom.nr)
+        if element in HBOND_ELEMENTS:
+            acceptors.append(atom.nr)
+        elif element == "H":
+            for neighbour in topology.bonded_neighbours(atom.nr):
+                if _element_of(topology, neighbour) in HBOND_ELEMENTS:
+                    donors.append((neighbour, atom.nr))
+    return donors, acceptors
+
+
+def _excluded_acceptors(topology: Topology, donor: int) -> set[int]:
+    """Acceptors too close in the bond graph to count (1-2 and 1-3 neighbours)."""
+    out = {donor}
+    for first in topology.bonded_neighbours(donor):
+        out.add(first)
+        out.update(topology.bonded_neighbours(first))
+    return out
+
+
+def find_hydrogen_bonds(
+    frame_nm: np.ndarray,
+    donors: list[tuple[int, int]],
+    acceptors: list[int],
+    topology: Topology,
+    max_h_acceptor_nm: float = HBOND_MAX_H_ACCEPTOR_NM,
+    min_angle_deg: float = HBOND_MIN_ANGLE_DEG,
+) -> set[HBond]:
+    """Hydrogen bonds present in one geometry, by the usual geometric criterion.
+
+    A bond counts when the H...acceptor separation is under
+    ``max_h_acceptor_nm`` and the donor-H...acceptor angle is above
+    ``min_angle_deg``.  The angle matters as much as the distance: a hydrogen
+    merely passing near an oxygen sideways is not donating to it.
+
+    1-2 and 1-3 bonded acceptors are excluded -- a hydroxyl cannot hydrogen
+    bond to its own oxygen or to the one across a single intervening atom, and
+    such a geometry would otherwise trip the distance test constantly.
+
+    Args:
+        frame_nm: shape (natoms, 3) in nanometres.
+        donors: ``(heavy, hydrogen)`` pairs from
+            :func:`hbond_donors_and_acceptors`.
+        acceptors: acceptor atom numbers from the same.
+        topology: supplies the bond graph for the exclusions.
+        max_h_acceptor_nm: distance cutoff.
+        min_angle_deg: angle cutoff.
+
+    Returns:
+        The hydrogen bonds found, as 1-based index triples.
+    """
+    frame = np.asarray(frame_nm, float)
+    found: set[HBond] = set()
+    for heavy, hydrogen in donors:
+        excluded = _excluded_acceptors(topology, heavy)
+        h_pos = frame[hydrogen - 1]
+        d_pos = frame[heavy - 1]
+        for acceptor in acceptors:
+            if acceptor in excluded:
+                continue
+            a_pos = frame[acceptor - 1]
+            if float(np.linalg.norm(a_pos - h_pos)) > max_h_acceptor_nm:
+                continue
+            v1 = d_pos - h_pos
+            v2 = a_pos - h_pos
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 == 0.0 or n2 == 0.0:
+                continue
+            cosine = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+            if np.degrees(np.arccos(cosine)) >= min_angle_deg:
+                found.add(HBond(donor=heavy, hydrogen=hydrogen, acceptor=acceptor))
+    return found
+
+
+def hbond_changes(
+    frames_nm: np.ndarray,
+    topology: Topology,
+    phi_deg: np.ndarray,
+    max_h_acceptor_nm: float = HBOND_MAX_H_ACCEPTOR_NM,
+    min_angle_deg: float = HBOND_MIN_ANGLE_DEG,
+) -> list[HBondChange]:
+    """Report intramolecular hydrogen bonds forming or breaking across a scan.
+
+    Why this belongs in a torsion tool: the scan is *relaxed*, so at every grid
+    point everything except the scanned dihedral is free to rearrange.  In a
+    molecule carrying both a donor and an acceptor, a hydroxyl can rotate into
+    an internal hydrogen bond partway through -- 1,2-ethanediol scanning
+    O-C-C-O is the standard case, where the gauche region gains roughly 10-20
+    kJ/mol of stabilisation the anti region has no access to.  That well is not
+    the torsional potential.  Fitting a cosine series through it writes an
+    electrostatic interaction into the dihedral term, and the nonbonded terms
+    then count the same interaction again in every simulation that uses the
+    result.
+
+    Per spec 4.3 this reports and continues: re-scanning with
+    ``--freeze-dihedral``, choosing another starting conformer, or knowingly
+    accepting the profile are all the user's decisions.
+
+    Args:
+        frames_nm: shape (nframes, natoms, 3).
+        topology: supplies elements and the bond graph.
+        phi_deg: measured angles, for reporting.
+        max_h_acceptor_nm: distance cutoff.
+        min_angle_deg: angle cutoff.
+
+    Returns:
+        One :class:`HBondChange` per adjacent pair that differs.  Empty for a
+        molecule with no donors or acceptors, which includes the butane fixture.
+    """
+    donors, acceptors = hbond_donors_and_acceptors(topology)
+    if not donors or not acceptors:
+        return []
+
+    per_frame = [
+        find_hydrogen_bonds(frame, donors, acceptors, topology, max_h_acceptor_nm, min_angle_deg)
+        for frame in np.asarray(frames_nm, float)
+    ]
+    changes = []
+    for i in range(1, len(per_frame)):
+        formed = per_frame[i] - per_frame[i - 1]
+        broken = per_frame[i - 1] - per_frame[i]
+        if formed or broken:
+            changes.append(
+                HBondChange(index=i, phi_deg=float(phi_deg[i]), formed=formed, broken=broken)
+            )
+    return changes

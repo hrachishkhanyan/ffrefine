@@ -6,9 +6,13 @@ from ffrefine.errors import ValidationError
 from ffrefine.geometry import kabsch_rmsd
 from ffrefine.qm.scan import (
     UNIFORM_STEP_FACTOR,
+    HBond,
     Hop,
     ScanLeg,
     find_hops,
+    find_hydrogen_bonds,
+    hbond_changes,
+    hbond_donors_and_acceptors,
     measure_angles,
     merge_bidirectional,
 )
@@ -361,3 +365,206 @@ def test_find_hops_flags_a_spike_against_a_perfectly_uniform_baseline():
     # multiple of the ordinary step, not the median a hair's breadth above it.
     ordinary_step = kabsch_rmsd(frames[0], frames[1])
     assert hops[0].threshold_nm == pytest.approx(UNIFORM_STEP_FACTOR * ordinary_step)
+
+
+def _glycol_topology():
+    """A minimal 1,2-ethanediol-like topology: O1-C2-C3-O4, with H5 on O1, H6 on O4."""
+    from pathlib import Path
+
+    from ffrefine.io.topology import Atom, Topology
+
+    atoms = [
+        Atom(1, "OG311", 1, "LIG", "O1", 1, -0.65, 15.999),
+        Atom(2, "CG321", 1, "LIG", "C2", 1, 0.05, 12.011),
+        Atom(3, "CG321", 1, "LIG", "C3", 1, 0.05, 12.011),
+        Atom(4, "OG311", 1, "LIG", "O4", 1, -0.65, 15.999),
+        Atom(5, "HGP1", 1, "LIG", "H5", 1, 0.42, 1.008),
+        Atom(6, "HGP1", 1, "LIG", "H6", 1, 0.42, 1.008),
+    ]
+    return Topology(
+        name="GLY",
+        nrexcl=3,
+        atoms=atoms,
+        bonds=[(1, 2), (2, 3), (3, 4), (1, 5), (4, 6)],
+        pairs=[],
+        angles=[],
+        propers=[],
+        impropers=[],
+        defaults=None,
+        raw_lines=[],
+        source=Path("synthetic.itp"),
+    )
+
+
+def _methanediol_topology():
+    """H4-O1-C2-O3-H5: the two oxygens are 1-3 neighbours across the carbon."""
+    from pathlib import Path
+
+    from ffrefine.io.topology import Atom, Topology
+
+    atoms = [
+        Atom(1, "OG311", 1, "LIG", "O1", 1, -0.65, 15.999),
+        Atom(2, "CG321", 1, "LIG", "C2", 1, 0.20, 12.011),
+        Atom(3, "OG311", 1, "LIG", "O3", 1, -0.65, 15.999),
+        Atom(4, "HGP1", 1, "LIG", "H4", 1, 0.42, 1.008),
+        Atom(5, "HGP1", 1, "LIG", "H5", 1, 0.42, 1.008),
+    ]
+    return Topology(
+        name="MDO",
+        nrexcl=3,
+        atoms=atoms,
+        bonds=[(1, 2), (2, 3), (1, 4), (3, 5)],
+        pairs=[],
+        angles=[],
+        propers=[],
+        impropers=[],
+        defaults=None,
+        raw_lines=[],
+        source=Path("synthetic.itp"),
+    )
+
+
+def _glycol_frame(h6: list[float]) -> np.ndarray:
+    """The gauche 1,2-ethanediol skeleton; only the O4 hydroxyl hydrogen moves.
+
+    Every covalent distance here is physical -- O-H 0.096 nm, C-O 0.143 nm,
+    C-C 0.151 nm, and the two oxygens 0.292 nm apart as they are in the gauche
+    conformer.  A fixture that stretched the hydroxyl to 0.2 nm to bring its
+    hydrogen inside the cutoff would still exercise the arithmetic, but it
+    would describe a molecule that cannot exist, and anyone reading it to learn
+    what a donor looks like would be misled.
+    """
+    return np.array(
+        [
+            [0.0000, 0.0000, 0.0000],  # O1
+            [0.1430, 0.0000, 0.0000],  # C2
+            [0.2000, 0.1400, 0.0000],  # C3
+            [0.1500, 0.2300, 0.1000],  # O4
+            [-0.0493, -0.0756, -0.0329],  # H5 on O1, pointing away from O4
+            h6,  # H6 on O4
+        ]
+    )
+
+
+H6_TOWARD_O1 = [0.0816, 0.1706, 0.0683]
+"""H6 aimed at O1: H...O of 0.201 nm at 158 degrees, inside both cutoffs."""
+
+H6_ROTATED_AWAY = [0.1993, 0.3056, 0.1329]
+"""H6 turned to the far side of O4: H...O of 0.388 nm, outside the distance cutoff."""
+
+
+def test_donors_and_acceptors_come_from_the_topology_bonds():
+    donors, acceptors = hbond_donors_and_acceptors(_glycol_topology())
+    assert set(donors) == {(1, 5), (4, 6)}  # (heavy donor, its hydrogen)
+    assert set(acceptors) == {1, 4}  # both oxygens
+
+
+def test_element_comes_from_the_mass_not_the_ambiguous_name():
+    """An atom named 'NA' with nitrogen's mass is nitrogen, not sodium.
+
+    guess_element reads the name only and would call this sodium, silently
+    dropping a donor or inventing an acceptor.
+    """
+    top = _glycol_topology()
+    top.atoms[0].name = "NA"
+    top.atoms[0].mass = 14.007
+
+    donors, acceptors = hbond_donors_and_acceptors(top)
+
+    assert 1 in acceptors  # still recognised as N, via the mass
+    assert (1, 5) in donors
+
+
+def test_butane_has_no_donors_or_acceptors(butane_itp):
+    """The only committed fixture cannot exercise this path -- assert that, do not assume it."""
+    from ffrefine.io.topology import read_topology
+
+    donors, acceptors = hbond_donors_and_acceptors(read_topology(butane_itp))
+    assert donors == [] and acceptors == []
+
+
+def test_finds_a_hydrogen_bond_when_the_hydroxyl_points_at_the_far_oxygen():
+    """O4-H6 aimed at O1 across 0.201 nm at 158 degrees is a textbook H-bond."""
+    top = _glycol_topology()
+    donors, acceptors = hbond_donors_and_acceptors(top)
+
+    found = find_hydrogen_bonds(_glycol_frame(H6_TOWARD_O1), donors, acceptors, top)
+
+    assert found == {HBond(donor=4, hydrogen=6, acceptor=1)}
+
+
+def test_no_hydrogen_bond_when_the_hydroxyl_is_rotated_away():
+    """Same heavy-atom skeleton, hydroxyl turned around: 0.388 nm is no bond."""
+    top = _glycol_topology()
+    donors, acceptors = hbond_donors_and_acceptors(top)
+
+    assert find_hydrogen_bonds(_glycol_frame(H6_ROTATED_AWAY), donors, acceptors, top) == set()
+
+
+def test_a_donor_does_not_bond_to_its_own_one_three_neighbour():
+    """O1-H4 pointing straight down the 1-3 contact at O3 is not a hydrogen bond.
+
+    This geometry clears both cutoffs on its own -- H...O of 0.142 nm at 180
+    degrees -- so only the bond-graph exclusion can reject it, which is what
+    makes the test worth having.  Testing the donor against itself would prove
+    nothing: when the acceptor *is* the donor, the two vectors from the
+    hydrogen are identical, so the angle is 0 degrees and the angle cutoff
+    rejects it whether the exclusion works or not.
+    """
+    top = _methanediol_topology()
+    donors, acceptors = hbond_donors_and_acceptors(top)
+    frame = np.array(
+        [
+            [0.0000, 0.0000, 0.0000],  # O1
+            [0.1430, 0.0000, 0.0000],  # C2
+            [0.2000, 0.1310, 0.0000],  # O3, 0.239 nm from O1
+            [0.0811, 0.0531, 0.0000],  # H4 on O1, aimed straight at O3
+            [0.2098, 0.2192, 0.0392],  # H5 on O3, aimed away
+        ]
+    )
+
+    assert find_hydrogen_bonds(frame, donors, acceptors, top) == set()
+
+
+def test_hbond_changes_reports_formation_between_frames():
+    """The event a user needs told about: a bond that was not there, now is."""
+    top = _glycol_topology()
+    frames = np.stack([_glycol_frame(H6_ROTATED_AWAY), _glycol_frame(H6_TOWARD_O1)])
+
+    changes = hbond_changes(frames, top, np.array([180.0, 60.0]))
+
+    assert len(changes) == 1
+    assert changes[0].index == 1
+    assert changes[0].formed == {HBond(donor=4, hydrogen=6, acceptor=1)}
+    assert changes[0].broken == set()
+    assert changes[0].phi_deg == pytest.approx(60.0)
+
+
+def test_hbond_changes_reports_breaking_too():
+    """Run the same pair backwards: the bond is lost, not gained."""
+    top = _glycol_topology()
+    frames = np.stack([_glycol_frame(H6_TOWARD_O1), _glycol_frame(H6_ROTATED_AWAY)])
+
+    changes = hbond_changes(frames, top, np.array([60.0, 180.0]))
+
+    assert len(changes) == 1
+    assert changes[0].broken == {HBond(donor=4, hydrogen=6, acceptor=1)}
+    assert changes[0].formed == set()
+
+
+def test_hbond_changes_is_silent_when_nothing_changes():
+    """A bond present throughout is not an event; only the transitions are."""
+    top = _glycol_topology()
+    frames = np.stack([_glycol_frame(H6_TOWARD_O1)] * 3)
+
+    assert hbond_changes(frames, top, np.array([0.0, 60.0, 120.0])) == []
+
+
+def test_hbond_changes_is_silent_on_butane(butane_pdb, butane_itp):
+    """No donors, no acceptors, no findings -- and no crash on the empty case."""
+    from ffrefine.io.structure import read_pdb
+    from ffrefine.io.topology import read_topology
+
+    s = read_pdb(butane_pdb)
+    frames = np.stack([s.coords, s.coords + 0.01])
+    assert hbond_changes(frames, read_topology(butane_itp), np.array([0.0, 15.0])) == []
