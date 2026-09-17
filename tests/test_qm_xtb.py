@@ -388,3 +388,39 @@ def test_derive_charge_override_wins_even_over_a_refusable_sum(butane_itp):
     top = read_topology(butane_itp)
     top.atoms[0].charge += 0.4
     assert derive_charge(top, override=0) == 0
+
+
+@pytest.mark.needs_xtb
+def test_optimize_geometry_moves_the_structure_and_keeps_the_atom_order(
+    tmp_path, butane_pdb, xtb_bin
+):
+    from ffrefine.qm.xtb import optimize_geometry
+
+    s = read_pdb(butane_pdb)
+    out = optimize_geometry(
+        Binaries(xtb=xtb_bin), s, s.coords, tmp_path, charge=0, uhf=0, nthreads=1
+    )
+
+    assert out.shape == s.coords.shape
+    # The hand-authored fixture is not at an xtb minimum, so it must move,
+    # but it must stay the same molecule rather than fly apart.
+    assert np.abs(out - s.coords).max() > 1e-4
+    assert np.abs(out - s.coords).max() < 0.1
+
+
+def test_optimize_geometry_refuses_output_that_never_converged(tmp_path, butane_pdb, monkeypatch):
+    """xtb can exit 0 having given up; the banner is the real signal."""
+    import ffrefine.qm.xtb as xtb_module
+    from ffrefine.errors import ExternalToolError
+
+    class _Proc:
+        stdout = "some output without the magic words\n"
+        stderr = ""
+
+    monkeypatch.setattr(xtb_module, "run_command", lambda *a, **k: _Proc())
+    s = read_pdb(butane_pdb)
+
+    with pytest.raises(ExternalToolError, match="converge"):
+        xtb_module.optimize_geometry(
+            Binaries(xtb="/nonexistent/xtb"), s, s.coords, tmp_path, charge=0
+        )

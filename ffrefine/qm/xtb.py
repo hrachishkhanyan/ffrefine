@@ -19,7 +19,7 @@ import numpy as np
 
 from ..config import Binaries
 from ..errors import ExternalToolError, ParseError, ValidationError
-from ..io.structure import Structure, write_xyz
+from ..io.structure import Structure, read_xyz, write_xyz
 from ..io.topology import Topology
 from ..runner import run_command
 from ..units import angstrom_to_nm, hartree_to_kj
@@ -386,3 +386,70 @@ def derive_charge(
             "--charge to state the molecular charge explicitly."
         )
     return int(nearest)
+
+
+OPT_CONVERGED_MARKER = "GEOMETRY OPTIMIZATION CONVERGED"
+"""What xtb prints when the optimiser actually finished.
+
+Checked rather than trusting exit 0, for the same reason run_scan verifies its
+$scan block: xtb can stop early and still exit cleanly, and a geometry that
+never converged produces charges for a molecule that does not exist.
+"""
+
+
+def optimize_geometry(
+    binaries: Binaries,
+    structure: Structure,
+    coords_nm: np.ndarray,
+    workdir: str | Path,
+    charge: int,
+    uhf: int = 0,
+    gfn: int = 2,
+    nthreads: int = 1,
+) -> np.ndarray:
+    """Optimise a geometry with ``xtb --opt tight`` and return it in nm.
+
+    Spec 5.1's default for ``--charge-geom``: charges fitted to a strained
+    input geometry describe a molecule nobody is going to simulate.
+
+    Args:
+        binaries: resolved external programs.
+        structure: supplies the element symbols; its coordinates are ignored in
+            favour of ``coords_nm``.
+        coords_nm: starting geometry, shape (natoms, 3).
+        workdir: directory to run in; xtb writes ``xtbopt.xyz`` into it.
+        charge: molecular charge for ``--chrg``.
+        uhf: unpaired electrons for ``--uhf``.
+        gfn: GFN parameterisation.
+        nthreads: ``-P``.
+
+    Returns:
+        The optimised coordinates in nm, in the input atom order.
+
+    Raises:
+        ExternalToolError: xtb did not report convergence, wrote no
+            ``xtbopt.xyz``, or returned a different number of atoms.
+    """
+    exe = binaries.require("xtb")
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    write_xyz(workdir / "mol.xyz", structure, coords_nm)
+    argv = [exe, "mol.xyz", "--opt", "tight", "--chrg", str(charge), "--uhf", str(uhf)]
+    argv += ["--gfn", str(gfn), "-P", str(nthreads)]
+    proc = run_command(argv, workdir, "xtb_opt")
+
+    if OPT_CONVERGED_MARKER not in (proc.stdout or ""):
+        raise ExternalToolError(
+            f"xtb did not report '{OPT_CONVERGED_MARKER}', so the geometry was never "
+            "optimised even though the run finished. See xtb_opt.stdout in the stage "
+            "directory. Charges fitted to an unconverged geometry are meaningless."
+        )
+    optimised = workdir / "xtbopt.xyz"
+    if not optimised.exists():
+        raise ExternalToolError(f"xtb reported convergence but wrote no {optimised}")
+    out = read_xyz(optimised)
+    if out.natoms != len(coords_nm):
+        raise ExternalToolError(
+            f"{optimised} has {out.natoms} atoms, the input had {len(coords_nm)}"
+        )
+    return out.coords
