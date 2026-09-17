@@ -76,6 +76,15 @@ def apply_charges(
 ) -> list[ChargeAssignment]:
     """Combine fitted charges with the topology's, keeping the total exact.
 
+    In ``selected`` mode, the fitted charges replace only the named atoms; the
+    residual is redistributed to unselected atoms in the same charge group
+    (falling back to bonded heavy atoms). After rounding to the output
+    precision, any remaining drift is absorbed by the largest-magnitude atom
+    among the redistribution recipients (or, in ``all`` mode, any atom). This
+    ensures an atom reported as ``source="fitted"`` carries its fitted value
+    unchanged: drift is kept off fitted atoms when there is anywhere else to
+    put it. The molecular total is then exact rather than merely close.
+
     Args:
         topology: the parsed molecule, supplying the existing charges, the
             charge groups and the bond graph.

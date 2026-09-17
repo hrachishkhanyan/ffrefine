@@ -297,10 +297,14 @@ freezing is impossible for CHELPG, where ORCA owns the fit. Recorded in section 
 
 ### 6.5 Rounding leaves the total exact
 
-Charges are written to four decimals. The rounding residual is compensated on the
-largest-magnitude atom, and the final total is asserted to be within 1e-6 of the target
-integer. Four decimals makes every written charge a multiple of 1e-4, so the compensated
-total is exact rather than merely close.
+Charges are written to four decimals. After rounding, any residual drift is absorbed by the
+largest-magnitude atom among the redistribution recipients (when there are any); otherwise the
+largest-magnitude atom overall. This ensures an atom reported as `source="fitted"` carries
+exactly the fitted value: drift compensation is kept off fitted atoms when there is anywhere
+else to put it. The final total is asserted to be within 1e-6 of the target integer. Four
+decimals makes every written charge a multiple of 1e-4, so the compensated total is exact
+rather than merely close. (The two compensation strategies yield identical totals to 1e-6,
+differing only in which atom bears the rounding error.)
 
 The target total comes from `derive_charge` (milestone 4), which reads the topology's own
 `[ atoms ]` sum and refuses one that is not near an integer.
