@@ -20,10 +20,22 @@ from ..config import Binaries
 from ..errors import ExternalToolError
 from ..io.structure import Structure, write_xyz  # noqa: F401  (re-exported for symmetry)
 from ..runner import run_command
-from ..units import ANGSTROM_TO_NM, hartree_to_kj
+from ..units import ANGSTROM_TO_NM, bohr_to_nm, hartree_to_kj
 
 DEFAULT_SP_KEYWORDS = "! wB97X-D3 def2-TZVP TightSCF"
 """Spec 4.3's default single-point level; overridable with --orca-sp-keywords."""
+
+ESP_DEFAULT_KEYWORDS = "! HF 6-31G*"
+"""Spec 5.2's ESP level of theory, without the scheme keyword.
+
+HF/6-31G* is deliberate rather than dated: its systematic overpolarisation
+approximates condensed-phase charges, which is why both Amber and the
+CHARMM-adjacent workflows fit charges at this level.
+
+The scheme appends ``CHELPG`` itself (see :func:`esp_keyword_line`), so that
+overriding the level with --orca-esp-keywords cannot silently switch the
+scheme off.
+"""
 
 
 def orca_env(binaries: Binaries) -> dict[str, str]:
@@ -136,3 +148,114 @@ def refine_energies(
         except ExternalToolError as exc:
             raise ExternalToolError(f"frame {index}: {exc}") from exc
     return hartree_to_kj(np.array(out, dtype=float))
+
+
+def esp_keyword_line(keywords: str, chelpg: bool) -> str:
+    """The ORCA keyword line for an ESP job, adding CHELPG when the scheme needs it."""
+    if chelpg and "chelpg" not in keywords.lower():
+        return f"{keywords} CHELPG"
+    return keywords
+
+
+def run_esp_job(
+    binaries: Binaries,
+    structure: Structure,
+    coords_nm: np.ndarray,
+    workdir: str | Path,
+    keywords: str = ESP_DEFAULT_KEYWORDS,
+    charge: int = 0,
+    mult: int = 1,
+    nprocs: int = 1,
+    chelpg: bool = True,
+) -> Path:
+    """Run the single ESP job both charge schemes are built on.
+
+    One job serves both: RESP needs the converged density for ``orca_vpot``,
+    and CHELPG costs nothing on top of it.  The run also leaves ``<base>.vpot``
+    -- ORCA's own grid carrying the QM potential -- which is what lets the
+    CHELPG path report a fit RRMS comparable with RESP's.
+
+    Returns:
+        The job's base path.  ``<base>.gbw``, ``<base>.scfp``,
+        ``<base>.chelpg.xyz`` and ``<base>.vpot`` hang off it.
+
+    Raises:
+        ExternalToolError: ORCA failed, or produced no CHELPG file when asked.
+    """
+    exe = binaries.require("orca")
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    base = workdir / "esp"
+    write_sp_input(
+        base.with_suffix(".inp"),
+        structure,
+        coords_nm,
+        esp_keyword_line(keywords, chelpg),
+        charge,
+        mult,
+        nprocs,
+    )
+    run_command([exe, base.with_suffix(".inp").name], workdir, "esp", extra_env=orca_env(binaries))
+    if chelpg and not Path(str(base) + ".chelpg.xyz").exists():
+        raise ExternalToolError(
+            f"ORCA finished but wrote no {base.name}.chelpg.xyz, so the CHELPG charges were "
+            "never produced. Check esp.stdout in the stage directory; the usual cause is a "
+            "keyword line that does not reach the CHELPG module."
+        )
+    return base
+
+
+def parse_chelpg_charges(path: str | Path) -> np.ndarray:
+    """Read ORCA's ``<base>.chelpg.xyz`` into an array of charges in e.
+
+    Preferred over the stdout table: this file carries eight decimals to the
+    table's six, and no surrounding banner that can change between versions.
+
+    Raises:
+        ExternalToolError: the file has no charge column, which means the run
+            did not produce CHELPG charges.
+    """
+    lines = Path(path).read_text().splitlines()
+    if len(lines) < 3:
+        raise ExternalToolError(f"{path}: too short to be a CHELPG point-charge file")
+    count = int(lines[0].split()[0])
+    charges = []
+    for line in lines[2 : 2 + count]:
+        fields = line.split()
+        if len(fields) < 5:
+            raise ExternalToolError(
+                f"{path}: line {line!r} has no charge column. ORCA writes element, x, y, z "
+                "and charge; a four-column file is a plain xyz, not a CHELPG result."
+            )
+        charges.append(float(fields[4]))
+    if len(charges) != count:
+        raise ExternalToolError(f"{path}: header says {count} atoms, found {len(charges)}")
+    return np.array(charges, dtype=float)
+
+
+def read_chelpg_vpot(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read the ``.vpot`` written by a CHELPG run.
+
+    **Column order matters.** This file is ``V x y z``; the file ``orca_vpot``
+    writes is ``x y z V``.  Same extension, reversed order, and reading either
+    with the other's parser yields coordinates that look like potentials while
+    the fit carries on producing numbers.
+
+    Returns:
+        ``(grid_nm, v_hartree_per_e)`` with shapes ``(npoints, 3)`` and
+        ``(npoints,)``.  Coordinates are converted from bohr here, at the
+        process boundary (spec section 9.8).
+
+    Raises:
+        ExternalToolError: the file holds fewer points than its header claims.
+    """
+    lines = Path(path).read_text().splitlines()
+    natoms, npoints = (int(v) for v in lines[0].split()[:2])
+    rows = [ln.split() for ln in lines[1 + natoms : 1 + natoms + npoints] if ln.strip()]
+    if len(rows) != npoints:
+        raise ExternalToolError(
+            f"{path}: header claims {npoints} grid points, found {len(rows)}. The file is "
+            "truncated, which usually means ORCA was killed part-way through."
+        )
+    data = np.array([[float(x) for x in row[:4]] for row in rows], dtype=float)
+    return bohr_to_nm(data[:, 1:4]), data[:, 0]
