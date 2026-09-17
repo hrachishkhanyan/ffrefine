@@ -45,14 +45,14 @@ def test_scan_dry_run_writes_nothing(butane_pdb, butane_itp, tmp_path):
     assert not outdir.exists()
 
 
-def test_scan_help_no_longer_advertises_the_stage_as_unimplemented(capsys):
+def test_help_no_longer_advertises_any_stage_as_unimplemented(capsys):
     """The subcommand list is where a user looks to see what the tool can do."""
     with pytest.raises(SystemExit):
         main(["--help"])
     out = capsys.readouterr().out
 
     assert "milestone 4" not in out  # scan is implemented now
-    assert "milestone 5" in out  # charges genuinely is not, so the help must still say so
+    assert "milestone 5" not in out  # charges (chelpg) is implemented now too
 
 
 def test_scan_rejects_a_step_that_does_not_divide_360(butane_pdb, butane_itp, tmp_path, capsys):

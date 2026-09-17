@@ -222,7 +222,7 @@ def test_run_accepts_the_fit_flags():
 
 
 # --------------------------------------------------------------------------
-# out-of-scope subcommands (milestones 4 and 5)
+# formerly-unimplemented subcommands (milestones 4 and 5)
 # --------------------------------------------------------------------------
 
 
@@ -235,24 +235,25 @@ def test_scan_no_longer_reports_itself_unimplemented(capsys):
     assert "a.pdb" in err
 
 
-def test_charges_reports_not_implemented(capsys):
+def test_charges_no_longer_reports_itself_unimplemented(capsys):
+    """Milestone 5 implemented it, so it fails on real validation, not on itself."""
     code = main(["charges", "-s", "a.pdb", "-p", "a.itp"])
     assert code != 0
-    assert "milestone 5" in capsys.readouterr().err.lower()
+    err = capsys.readouterr().err.lower()
+    assert "milestone 5" not in err
+    assert "--charge-atoms" in err
 
 
-def test_unimplemented_subcommands_write_nothing(tmp_path, butane_pdb, butane_itp):
-    """They must not be mistakable for working: no outdir, no files, exit != 0.
+def test_charges_without_atoms_writes_nothing(tmp_path, butane_pdb, butane_itp):
+    """Refusing --charge-mode selected with no --charge-atoms must not half-run.
 
-    ``scan`` left this list when milestone 4 implemented it, so only ``charges``
-    remains.  It takes no --dihedral, because spec section 5 selects atoms
-    rather than a torsion.
+    It takes no --dihedral, because spec section 5 selects atoms rather than a
+    torsion.
     """
     out = tmp_path / "out"
-    for argv in (["charges"],):
-        code = main(argv + ["-s", str(butane_pdb), "-p", str(butane_itp), "--outdir", str(out)])
-        assert code != 0
-        assert not out.exists()
+    code = main(["charges", "-s", str(butane_pdb), "-p", str(butane_itp), "--outdir", str(out)])
+    assert code != 0
+    assert not out.exists()
 
 
 # --------------------------------------------------------------------------

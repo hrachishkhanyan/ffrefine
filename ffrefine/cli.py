@@ -1,9 +1,10 @@
 """Command line interface (spec section 3).
 
 Subcommands: ``scan``, ``mmscan``, ``fit``, ``charges``, ``validate``,
-``run``.  ``scan`` (xtb, milestone 4) and ``charges`` (ORCA, milestone 5) are
-registered so the CLI surface matches spec section 3, but they refuse to run
-and exit nonzero rather than pretending to work.
+``run``.  All are implemented.  ``ffrefine charges --charge-scheme chelpg``
+runs end to end; ``--charge-scheme resp`` is registered so the CLI surface
+matches spec section 3, but its fit arrives in a later milestone-5 task and
+is not expected to work yet.
 
 Atom-index convention (spec section 8)
 --------------------------------------
@@ -77,6 +78,8 @@ import argparse
 import json
 import subprocess
 import logging
+import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -84,6 +87,9 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
+from .charges.apply import apply_charges
+from .charges.equivalence import average_within_groups, equivalent_hydrogen_groups
+from .charges.esp import inverse_distances, potential_from_charges, rrms
 from .config import Binaries, discover_binaries, load_config
 from .errors import FFRefineError, ValidationError
 from .fit.linear import DEFAULT_ASYMMETRY_TOLERANCE, asymmetry_metric, is_asymmetric
@@ -98,7 +104,7 @@ from .fit.weights import DEFAULT_EMAX, DEFAULT_TEMPERATURE, boltzmann_weights, u
 from .io.prm import write_prm_block
 from .io.structure import Structure, read_structure, write_multimodel_pdb
 from .io.topology import Topology, read_topology
-from .io.topwriter import write_refit_topology
+from .io.topwriter import write_charged_topology, write_refit_topology
 from .io.validate import adopt_topology_naming, validate_structure_topology
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
@@ -112,8 +118,16 @@ from .qm.scan import (
     measure_angles,
     merge_bidirectional,
 )
-from .qm.orca import DEFAULT_SP_KEYWORDS, refine_energies
-from .qm.xtb import derive_charge, run_scan, scan_grid
+from .qm.orca import (
+    DEFAULT_SP_KEYWORDS,
+    ESP_DEFAULT_KEYWORDS,
+    orca_env,
+    parse_chelpg_charges,
+    read_chelpg_vpot,
+    refine_energies,
+    run_esp_job,
+)
+from .qm.xtb import derive_charge, optimize_geometry, run_scan, scan_grid
 from .stages import (
     STAGE_DIRS,
     hash_array,
@@ -124,6 +138,7 @@ from .stages import (
     stage_is_current,
     write_manifest,
 )
+from .units import nm_to_bohr
 
 log = logging.getLogger("ffrefine")
 
@@ -274,11 +289,20 @@ def _add_torsion(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_qm_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the flags describing the QM electronic state.
+
+    Shared by ``scan`` (xtb relaxed scans) and ``charges`` (ORCA ESP jobs and
+    the xtb geometry optimisation ``--charge-geom xtb`` runs before them), and
+    by ``run``, which chains both.
+    """
+    parser.add_argument("--charge", type=int, help="molecular charge (default: from the topology)")
+    parser.add_argument("--uhf", type=int, default=0, help="unpaired electrons (default: 0)")
+
+
 def _add_scan_flags(parser: argparse.ArgumentParser) -> None:
     """Add the QM scan flags (also needed by ``run``, which chains the scan)."""
     parser.add_argument("--step", type=float, help="scan step in degrees (default: 15)")
-    parser.add_argument("--charge", type=int, help="molecular charge (default: from the topology)")
-    parser.add_argument("--uhf", type=int, default=0, help="unpaired electrons (default: 0)")
     parser.add_argument("--gfn", type=int, default=2, help="xtb GFN parameterisation (default: 2)")
     parser.add_argument(
         "--bidirectional",
@@ -319,6 +343,73 @@ def _add_scan_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _atom_list(text: str) -> tuple[int, ...]:
+    """Parse ``1,5,8`` into 1-based atom numbers.
+
+    Raises:
+        ValidationError: a field is not a positive integer.  Ruling R29 makes
+            every validation failure a ValidationError, which the parser adapts
+            to argparse's own error channel.
+    """
+    out = []
+    for field in text.split(","):
+        field = field.strip()
+        try:
+            value = int(field)
+        except ValueError:
+            raise ValidationError(f"--charge-atoms: {field!r} is not an integer") from None
+        if value < 1:
+            raise ValidationError(
+                f"--charge-atoms: {value} is not a valid atom number; indices are 1-based, "
+                "matching the topology's [ atoms ] numbering"
+            )
+        out.append(value)
+    if not out:
+        raise ValidationError("--charge-atoms: no atoms given")
+    return tuple(out)
+
+
+def _add_charge_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the charge-refinement flags (also needed by ``run``, which chains them)."""
+    parser.add_argument(
+        "--charge-scheme",
+        choices=("chelpg", "resp"),
+        default="chelpg",
+        help="ESP charge scheme (default: chelpg)",
+    )
+    parser.add_argument(
+        "--charge-geom",
+        choices=("input", "xtb"),
+        default="xtb",
+        help="geometry for the ESP job (default: xtb, an xtb --opt tight optimisation)",
+    )
+    parser.add_argument(
+        "--charge-mode",
+        choices=("selected", "all"),
+        default="selected",
+        help="replace only the named atoms, or every charge (default: selected)",
+    )
+    parser.add_argument(
+        "--charge-atoms",
+        action="append",
+        type=_atom_list,
+        default=None,
+        metavar="i,j,k",
+        help="1-based atoms whose charges to replace; repeatable",
+    )
+    parser.add_argument(
+        "--orca-esp-keywords",
+        default=ESP_DEFAULT_KEYWORDS,
+        help=f"ORCA level of theory for the ESP job (default: {ESP_DEFAULT_KEYWORDS!r})",
+    )
+    parser.add_argument(
+        "--esp-density",
+        type=float,
+        default=1.0,
+        help="MK grid points per square Angstrom, --charge-scheme resp only (default: 1.0)",
+    )
+
+
 def _add_fit_flags(parser: argparse.ArgumentParser) -> None:
     """Add the fit-stage flags (also needed by ``run``, which chains the fit)."""
     parser.add_argument(
@@ -356,6 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="QM relaxed torsion scan (xtb)")
     _add_common(scan)
     _add_torsion(scan)
+    _add_qm_flags(scan)
     _add_scan_flags(scan)
 
     mmscan = sub.add_parser("mmscan", help="GROMACS single points with and without the torsion")
@@ -367,8 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_torsion(fit)
     _add_fit_flags(fit)
 
-    charges = sub.add_parser("charges", help="ESP/RESP charges via ORCA (milestone 5, NOT IMPL.)")
+    charges = sub.add_parser("charges", help="ESP/RESP charges via ORCA")
     _add_common(charges)
+    _add_qm_flags(charges)
+    _add_charge_flags(charges)
 
     validate = sub.add_parser("validate", help="rebuild with fitted parameters and compare to QM")
     _add_common(validate)
@@ -377,8 +471,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run every implemented stage in order")
     _add_common(run)
     _add_torsion(run)
+    _add_qm_flags(run)
     _add_scan_flags(run)
     _add_fit_flags(run)
+    _add_charge_flags(run)
 
     return parser
 
@@ -664,10 +760,43 @@ def _energies_path(args: argparse.Namespace) -> Path:
     return Path(args.outdir) / STAGE_DIRS["mm_scan"] / "energies.json"
 
 
+def _charges_path(args: argparse.Namespace) -> Path:
+    return Path(args.outdir) / STAGE_DIRS["charges"] / "charges.json"
+
+
+def _orca_version(binaries: Binaries) -> str:
+    """Best-effort ORCA version for the provenance block; never fatal."""
+    try:
+        proc = subprocess.run(
+            [binaries.require("orca"), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, **orca_env(binaries)},
+        )
+    except (OSError, subprocess.SubprocessError, FFRefineError):
+        return "unknown"
+    for line in (proc.stdout or "").splitlines():
+        if "version" in line.lower():
+            return line.strip()
+    return "unknown"
+
+
+def _looks_like_cgenff(topology: Topology) -> bool:
+    """True when the atom types look like CGenFF (CG331, HGA3, OG311).
+
+    Decides only whether spec 5.3's warning applies.  A false positive prints a
+    warning that is merely irrelevant; a false negative withholds one that
+    matters, so the test is deliberately loose.
+    """
+    return any(re.match(r"^[A-Z]{1,2}G\d", atom.atype or "") for atom in topology.atoms)
+
+
 _STAGE_OUTPUTS: dict[str, tuple[str, ...]] = {
     "qm_scan": ("scan.json",),
     "mm_scan": ("energies.json",),
     "fit": ("fit.json", "dihedral.itp", "dihedral.prm"),
+    "charges": ("charges.json", "molecule_charged.itp"),
     "final": ("validation.json", "molecule_refined.itp", "after.itp"),
 }
 """Files each stage must have left behind for ``--resume`` to skip it.
@@ -1052,6 +1181,161 @@ def cmd_scan(args: argparse.Namespace) -> int:
         f"torsion {quad}: {npoints}-point relaxed scan complete, span "
         f"{relative.max():.2f} kJ/mol, written to {_scan_path(args)}"
     )
+    return 0
+
+
+def cmd_charges(args: argparse.Namespace) -> int:
+    """Fit partial charges to an ORCA electrostatic potential (spec section 5).
+
+    Charges are refined *before* the torsion stages, never after: the fitted
+    torsion absorbs whatever the 1-4 electrostatics do not account for, and
+    those depend on these charges.  Fitting the torsion first and then changing
+    the charges leaves a topology whose torsion was fitted against charges it
+    no longer carries.
+    """
+    selected_atoms = None
+    if args.charge_mode == "selected":
+        if not args.charge_atoms:
+            raise ValidationError(
+                "--charge-mode selected replaces only the atoms you name, and none were "
+                "named. Pass --charge-atoms i,j,k (1-based), or --charge-mode all to "
+                "replace every charge -- which on a CGenFF topology changes the derivation "
+                "scheme, so read the warning it prints. Choosing atoms automatically from "
+                "a CGenFF .str file arrives in milestone 6."
+            )
+        selected_atoms = sorted({nr for group in args.charge_atoms for nr in group})
+
+    if args.dry_run:
+        structure, topology = _load_structure_and_topology(args)
+        what = "every charge" if selected_atoms is None else f"atoms {selected_atoms}"
+        print(
+            f"would fit {args.charge_scheme} charges for {what} of {topology.name} "
+            f"({structure.natoms} atoms), geometry from {args.charge_geom}, "
+            f"into {args.outdir}"
+        )
+        return 0
+
+    structure, topology, _ = _prepare(args, need_quad=False)
+    target_total = derive_charge(topology, args.charge)
+    settings = {
+        "scheme": args.charge_scheme,
+        "geom": args.charge_geom,
+        "mode": args.charge_mode,
+        "atoms": selected_atoms,
+        "keywords": args.orca_esp_keywords,
+        "esp_density": float(args.esp_density),
+        "charge": target_total,
+        "uhf": int(args.uhf),
+    }
+    digest = hash_inputs([args.topology, args.structure], settings)
+    if args.resume and stage_is_current(
+        args.outdir, "charges", digest, _stage_outputs(args, "charges")
+    ):
+        print(f"charges: skipping, {_charges_path(args)} is current (--resume)")
+        return 0
+
+    binaries = _binaries(args)
+    workdir = stage_dir(args.outdir, "charges")
+
+    coords_nm = structure.coords
+    if args.charge_geom == "xtb":
+        coords_nm = optimize_geometry(
+            binaries,
+            structure,
+            coords_nm,
+            workdir / "opt",
+            charge=target_total,
+            uhf=args.uhf,
+            nthreads=args.nthreads,
+        )
+
+    base = run_esp_job(
+        binaries,
+        structure,
+        coords_nm,
+        workdir,
+        args.orca_esp_keywords,
+        charge=target_total,
+        mult=args.uhf + 1,
+        nprocs=args.nthreads,
+        chelpg=True,
+    )
+    raw = parse_chelpg_charges(Path(str(base) + ".chelpg.xyz"))
+
+    groups = equivalent_hydrogen_groups(topology)
+    raw = average_within_groups(raw, groups)
+
+    grid_nm, v_ref = read_chelpg_vpot(Path(str(base) + ".vpot"))
+    inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
+    fit_rrms = rrms(v_ref, potential_from_charges(inv_r, raw))
+    if fit_rrms > 0.5:
+        _warn(
+            f"the ESP fit reproduces the QM potential poorly (RRMS {fit_rrms:.3f}). Point "
+            "charges may simply be a poor model for this molecule; treat the result with "
+            "suspicion rather than assuming a bug."
+        )
+
+    if selected_atoms is None and _looks_like_cgenff(topology):
+        _warn(
+            "--charge-mode all replaces every charge on what looks like a CGenFF topology. "
+            "CGenFF charges are fitted to water interaction energies and dipoles, not to "
+            "the gas-phase ESP, so replacing them wholesale is a change of derivation "
+            "scheme and can degrade condensed-phase behaviour. --charge-mode selected with "
+            "--charge-atoms is the safer choice."
+        )
+
+    assignments = apply_charges(topology, raw, selected_atoms, target_total)
+    for a in assignments:
+        if a.source == "redistributed":
+            log.info(
+                "charges: atom %d (%s) %+.4f -> %+.4f, absorbing the redistribution residual",
+                a.nr,
+                a.name,
+                a.before,
+                a.after,
+            )
+    charged_itp = workdir / "molecule_charged.itp"
+    write_charged_topology(args.topology, assignments, charged_itp)
+
+    payload = {
+        "molecule": topology.name,
+        "natoms": topology.natoms,
+        "total_before": float(sum(a.before for a in assignments)),
+        "total_after": float(sum(a.after for a in assignments)),
+        "target_total": int(target_total),
+        "rrms": float(fit_rrms),
+        "atoms": [
+            {
+                "nr": a.nr,
+                "name": a.name,
+                "charge_before": a.before,
+                "charge_after": a.after,
+                "source": a.source,
+            }
+            for a in assignments
+        ],
+        "provenance": {
+            "scheme": args.charge_scheme,
+            "geometry": args.charge_geom,
+            "mode": args.charge_mode,
+            "selected_atoms": selected_atoms,
+            "orca_esp_keywords": args.orca_esp_keywords,
+            "orca_version": _orca_version(binaries),
+            "charge": int(target_total),
+            "uhf": int(args.uhf),
+            "equivalence_groups": groups,
+            "npoints": int(len(v_ref)),
+        },
+    }
+    _charges_path(args).write_text(json.dumps(payload, indent=2) + "\n", newline="\n")
+    write_manifest(args.outdir, "charges", digest, {"scheme": args.charge_scheme})
+
+    changed = sum(1 for a in assignments if a.source != "unchanged")
+    print(
+        f"{args.charge_scheme} charges: {changed} of {topology.natoms} atoms changed, "
+        f"ESP fit RRMS {fit_rrms:.4f}, written to {charged_itp}"
+    )
+    print(f"to use them, pass -p {charged_itp} to the remaining stages")
     return 0
 
 
@@ -1552,17 +1836,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {
         "scan": cmd_scan,
-        "charges": lambda a: cmd_not_implemented("charges", 5),
+        "charges": cmd_charges,
         "mmscan": cmd_mmscan,
         "fit": cmd_fit,
         "validate": cmd_validate,
         "run": cmd_run,
     }
     try:
-        # Unimplemented stages are dispatched before any config handling or
-        # file reading, so they cannot half-run and cannot create an outdir.
-        if args.command == "charges":
-            return handlers[args.command](args)
         if args.dry_run:
             _reset_logging()
         _apply_config(args)
