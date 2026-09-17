@@ -8,6 +8,7 @@ Rewriting is line-oriented: everything the parser does not model -- comments,
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -387,18 +388,26 @@ def write_charged_topology(
 def _replace_charge_field(line: str, charge: float, decimals: int) -> str:
     """Rewrite the seventh whitespace field of an ``[ atoms ]`` line in place.
 
-    Works on the character span of the existing field rather than reformatting
-    the line, so the surrounding columns keep their original spacing and any
-    trailing comment survives.
+    Locates each field by its exact character span (a regex over
+    non-whitespace runs) rather than reconstructing an offset from the
+    lengths of the preceding fields. A length-based offset ignores the
+    whitespace between fields, so it can land inside an earlier column; a
+    short charge value such as a bare ``1`` can then match the trailing
+    digit of an earlier field (e.g. atom type ``CG331``) instead of the
+    charge itself, silently corrupting that field while leaving the charge
+    unchanged. Working from the token's own span rules that out.
+
+    Only the charge field's span is replaced, so the surrounding columns
+    keep their original spacing and any trailing comment survives.
     """
     body, comment = (line.split(";", 1) + [""])[:2]
-    fields = body.split()
-    if len(fields) < 7:
+    tokens = list(re.finditer(r"\S+", body))
+    if len(tokens) < 7:
         raise ValidationError(
-            f"[ atoms ] line has {len(fields)} fields, expected at least 7: {line!r}"
+            f"[ atoms ] line has {len(tokens)} fields, expected at least 7: {line!r}"
         )
-    old = fields[6]
-    start = body.index(old, sum(len(f) for f in fields[:6]))
+    charge_token = tokens[6]
+    old = charge_token.group()
     new = f"{charge:.{decimals}f}".rjust(len(old))
-    rebuilt = body[:start] + new + body[start + len(old) :]
+    rebuilt = body[: charge_token.start()] + new + body[charge_token.end() :]
     return rebuilt + (";" + comment if comment else "")

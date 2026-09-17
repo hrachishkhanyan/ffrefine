@@ -323,3 +323,36 @@ def test_charged_topology_refuses_an_atom_it_cannot_find(tmp_path, butane_itp):
 
     with pytest.raises(ValidationError, match="99"):
         write_charged_topology(butane_itp, assignments, tmp_path / "charged.itp")
+
+
+def test_charged_topology_charge_not_confused_with_earlier_substring(tmp_path):
+    """Regression: the charge column was located by an offset computed from
+    the summed lengths of the preceding fields, which ignores the whitespace
+    between them and so lands short of the real column. ``str.index`` then
+    matched the first occurrence of the (short) charge value at or after
+    that point -- here the trailing "1" of the atom type "CG331" -- instead
+    of the actual charge field, corrupting the atom type while leaving the
+    charge untouched and still reporting the atom as changed.
+    """
+    from ffrefine.charges.apply import ChargeAssignment
+    from ffrefine.io.topwriter import write_charged_topology
+
+    src = tmp_path / "tricky.itp"
+    src.write_text(
+        "[ moleculetype ]\n"
+        "BUT     3\n"
+        "\n"
+        "[ atoms ]\n"
+        ";  nr  type   resnr  residue  atom  cgnr   charge     mass\n"
+        "     1   CG331      1    BUT    C1      1     1     12.011   ; comment\n"
+    )
+    out = tmp_path / "charged.itp"
+    assignments = [ChargeAssignment(nr=1, name="C1", before=1.0, after=0.5, source="fitted")]
+
+    changed = write_charged_topology(src, assignments, out)
+
+    assert changed == [1]
+    text = out.read_text()
+    assert "CG331" in text  # atom type intact, not corrupted
+    assert "CG330.5000" not in text  # the bug: new charge spliced into the type
+    assert "0.5000" in text  # the charge itself actually moved
