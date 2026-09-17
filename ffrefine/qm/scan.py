@@ -17,9 +17,8 @@ import numpy as np
 
 from ..errors import ValidationError
 from ..geometry import dihedral_deg_frames, kabsch_rmsd, wrap_deg
-from ..io.structure import guess_element
 from ..io.topology import Topology
-from ..io.validate import element_from_mass
+from ..io.validate import element_of
 
 Quad = tuple[int, int, int, int]
 
@@ -347,25 +346,6 @@ class HBondChange:
     broken: set[HBond]
 
 
-def _element_of(topology: Topology, nr: int) -> str:
-    """Element of a topology atom, preferring its mass over its name.
-
-    ``guess_element`` reads the name only, and names are ambiguous in exactly
-    the way that matters here: ``NA`` matches the two-letter element table and
-    returns sodium for what is often a nitrogen, which would drop a real donor
-    or invent an acceptor that does not exist.  The mass is unambiguous, and
-    :func:`ffrefine.io.validate.validate_structure_topology` already treats it
-    as the authority, so this follows that precedent and falls back to the name
-    only when the topology carries no mass.
-    """
-    atom = topology.atoms[nr - 1]
-    if atom.mass is not None:
-        from_mass = element_from_mass(atom.mass)
-        if from_mass:
-            return from_mass
-    return guess_element(atom.name) or ""
-
-
 def hbond_donors_and_acceptors(
     topology: Topology,
 ) -> tuple[list[tuple[int, int]], list[int]]:
@@ -385,12 +365,12 @@ def hbond_donors_and_acceptors(
     donors: list[tuple[int, int]] = []
     acceptors: list[int] = []
     for atom in topology.atoms:
-        element = _element_of(topology, atom.nr)
+        element = element_of(topology, atom.nr)
         if element in HBOND_ELEMENTS:
             acceptors.append(atom.nr)
         elif element == "H":
             for neighbour in topology.bonded_neighbours(atom.nr):
-                if _element_of(topology, neighbour) in HBOND_ELEMENTS:
+                if element_of(topology, neighbour) in HBOND_ELEMENTS:
                     donors.append((neighbour, atom.nr))
     return donors, acceptors
 
@@ -516,12 +496,13 @@ def hbond_changes(
 def heavy_atom_indices(topology: Topology) -> list[int]:
     """0-based indices of the non-hydrogen atoms, for :func:`find_hops`.
 
-    The element comes from the mass first, exactly as :func:`_element_of` does
-    for the donor search, and for the same reason: a name is not authoritative.
-    It matters more here than it looks.  ``find_hops`` excludes hydrogens
-    because a rotating methyl throws a large aligned RMSD at every step without
-    any conformational change happening, so a hydrogen misread as heavy puts
-    that rotation straight back into the statistic the hop test is built on.
+    The element comes from the mass first, exactly as
+    :func:`ffrefine.io.validate.element_of` does for the donor search, and for
+    the same reason: a name is not authoritative.  It matters more here than it
+    looks.  ``find_hops`` excludes hydrogens because a rotating methyl throws a
+    large aligned RMSD at every step without any conformational change
+    happening, so a hydrogen misread as heavy puts that rotation straight back
+    into the statistic the hop test is built on.
 
     Args:
         topology: the parsed molecule.
@@ -530,4 +511,4 @@ def heavy_atom_indices(topology: Topology) -> list[int]:
         0-based indices, because the caller uses them to index the coordinate
         array rather than to name topology atoms.
     """
-    return [i for i, atom in enumerate(topology.atoms) if _element_of(topology, atom.nr) != "H"]
+    return [i for i, atom in enumerate(topology.atoms) if element_of(topology, atom.nr) != "H"]

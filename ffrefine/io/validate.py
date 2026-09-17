@@ -42,6 +42,28 @@ _element_from_mass = element_from_mass
 """Kept so this module's existing internal callers read unchanged."""
 
 
+def element_of(topology: Topology, nr: int) -> str:
+    """Element of a topology atom, preferring its mass over its name.
+
+    ``guess_element`` reads the name only, and names are ambiguous in exactly
+    the way that matters: ``NA`` matches the two-letter element table and comes
+    back as sodium for what is often a nitrogen.  The mass is unambiguous, and
+    :func:`validate_structure_topology` already treats it as the authority, so
+    this follows that precedent and falls back to the name only when the
+    topology carries no mass.
+
+    Args:
+        topology: the parsed molecule.
+        nr: 1-based atom number, as written in ``[ atoms ]``.
+    """
+    atom = topology.atoms[nr - 1]
+    if atom.mass is not None:
+        from_mass = element_from_mass(atom.mass)
+        if from_mass:
+            return from_mass
+    return guess_element(atom.name) or ""
+
+
 def validate_structure_topology(
     structure: Structure, topology: Topology, strict_names: bool = True
 ) -> list[str]:
