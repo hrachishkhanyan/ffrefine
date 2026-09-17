@@ -48,3 +48,33 @@ def test_structure_still_exports_angstrom_to_nm():
     from ffrefine.units import ANGSTROM_TO_NM as from_units
 
     assert from_structure is from_units
+
+
+def test_bohr_to_nm_uses_the_codata_value():
+    from ffrefine.units import bohr_to_nm
+
+    assert bohr_to_nm(1.0) == pytest.approx(0.0529177210903)
+
+
+def test_bohr_round_trips_through_nm():
+    from ffrefine.units import bohr_to_nm, nm_to_bohr
+
+    assert nm_to_bohr(bohr_to_nm(2.5)) == pytest.approx(2.5, rel=1e-12)
+
+
+def test_bohr_conversion_is_consistent_with_the_angstrom_one():
+    """One bohr is 0.529177 Angstrom, and Angstrom already has a conversion.
+
+    Two independent constants for the same physical relation is how a unit bug
+    hides: each looks right on its own.
+    """
+    from ffrefine.units import angstrom_to_nm, bohr_to_nm
+
+    assert bohr_to_nm(1.0) == pytest.approx(angstrom_to_nm(0.529177210903), rel=1e-12)
+
+
+def test_bohr_conversions_work_on_arrays():
+    from ffrefine.units import nm_to_bohr
+
+    out = nm_to_bohr(np.array([0.0, 0.0529177210903]))
+    assert out == pytest.approx([0.0, 1.0])

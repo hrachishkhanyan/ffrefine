@@ -17,6 +17,13 @@ KCAL_TO_KJ: float = 4.184
 ANGSTROM_TO_NM: float = 0.1
 """nm per Angstrom.  xtb and ORCA speak Angstrom; GROMACS and ffrefine speak nm."""
 
+BOHR_TO_ANGSTROM: float = 0.529177210903
+"""Angstrom per bohr (CODATA 2018).
+
+ORCA's ``orca_vpot`` reads grid coordinates and writes potentials in atomic
+units, so the ESP path crosses this boundary twice.
+"""
+
 Numeric = float | np.ndarray
 
 
@@ -48,6 +55,16 @@ def angstrom_to_nm(x: Numeric) -> Numeric:
 def nm_to_angstrom(x: Numeric) -> Numeric:
     """Convert nanometres to Angstrom."""
     return x / ANGSTROM_TO_NM
+
+
+def bohr_to_nm(x: Numeric) -> Numeric:
+    """Convert bohr to nanometres."""
+    return x * BOHR_TO_ANGSTROM * ANGSTROM_TO_NM
+
+
+def nm_to_bohr(x: Numeric) -> Numeric:
+    """Convert nanometres to bohr."""
+    return x / (BOHR_TO_ANGSTROM * ANGSTROM_TO_NM)
 
 
 def deg_to_rad(x: Numeric) -> Numeric:
