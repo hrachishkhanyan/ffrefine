@@ -1190,3 +1190,46 @@ def test_run_log_only_material_is_not_echoed_to_stderr(tmp_path, butane_pdb, but
     captured = capsys.readouterr()
     assert "BIC ranking of candidate" not in captured.err
     assert captured.out.count("multiplicities") >= 1
+
+
+def test_inputs_load_without_a_dihedral(butane_pdb, butane_itp):
+    """charges needs no torsion, so loading must not require one."""
+    from ffrefine.cli import _load_structure_and_topology
+
+    parser = build_parser()
+    args = parser.parse_args(["charges", "-s", str(butane_pdb), "-p", str(butane_itp)])
+    structure, topology = _load_structure_and_topology(args)
+
+    assert topology.natoms == 14
+    assert structure.natoms == 14
+
+
+def test_resolving_a_quad_still_refuses_when_none_was_given(butane_pdb, butane_itp):
+    """The refusal must survive the split, not leak away with it."""
+    from ffrefine.cli import _load_structure_and_topology, _resolve_quad
+
+    parser = build_parser()
+    args = parser.parse_args(["mmscan", "-s", str(butane_pdb), "-p", str(butane_itp)])
+    _, topology = _load_structure_and_topology(args)
+
+    with pytest.raises(ValidationError, match="--dihedral"):
+        _resolve_quad(args, topology)
+
+
+def test_input_stage_omits_the_torsion_set_when_there_is_no_torsion(
+    tmp_path, butane_pdb, butane_itp
+):
+    """model.json must not claim a target torsion that was never selected."""
+    from ffrefine.cli import _load_structure_and_topology, _write_input_stage
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["charges", "-s", str(butane_pdb), "-p", str(butane_itp), "--outdir", str(tmp_path)]
+    )
+    structure, topology = _load_structure_and_topology(args)
+    _write_input_stage(args, structure, topology, None)
+
+    model = json.loads((tmp_path / "00_input" / "model.json").read_text())
+    assert model["natoms"] == 14
+    assert "target_quad_1_based" not in model
+    assert "torsion_set_1_based" not in model

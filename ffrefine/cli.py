@@ -518,12 +518,13 @@ def _binaries(args: argparse.Namespace) -> Binaries:
     )
 
 
-def _load_inputs(args: argparse.Namespace) -> tuple[Structure, Topology, Quad]:
-    """Read, cross-check and return the structure, topology and target quad.
+def _load_structure_and_topology(args: argparse.Namespace) -> tuple[Structure, Topology]:
+    """Read and cross-check the structure and topology, with no torsion involved.
+
+    Split out of :func:`_load_inputs` so ``charges``, which refines charges and
+    touches no dihedral, does not have to supply a ``--dihedral`` it never uses.
 
     Raises:
-        ValidationError: no ``--dihedral`` was given, more than one was given,
-            or the quadruplet is unusable with this topology.
         ParseError: a structure or topology file could not be parsed.
     """
     structure = read_structure(args.structure)
@@ -535,8 +536,16 @@ def _load_inputs(args: argparse.Namespace) -> tuple[Structure, Topology, Quad]:
     # XYZ carries no atom names, so the reader's placeholders would reach
     # grompp and never match the topology. Order is already checked above, so
     # the topology's own naming is the right one to use from here on.
-    structure = adopt_topology_naming(structure, topology)
+    return adopt_topology_naming(structure, topology), topology
 
+
+def _resolve_quad(args: argparse.Namespace, topology: Topology) -> Quad:
+    """Resolve the single target torsion from ``--dihedral``.
+
+    Raises:
+        ValidationError: no ``--dihedral`` was given, more than one was given,
+            or the quadruplet is unusable with this topology.
+    """
     quads = getattr(args, "dihedral", None) or []
     if not quads:
         raise ValidationError(
@@ -552,17 +561,25 @@ def _load_inputs(args: argparse.Namespace) -> tuple[Structure, Topology, Quad]:
         )
     quad = quads[0]
     validate_quad(topology, quad)
-    return structure, topology, quad
+    return quad
+
+
+def _load_inputs(args: argparse.Namespace) -> tuple[Structure, Topology, Quad]:
+    """Read, cross-check and return the structure, topology and target quad."""
+    structure, topology = _load_structure_and_topology(args)
+    return structure, topology, _resolve_quad(args, topology)
 
 
 def _write_input_stage(
-    args: argparse.Namespace, structure: Structure, topology: Topology, quad: Quad
+    args: argparse.Namespace, structure: Structure, topology: Topology, quad: Quad | None
 ) -> None:
     """Populate ``00_input/`` (spec section 6).
 
     Copies -- never moves or rewrites -- the two input files and dumps the
     parsed model, including the 1-4 conventions that make the eventual fit
-    convention-bound (spec section 9.3).
+    convention-bound (spec section 9.3).  ``quad`` is ``None`` for stages that
+    refine something other than a torsion; the torsion-set keys are then
+    omitted rather than recording a target that was never chosen.
     """
     target = stage_dir(args.outdir, "input")
     for source in (Path(args.structure), Path(args.topology)):
@@ -571,7 +588,6 @@ def _write_input_stage(
             shutil.copyfile(source, destination)
 
     defaults = topology.defaults
-    torsion_set = collect_torsion_set(topology, quad)
     model = {
         "structure": str(Path(args.structure).resolve()),
         "topology": str(Path(args.topology).resolve()),
@@ -585,11 +601,13 @@ def _write_input_stage(
         "fudgeQQ": None if defaults is None else defaults.fudge_qq,
         "fudgeLJ": None if defaults is None else defaults.fudge_lj,
         "gen_pairs": None if defaults is None else defaults.gen_pairs,
-        "target_quad_1_based": list(quad),
-        "central_bond_1_based": [quad[1], quad[2]],
-        "torsion_set_size": len(torsion_set),
-        "torsion_set_1_based": [[d.ai, d.aj, d.ak, d.al] for d in torsion_set],
     }
+    if quad is not None:
+        torsion_set = collect_torsion_set(topology, quad)
+        model["target_quad_1_based"] = list(quad)
+        model["central_bond_1_based"] = [quad[1], quad[2]]
+        model["torsion_set_size"] = len(torsion_set)
+        model["torsion_set_1_based"] = [[d.ai, d.aj, d.ak, d.al] for d in torsion_set]
     if defaults is None:
         _warn(
             f"{args.topology} has no [ defaults ] directive, so fudgeQQ/fudgeLJ could not "
@@ -599,10 +617,18 @@ def _write_input_stage(
     (target / "model.json").write_text(json.dumps(model, indent=2) + "\n")
 
 
-def _prepare(args: argparse.Namespace) -> tuple[Structure, Topology, Quad]:
-    """Configure logging, read the inputs and write ``00_input/``."""
+def _prepare(
+    args: argparse.Namespace, *, need_quad: bool = True
+) -> tuple[Structure, Topology, Quad | None]:
+    """Configure logging, read the inputs and write ``00_input/``.
+
+    ``need_quad=False`` is for stages that refine something other than a
+    torsion; they get ``None`` and ``00_input/model.json`` omits the torsion
+    set rather than recording one that was never chosen.
+    """
     setup_logging(args.outdir, args.verbose)
-    structure, topology, quad = _load_inputs(args)
+    structure, topology = _load_structure_and_topology(args)
+    quad = _resolve_quad(args, topology) if need_quad else None
     _write_input_stage(args, structure, topology, quad)
     return structure, topology, quad
 
