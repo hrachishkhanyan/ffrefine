@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+from ..errors import ValidationError
 from ..mm.torsionset import EntryKey as _EntryKey
 from ..mm.torsionset import collect_torsion_set, distinct_entry_keys
 from .topology import Dihedral, Topology
+
+if TYPE_CHECKING:
+    # ffrefine/io/ is the lowest layer; ffrefine/charges/ builds on top of it
+    # (charges/apply.py already imports io.topology and io.validate), so this
+    # stays a type-checking-only import to avoid inverting that layering.
+    from ..charges.apply import ChargeAssignment
 
 log = logging.getLogger("ffrefine")
 
@@ -305,3 +313,92 @@ def make_system_top(
     lines.append(f'#include "{Path(itp_path).name}"')
     lines += ["", "[ system ]", f"{molname} in vacuum", "", "[ molecules ]", f"{molname}    1", ""]
     Path(out_path).write_text("\n".join(lines), newline="\n")
+
+
+def write_charged_topology(
+    source: str | Path,
+    assignments: list["ChargeAssignment"],
+    out_path: str | Path,
+    decimals: int = 4,
+) -> list[int]:
+    """Copy a topology, rewriting only the charge column of changed atoms.
+
+    Reads the source *text* rather than the parsed ``raw_lines``, for the same
+    reason :func:`write_molecule_copy` does: ``#ifdef`` branches this build did
+    not take must still reach grompp, which runs its own preprocessor.
+
+    Only the charge field is touched.  Atom type, residue, charge group and
+    mass are left exactly as written, including their spacing, so a diff
+    against the input shows the charges and nothing else.
+
+    Args:
+        source: the user's topology; never modified.
+        assignments: from :func:`ffrefine.charges.apply.apply_charges`.  Entries
+            whose charge did not move are skipped.
+        out_path: destination.
+        decimals: decimal places written into the charge field.  Defaults to
+            :data:`ffrefine.charges.apply.CHARGE_DECIMALS`; pass that value
+            (or a matching custom precision) explicitly if it ever changes,
+            so the written charges stay consistent with what
+            :func:`ffrefine.charges.apply.apply_charges` rounded to.
+
+    Returns:
+        The 1-based atom numbers whose lines were rewritten, in file order.
+
+    Raises:
+        ValidationError: an assignment names an atom that has no line in
+            ``[ atoms ]``.  Skipping it silently would leave a topology whose
+            charges no longer sum to the molecular charge.
+    """
+    wanted = {a.nr: a for a in assignments if a.after != a.before}
+    lines = Path(source).read_text().splitlines()
+    out: list[str] = []
+    changed: list[int] = []
+    section = ""
+    for line in lines:
+        body = line.split(";", 1)[0].strip()
+        if body.startswith("[") and body.endswith("]"):
+            section = body.strip("[] ").strip()
+            out.append(line)
+            continue
+        if section != "atoms" or not body:
+            out.append(line)
+            continue
+        fields = body.split()
+        nr = int(fields[0]) if fields[0].isdigit() else None
+        if nr is None or nr not in wanted:
+            out.append(line)
+            continue
+        out.append(_replace_charge_field(line, wanted[nr].after, decimals))
+        changed.append(nr)
+
+    missing = sorted(set(wanted) - set(changed))
+    if missing:
+        raise ValidationError(
+            f"{source}: no [ atoms ] line for atom(s) {missing}, so their new charges "
+            "could not be written. The topology and the fitted charges disagree about "
+            "how many atoms this molecule has."
+        )
+    Path(out_path).write_text("\n".join(out) + "\n", newline="\n")
+    log.info("wrote %s with %d charge(s) changed", Path(out_path).name, len(changed))
+    return changed
+
+
+def _replace_charge_field(line: str, charge: float, decimals: int) -> str:
+    """Rewrite the seventh whitespace field of an ``[ atoms ]`` line in place.
+
+    Works on the character span of the existing field rather than reformatting
+    the line, so the surrounding columns keep their original spacing and any
+    trailing comment survives.
+    """
+    body, comment = (line.split(";", 1) + [""])[:2]
+    fields = body.split()
+    if len(fields) < 7:
+        raise ValidationError(
+            f"[ atoms ] line has {len(fields)} fields, expected at least 7: {line!r}"
+        )
+    old = fields[6]
+    start = body.index(old, sum(len(f) for f in fields[:6]))
+    new = f"{charge:.{decimals}f}".rjust(len(old))
+    rebuilt = body[:start] + new + body[start + len(old) :]
+    return rebuilt + (";" + comment if comment else "")

@@ -259,3 +259,67 @@ def test_writers_emit_lf_line_endings(tmp_path, butane_itp):
     make_system_top(zeroed, top, "BUT")
     for path in (zeroed, refit, top):
         assert b"\r\n" not in path.read_bytes(), path.name
+
+
+def test_charged_topology_changes_only_the_charge_column(tmp_path, butane_itp):
+    """Everything but the edited charges must survive byte-for-byte."""
+    from ffrefine.charges.apply import ChargeAssignment
+    from ffrefine.io.topwriter import write_charged_topology
+
+    assignments = [ChargeAssignment(nr=1, name="C1", before=-0.270, after=-0.4058, source="fitted")]
+    out = tmp_path / "charged.itp"
+
+    changed = write_charged_topology(butane_itp, assignments, out)
+
+    assert changed == [1]
+    before = butane_itp.read_text().splitlines()
+    after = out.read_text().splitlines()
+    assert len(before) == len(after)
+    differing = [i for i, (a, b) in enumerate(zip(before, after)) if a != b]
+    assert len(differing) == 1
+    assert "-0.4058" in after[differing[0]]
+    assert "CG331" in after[differing[0]]  # the rest of the line is intact
+
+
+def test_charged_topology_rewrites_nothing_when_no_charge_moved(tmp_path, butane_itp):
+    from ffrefine.charges.apply import ChargeAssignment
+    from ffrefine.io.topwriter import write_charged_topology
+
+    assignments = [
+        ChargeAssignment(nr=1, name="C1", before=-0.270, after=-0.270, source="unchanged")
+    ]
+    out = tmp_path / "charged.itp"
+
+    assert write_charged_topology(butane_itp, assignments, out) == []
+    assert out.read_text() == butane_itp.read_text()
+
+
+def test_charged_topology_reads_back_with_the_new_charges(tmp_path, butane_itp):
+    """The point of the file: the parser must see what was written."""
+    from ffrefine.charges.apply import ChargeAssignment
+    from ffrefine.io.topwriter import write_charged_topology
+    from ffrefine.io.topology import read_topology
+
+    assignments = [
+        ChargeAssignment(nr=1, name="C1", before=-0.270, after=-0.4058, source="fitted"),
+        ChargeAssignment(nr=11, name="C4", before=-0.270, after=-0.4091, source="fitted"),
+    ]
+    out = tmp_path / "charged.itp"
+    write_charged_topology(butane_itp, assignments, out)
+
+    top = read_topology(out)
+    assert top.atoms[0].charge == pytest.approx(-0.4058)
+    assert top.atoms[10].charge == pytest.approx(-0.4091)
+    assert top.atoms[1].charge == pytest.approx(0.090)  # untouched
+
+
+def test_charged_topology_refuses_an_atom_it_cannot_find(tmp_path, butane_itp):
+    """A silently skipped atom would give a topology with the wrong total."""
+    from ffrefine.charges.apply import ChargeAssignment
+    from ffrefine.io.topwriter import write_charged_topology
+    from ffrefine.errors import ValidationError
+
+    assignments = [ChargeAssignment(nr=99, name="ZZ", before=0.0, after=0.5, source="fitted")]
+
+    with pytest.raises(ValidationError, match="99"):
+        write_charged_topology(butane_itp, assignments, tmp_path / "charged.itp")
