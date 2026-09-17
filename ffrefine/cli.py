@@ -1193,6 +1193,12 @@ def cmd_charges(args: argparse.Namespace) -> int:
     the charges leaves a topology whose torsion was fitted against charges it
     no longer carries.
     """
+    if args.charge_scheme == "resp":
+        raise ValidationError(
+            "--charge-scheme resp is not implemented yet; it arrives later in this "
+            "milestone. --charge-scheme chelpg is the working scheme today."
+        )
+
     selected_atoms = None
     if args.charge_mode == "selected":
         if not args.charge_atoms:

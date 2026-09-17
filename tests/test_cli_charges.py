@@ -55,6 +55,27 @@ def test_selected_mode_without_atoms_is_refused(butane_pdb, butane_itp, tmp_path
     assert "Traceback" not in err
 
 
+def test_charge_scheme_resp_is_refused_for_now(butane_pdb, butane_itp, tmp_path, capsys):
+    """RESP isn't implemented yet; nothing may silently mislabel a CHELPG fit as RESP."""
+    rc = main(
+        _args(
+            butane_pdb,
+            butane_itp,
+            tmp_path / "out",
+            "--charge-scheme",
+            "resp",
+            "--charge-mode",
+            "all",
+        )
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "chelpg" in err.lower()
+    assert "Traceback" not in err
+
+
 def test_charges_dry_run_writes_nothing(butane_pdb, butane_itp, tmp_path):
     outdir = tmp_path / "out"
     rc = main(_args(butane_pdb, butane_itp, outdir, "--charge-mode", "all", "--dry-run"))
