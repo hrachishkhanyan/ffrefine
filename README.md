@@ -157,8 +157,8 @@ zeroing only the selected quadruplet is spec section 9.1's first named pitfall.
 
 This optimises the geometry with xtb, runs one ORCA ESP job, fits CHELPG
 charges to it, and writes `butane_out/04_charges/molecule_charged.itp` along
-with `charges.json` recording every atom's charge before and after and why it
-changed. `--charge-mode selected` is the default, so only atoms 1 and 11 (the
+with `charges.json` recording every atom's element and charge before and after,
+why it changed, and the text of every warning the run printed. `--charge-mode selected` is the default, so only atoms 1 and 11 (the
 terminal carbons) are replaced; the rest of each carbon's charge group absorbs
 the change so the group's own net charge stays put.
 

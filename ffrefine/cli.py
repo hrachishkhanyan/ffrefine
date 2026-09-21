@@ -80,6 +80,8 @@ import os
 import re
 import shutil
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -595,14 +597,39 @@ def _reset_logging() -> None:
         handler.close()
 
 
+_WARNING_SINKS: list[list[str]] = []
+"""Lists currently collecting every :func:`_warn` message; see :func:`_collect_warnings`."""
+
+
+@contextmanager
+def _collect_warnings() -> Iterator[list[str]]:
+    """Collect the text of every :func:`_warn` issued inside the block.
+
+    For stages that must keep their warnings in their own output file, not
+    only in ``run.log`` and on stderr -- ``charges.json``'s ``warnings`` list
+    (design section 7, ruling R25), which milestone 6's report reads.
+    Collecting at :func:`_warn` rather than at the call sites means a warning
+    added later is kept without anyone remembering to keep it.
+    """
+    sink: list[str] = []
+    _WARNING_SINKS.append(sink)
+    try:
+        yield sink
+    finally:
+        _WARNING_SINKS.remove(sink)
+
+
 def _warn(message: str) -> None:
     """Emit a user-facing warning exactly once.
 
     Once logging is configured, ``setup_logging``'s own console handler puts
     the message on stderr *and* into ``run.log``; printing as well would
     double it.  Before that (dry runs, argument handling) there is no logger
-    to carry it, so it goes straight to stderr.
+    to carry it, so it goes straight to stderr.  Any collector opened with
+    :func:`_collect_warnings` also receives the text.
     """
+    for sink in _WARNING_SINKS:
+        sink.append(message)
     if log.handlers:
         log.warning(message)
     else:
@@ -1343,7 +1370,16 @@ def cmd_charges(args: argparse.Namespace) -> int:
     those depend on these charges.  Fitting the torsion first and then changing
     the charges leaves a topology whose torsion was fitted against charges it
     no longer carries.
+
+    Every warning issued while the stage runs is also written to
+    ``charges.json`` under ``"warnings"``.
     """
+    with _collect_warnings() as emitted:
+        return _charges_stage(args, emitted)
+
+
+def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
+    """The body of :func:`cmd_charges`; ``emitted`` collects its warnings."""
     selected_atoms = None
     if args.charge_mode == "selected":
         if not args.charge_atoms:
@@ -1485,10 +1521,12 @@ def cmd_charges(args: argparse.Namespace) -> int:
         "rrms_written": float(scores["written"]),
         "rrms_fitted": float(scores["fitted"]),
         "rrms_before": float(scores["before"]),
+        "warnings": list(emitted),
         "atoms": [
             {
                 "nr": a.nr,
                 "name": a.name,
+                "element": element_of(topology, a.nr),
                 "charge_before": a.before,
                 "charge_after": a.after,
                 "source": a.source,

@@ -695,3 +695,52 @@ def test_a_six_decimal_topology_keeps_every_untouched_line(
     assert len(differing) == 4  # C1 and its three hydrogens, nothing else
     for line in differing:
         assert len(line.split()[6].split(".")[1]) == 6
+
+
+def test_charges_json_keeps_every_warning_the_stage_printed(
+    butane_pdb, butane_itp, tmp_path, fake_esp, capsys
+):
+    """Final review I6 (ruling R25): design section 7 puts warnings in charges.json.
+
+    ``--charge-mode all`` on butane's CGenFF-style types triggers the CGenFF
+    warning; milestone 6's report needs it, and the RRMS warning, from a
+    durable source rather than scrollback.
+    """
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-mode", "all", "--charge-geom", "input")
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+
+    warnings = _charges_json(outdir)["warnings"]
+    cgenff = [w for w in warnings if "CGenFF" in w]
+    assert len(cgenff) == 1
+    assert cgenff[0] in err  # the same text the user saw
+
+
+def test_charges_json_keeps_the_rrms_warning(butane_pdb, butane_itp, tmp_path, fake_esp, capsys):
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-atoms", "1", "--charge-geom", "input")
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+
+    warnings = _charges_json(outdir)["warnings"]
+    poorly = [w for w in warnings if "poorly" in w]
+    assert len(poorly) == 1
+    assert poorly[0] in err
+    assert not any("CGenFF" in w for w in warnings)  # selected mode: no CGenFF warning
+
+
+def test_charges_json_records_each_atoms_element(butane_pdb, butane_itp, tmp_path, fake_esp):
+    """Design section 4 lists a per-atom element."""
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-atoms", "1", "--charge-geom", "input")
+    )
+    assert rc == 0
+
+    elements = [a["element"] for a in _charges_json(outdir)["atoms"]]
+    assert elements == ["C", "H", "H", "H", "C", "H", "H", "C", "H", "H", "C", "H", "H", "H"]

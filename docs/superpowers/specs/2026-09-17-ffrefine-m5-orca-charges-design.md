@@ -208,8 +208,8 @@ ruling R20).
 
 `charges.json` records, per atom: `nr`, `name`, `element`, `charge_before`, `charge_after`,
 and `source` (`fitted`, `redistributed`, `unchanged`); plus both totals, the three RRMS values
-(`rrms_written`, `rrms_fitted`, `rrms_before`), and
-provenance: scheme, level of theory, geometry source, ORCA version, grid settings, the radii
+(`rrms_written`, `rrms_fitted`, `rrms_before`), the text of every warning the stage emitted
+(`warnings`, including the CGenFF and RRMS warnings of section 7), and provenance: scheme, level of theory, geometry source, ORCA version, grid settings, the radii
 used, the restraint constants, and the equivalence groups.
 
 ---
