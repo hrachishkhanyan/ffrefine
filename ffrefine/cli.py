@@ -832,6 +832,39 @@ def _orca_version(binaries: Binaries) -> str:
     return "unknown"
 
 
+def _partial_group_warnings(groups: list[list[int]], selected: list[int] | None) -> list[str]:
+    """Warnings for equivalence groups that ``--charge-atoms`` selects only part of.
+
+    Spec 5.3 gives equivalent hydrogens one charge.  ``selected`` mode
+    replaces only the named atoms, so naming one hydrogen of a methyl leaves
+    its siblings at their topology charges and the group unequal -- which
+    used to happen without a word (final review, M3).
+
+    Args:
+        groups: 1-based groups from
+            :func:`~ffrefine.charges.equivalence.equivalent_hydrogen_groups`.
+        selected: 1-based selected atoms, or ``None`` for ``--charge-mode all``
+            (which replaces every atom and so splits no group).
+
+    Returns:
+        One message per split group, naming the group and its unselected members.
+    """
+    if selected is None:
+        return []
+    chosen = set(selected)
+    out = []
+    for group in groups:
+        unselected = [nr for nr in group if nr not in chosen]
+        if unselected and len(unselected) < len(group):
+            out.append(
+                f"--charge-atoms selects only part of the equivalent-hydrogen group {group} "
+                f"(bonded to the same atom, same atom type): {unselected} are not selected and "
+                "keep their topology charges, so spec 5.3's equal-charge rule no longer holds "
+                f"for this group. Select all of {group} to keep it equal."
+            )
+    return out
+
+
 def _looks_like_cgenff(topology: Topology) -> bool:
     """True when the atom types look like CGenFF (CG331, HGA3, OG311).
 
@@ -1404,6 +1437,10 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
         # The same refusals the real run makes, so a dry run never promises a
         # run that would be refused.
         check_selection(topology, selected_atoms, derive_charge(topology, args.charge))
+        for warning in _partial_group_warnings(
+            equivalent_hydrogen_groups(topology), selected_atoms
+        ):
+            _warn(warning)
         what = "every charge" if selected_atoms is None else f"atoms {selected_atoms}"
         print(
             f"would fit {args.charge_scheme} charges for {what} of {topology.name} "
@@ -1417,6 +1454,9 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
     # Needs only the topology, so it runs before any xtb or ORCA job rather
     # than after them inside apply_charges (which checks again regardless).
     check_selection(topology, selected_atoms, target_total)
+    groups = equivalent_hydrogen_groups(topology)
+    for warning in _partial_group_warnings(groups, selected_atoms):
+        _warn(warning)
     settings = {
         "scheme": args.charge_scheme,
         "geom": args.charge_geom,
@@ -1460,7 +1500,6 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
         nprocs=args.nthreads,
         chelpg=True,
     )
-    groups = equivalent_hydrogen_groups(topology)
     grid_provenance: dict[str, object] | None = None
     restraint_provenance: dict[str, object] | None = None
 

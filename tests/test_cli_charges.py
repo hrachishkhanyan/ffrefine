@@ -808,3 +808,49 @@ def test_charge_atoms_with_charge_mode_all_is_refused(butane_pdb, butane_itp, tm
     err = capsys.readouterr().err
     assert "--charge-atoms" in err
     assert "--charge-mode all" in err
+
+
+def test_selecting_part_of_an_equivalence_group_is_warned_about_and_recorded(
+    butane_pdb, butane_itp, tmp_path, fake_esp, capsys
+):
+    """Final review M3: one hydrogen of a methyl breaks spec 5.3's equal-charge rule.
+
+    Atoms 2, 3 and 4 are C1's methyl hydrogens. Selecting only atom 2 replaces
+    its charge and leaves 3 and 4 at theirs, so the group is no longer equal;
+    that used to happen without a word.
+    """
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-atoms", "2", "--charge-geom", "input")
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+
+    partial = [w for w in _charges_json(outdir)["warnings"] if "equivalent" in w]
+    assert len(partial) == 1
+    assert "[2, 3, 4]" in partial[0]
+    assert "[3, 4] are not selected" in partial[0]
+    assert partial[0] in err
+
+
+def test_selecting_a_whole_equivalence_group_is_not_warned_about(
+    butane_pdb, butane_itp, tmp_path, fake_esp
+):
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-atoms", "1,2,3,4", "--charge-geom", "input")
+    )
+    assert rc == 0
+
+    assert not [w for w in _charges_json(outdir)["warnings"] if "equivalent" in w]
+
+
+def test_a_dry_run_warns_about_a_partial_equivalence_group(
+    butane_pdb, butane_itp, tmp_path, capsys
+):
+    rc = main(_args(butane_pdb, butane_itp, tmp_path / "out", "--charge-atoms", "6", "--dry-run"))
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "[6, 7]" in err
+    assert "[7] are not selected" in err

@@ -376,6 +376,7 @@ Every avoidable ambiguity is a refusal with a named remedy.
 | ORCA nonzero exit, or no CHELPG file | Refuse, with the tail of the output |
 | ORCA stdout lacks `ORCA TERMINATED NORMALLY`, or says `SCF NOT CONVERGED` (ORCA exits 0 then) | Refuse, naming the condition and `esp.stdout` |
 | `--charge-mode all` on a CGenFF topology | Warn, per spec 5.3, into the log and `charges.json` |
+| `--charge-atoms` selects only part of an equivalent-hydrogen group | Warn, naming the group and its unselected members, into the log and `charges.json`: the unselected siblings keep their charges, so the group is no longer equal |
 | RRMS of the written charges above 0.5 | Warn, quoting all three RRMS values. A poor fit is a judgement about the molecule (or, in `selected` mode, about mixing fitted and force-field charges), not a malfunction |
 
 ---
