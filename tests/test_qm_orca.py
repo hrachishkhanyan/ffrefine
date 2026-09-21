@@ -175,3 +175,69 @@ def test_run_esp_job_produces_the_files_the_schemes_need(tmp_path, butane_pdb, o
     q = parse_chelpg_charges(Path(str(base) + ".chelpg.xyz"))
     assert q.shape == (14,)
     assert q.sum() == pytest.approx(0.0, abs=1e-4)
+
+
+def test_read_vpot_output_takes_potential_from_the_last_column():
+    """orca_vpot writes x y z V, the reverse of the CHELPG .vpot layout."""
+    from ffrefine.qm.orca import read_vpot_output
+
+    v = read_vpot_output(ORCA_FIXTURES / "vpot_out.vpot", expected_points=5)
+
+    assert v.shape == (5,)
+    assert v[0] == pytest.approx(1.9701622336823e-04)
+    assert v[4] == pytest.approx(-1.231245707903e-04)
+
+
+def test_the_two_vpot_layouts_agree_on_the_potential():
+    """Same five points from the same run, written in opposite column orders.
+
+    If either parser reads the wrong column this test fails, which is the whole
+    reason both fixtures are committed.
+    """
+    from ffrefine.qm.orca import read_chelpg_vpot, read_vpot_output
+
+    _, from_chelpg = read_chelpg_vpot(ORCA_FIXTURES / "esp_head.vpot")
+    from_vpot = read_vpot_output(ORCA_FIXTURES / "vpot_out.vpot", expected_points=5)
+
+    assert from_chelpg == pytest.approx(from_vpot, rel=1e-6)
+
+
+def test_read_vpot_output_refuses_a_short_file(tmp_path):
+    """A wrong density name segfaults orca_vpot; the output is the only witness."""
+    from ffrefine.qm.orca import read_vpot_output
+
+    path = tmp_path / "short.vpot"
+    path.write_text("2\n 0.0 0.0 0.0 1.0\n")
+
+    with pytest.raises(ExternalToolError, match="2"):
+        read_vpot_output(path, expected_points=2)
+
+
+def test_write_vpot_grid_writes_bohr_with_a_count_header(tmp_path):
+    from ffrefine.qm.orca import write_vpot_grid
+
+    path = tmp_path / "grid.xyz"
+    write_vpot_grid(path, np.array([[0.0529177210903, 0.0, 0.0]]))
+
+    lines = path.read_text().splitlines()
+    assert lines[0].strip() == "1"
+    assert float(lines[1].split()[0]) == pytest.approx(1.0, rel=1e-9)
+
+
+@pytest.mark.needs_orca
+def test_run_vpot_reproduces_orcas_own_potential(tmp_path, butane_pdb, orca_bin):
+    """Checked against ORCA's own number, not merely 'it ran'."""
+    from ffrefine.config import Binaries
+    from ffrefine.io.structure import read_pdb
+    from ffrefine.qm.orca import read_chelpg_vpot, run_esp_job, run_vpot
+
+    s = read_pdb(butane_pdb)
+    binaries = Binaries(orca=orca_bin)
+    base = run_esp_job(binaries, s, s.coords, tmp_path, "! HF STO-3G", charge=0, mult=1)
+
+    grid_nm, reference = read_chelpg_vpot(Path(str(base) + ".vpot"))
+    subset = grid_nm[:20]
+    v = run_vpot(binaries, base, subset, tmp_path)
+
+    assert v.shape == (20,)
+    assert v == pytest.approx(reference[:20], rel=1e-6)

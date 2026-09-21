@@ -20,7 +20,7 @@ from ..config import Binaries
 from ..errors import ExternalToolError
 from ..io.structure import Structure, write_xyz  # noqa: F401  (re-exported for symmetry)
 from ..runner import run_command
-from ..units import ANGSTROM_TO_NM, bohr_to_nm, hartree_to_kj
+from ..units import ANGSTROM_TO_NM, bohr_to_nm, hartree_to_kj, nm_to_bohr
 
 DEFAULT_SP_KEYWORDS = "! wB97X-D3 def2-TZVP TightSCF"
 """Spec 4.3's default single-point level; overridable with --orca-sp-keywords."""
@@ -259,3 +259,88 @@ def read_chelpg_vpot(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
         )
     data = np.array([[float(x) for x in row[:4]] for row in rows], dtype=float)
     return bohr_to_nm(data[:, 1:4]), data[:, 0]
+
+
+def write_vpot_grid(path: str | Path, grid_nm: np.ndarray) -> None:
+    """Write grid points for ``orca_vpot``: a count line, then bohr coordinates."""
+    grid = nm_to_bohr(np.asarray(grid_nm, float))
+    lines = [str(len(grid))]
+    lines += [f"{x:>22.14f} {y:>22.14f} {z:>22.14f}" for x, y, z in grid]
+    Path(path).write_text("\n".join(lines) + "\n", newline="\n")
+
+
+def read_vpot_output(path: str | Path, expected_points: int) -> np.ndarray:
+    """Read the potential from the file ``orca_vpot`` writes.
+
+    **Columns are ``x y z V``** here -- the reverse of the ``.vpot`` a CHELPG
+    run writes, which is ``V x y z``.  Two functions rather than one flag,
+    because the wrong choice produces a plausible array either way.
+
+    Args:
+        path: the output file.
+        expected_points: how many points were sent.  Checked, because a wrong
+            density name makes ``orca_vpot`` segfault, and a truncated or
+            missing file is the only evidence of that.
+
+    Returns:
+        Potentials in Hartree/e, shape ``(expected_points,)``.
+
+    Raises:
+        ExternalToolError: the file is missing, short, or malformed.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise ExternalToolError(
+            f"orca_vpot wrote no {path}. It exits by segfault when it cannot read the "
+            "density, so an absent output usually means the density name was wrong."
+        )
+    rows = [ln.split() for ln in path.read_text().splitlines()[1:] if ln.strip()]
+    if len(rows) != expected_points:
+        raise ExternalToolError(
+            f"{path}: {len(rows)} potential values for {expected_points} grid points. "
+            "orca_vpot did not finish; check vpot.stdout in the stage directory."
+        )
+    return np.array([float(row[3]) for row in rows], dtype=float)
+
+
+def run_vpot(
+    binaries: Binaries,
+    base: Path,
+    grid_nm: np.ndarray,
+    workdir: str | Path,
+) -> np.ndarray:
+    """Evaluate the QM potential at ``grid_nm`` against a finished ESP job.
+
+    The invocation was established by probe against ORCA 6.1.1 rather than
+    taken from the usage text, as spec 5.2 requires:
+
+        orca_vpot <base>.gbw <base>.scfp grid.xyz out.vpot
+
+    The density argument is the **full** ``<base>.scfp``.  Passing the bare
+    ``scfp`` that the usage text suggests segfaults (exit 139), and the optional
+    fifth argument is unnecessary.
+
+    ``binaries.orca_vpot`` defaults to ``orca_vpot`` in ``orca``'s own
+    directory when not set explicitly, the same fallback :func:`orca_env`
+    already applies to ``orca_libdir`` -- a stock ORCA unpack keeps the two
+    binaries side by side.
+
+    Returns:
+        Potentials in Hartree/e, one per grid point.
+
+    Raises:
+        ExternalToolError: orca_vpot failed, or produced the wrong point count.
+    """
+    exe = binaries.orca_vpot or str(Path(binaries.require("orca")).parent / "orca_vpot")
+    workdir = Path(workdir)
+    grid_path = workdir / "grid.xyz"
+    out_path = workdir / "grid_out.vpot"
+    write_vpot_grid(grid_path, grid_nm)
+    run_command(
+        [exe, f"{base.name}.gbw", f"{base.name}.scfp", grid_path.name, out_path.name],
+        workdir,
+        "vpot",
+        extra_env=orca_env(binaries),
+        check=False,
+    )
+    return read_vpot_output(out_path, expected_points=len(grid_nm))
