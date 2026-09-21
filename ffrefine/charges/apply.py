@@ -46,27 +46,6 @@ class ChargeAssignment:
     source: str
 
 
-def _recipients(topology: Topology, selected: set[int]) -> list[int]:
-    """Atoms that may absorb the residual, as 0-based indices.
-
-    Spec 5.3: the atoms in the same charge group as the selected ones, falling
-    back to bonded heavy atoms.  Hydrogens are excluded from the fallback
-    because pushing a correction onto a hydrogen distorts the group it belongs
-    to more than putting it on the heavy atom it hangs off.
-    """
-    groups = {topology.atoms[nr - 1].cgnr for nr in selected}
-    same_group = [a.nr for a in topology.atoms if a.cgnr in groups and a.nr not in selected]
-    if same_group:
-        return [nr - 1 for nr in same_group]
-    bonded = {
-        n
-        for nr in selected
-        for n in topology.bonded_neighbours(nr)
-        if n not in selected and element_of(topology, n) != "H"
-    }
-    return [nr - 1 for nr in sorted(bonded)]
-
-
 def apply_charges(
     topology: Topology,
     fitted_e: np.ndarray,
@@ -139,9 +118,6 @@ def apply_charges(
             # Residual for this group: how much the fit changed it
             residual_g = sum(before[i] - fitted[i] for i in selected_in_group)
 
-            if abs(residual_g) < 1e-12:
-                continue
-
             # Try to find recipients within the same group
             recipients_in_group = [
                 i
@@ -150,8 +126,7 @@ def apply_charges(
             ]
 
             if recipients_in_group:
-                after[recipients_in_group] += residual_g / len(recipients_in_group)
-                recipients.extend(recipients_in_group)
+                group_recipients = recipients_in_group
             else:
                 # Fall back to bonded heavy atoms from this group
                 bonded = {
@@ -161,25 +136,49 @@ def apply_charges(
                     if n not in chosen and element_of(topology, n) != "H"
                 }
                 if not bonded:
-                    raise ValidationError(
-                        f"nothing left to redistribute the {residual_g:+.6f} e residual onto: every "
-                        "atom in the selected atoms' charge groups was itself selected, and no "
-                        "unselected heavy atom is bonded to one. Select fewer atoms, or use "
-                        "--charge-mode all."
-                    )
-                recipients_from_bonded = [nr - 1 for nr in sorted(bonded)]
-                after[recipients_from_bonded] += residual_g / len(recipients_from_bonded)
-                recipients.extend(recipients_from_bonded)
+                    # Only refuse if this group has a nonzero residual
+                    if abs(residual_g) > 1e-12:
+                        raise ValidationError(
+                            f"nothing left to redistribute the {residual_g:+.6f} e residual onto: every "
+                            "atom in the selected atoms' charge groups was itself selected, and no "
+                            "unselected heavy atom is bonded to one. Select fewer atoms, or use "
+                            "--charge-mode all."
+                        )
+                    continue  # Skip this group if no recipients and no residual
+                group_recipients = [nr - 1 for nr in sorted(bonded)]
+
+            # Collect recipients regardless of whether residual is zero
+            recipients.extend(group_recipients)
+
+            # Spread residual only if nonzero
+            if abs(residual_g) > 1e-12:
+                after[group_recipients] += residual_g / len(group_recipients)
 
         # After per-group redistribution, handle any remaining global offset
         global_offset = float(target_total) - float(after.sum())
-        if abs(global_offset) > 1e-12 and recipients:
+        if abs(global_offset) > 1e-12:
+            if not recipients:
+                raise ValidationError(
+                    f"nothing left to redistribute the {global_offset:+.6f} e global offset onto: "
+                    "all selected atoms have residuals of zero and no charge groups have recipients. "
+                    "Select fewer atoms, or use --charge-mode all."
+                )
             recipients_set = sorted(set(recipients))
             after[recipients_set] += global_offset / len(recipients_set)
 
     after = np.round(after, decimals)
     drift = float(target_total) - float(after.sum())
     if abs(drift) > 0.0:
+        # Drift should be rounding-sized only in selected mode with recipients.
+        # In selected mode without recipients or in all mode, the drift step is the path for offsets.
+        if selected is not None and recipients:
+            # Drift should be rounding-sized (max ~0.5 * 10^-decimals per atom)
+            max_rounding_drift = natoms * 0.5 * (10 ** (-decimals))
+            if abs(drift) > max_rounding_drift:
+                raise ValidationError(
+                    f"drift after rounding is {drift:+.8f}, larger than rounding error would cause "
+                    f"(max ~{max_rounding_drift:.8f}); an offset was never placed. This is an internal error."
+                )
         # Apply drift to recipients first if available, otherwise largest magnitude atom
         if recipients:
             largest = recipients[int(np.argmax(np.abs(after[recipients])))]

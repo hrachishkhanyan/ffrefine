@@ -133,3 +133,53 @@ def test_redistribution_is_per_charge_group_not_global(butane_itp):
     assert group4_after == pytest.approx(0.0, abs=1e-4)
     # Molecular total must be exact
     assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_global_offset_lands_on_group_recipients_not_drifted_atoms(butane_itp):
+    """Global offset (explicit --charge) routes to group recipients, not largest atom.
+
+    When a selected atom's fit leaves its group's charges unchanged (fitted value
+    equals topology value), that group's recipients must still be available to
+    absorb any global offset (e.g. from an explicit --charge -1). The offset must
+    not be routed to rounding drift, where it would land on the largest-magnitude
+    atom regardless of whether it was a selected or recipient.
+    """
+    top = read_topology(butane_itp)
+
+    # Atom 2 (C2, in group 1) has fitted value equal to its topology charge
+    fitted = _fitted()
+    fitted[1] = 0.090  # Matches atom 2's topology charge
+
+    out = apply_charges(top, fitted, selected=[2], target_total=-1)
+
+    # Atom 2 should keep its fitted value (unchanged from topology)
+    assert out[1].after == pytest.approx(0.090)
+    assert out[1].source == "fitted"
+
+    # The -1 offset should land on group 1's recipients (atoms 1, 3, 4)
+    # not on a single largest-magnitude atom. Verify at least one is redistributed.
+    redistributed = [a.nr for a in out if a.source == "redistributed"]
+    assert len(redistributed) > 0, "Offset must land on recipients, not drift"
+    assert set(redistributed).issubset({1, 3, 4}), "Offset must land in group 1"
+
+    # Total must be exact
+    assert sum(a.after for a in out) == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_no_recipients_with_nonzero_offset_is_refused(butane_itp):
+    """Nonzero global offset with no recipients anywhere must be refused.
+
+    If every atom is selected and there are no recipients to absorb a global
+    offset (e.g. from an explicit --charge), the function must refuse rather
+    than silently dumping it on one atom.
+    """
+    top = read_topology(butane_itp)
+    for atom in top.atoms:  # every atom in its own charge group
+        atom.cgnr = atom.nr
+
+    # All atoms selected, fitted equals topology (no group residuals),
+    # but target differs by 1 (global offset nonzero)
+    fitted = np.array([a.charge for a in top.atoms], dtype=float)
+
+    with pytest.raises(ValidationError, match="nothing left"):
+        apply_charges(top, fitted, selected=list(range(1, 15)), target_total=1)
