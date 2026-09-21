@@ -726,9 +726,16 @@ def _write_input_stage(
     convention-bound (spec section 9.3).  ``quad`` is ``None`` for stages that
     refine something other than a torsion; the torsion-set keys are then
     omitted rather than recording a target that was never chosen.
+
+    The topology copied and recorded is always the one the user passed with
+    ``-p`` (:func:`_input_topology`), never a stage output: once ``run`` has
+    repointed ``args.topology`` at ``04_charges/molecule_charged.itp``, every
+    later stage used to copy that file here and name it in ``model.json``
+    (final review I5, ruling R24).
     """
     target = stage_dir(args.outdir, "input")
-    for source in (Path(args.structure), Path(args.topology)):
+    input_topology = Path(_input_topology(args))
+    for source in (Path(args.structure), input_topology):
         destination = target / source.name
         if destination.resolve() != source.resolve():
             shutil.copyfile(source, destination)
@@ -736,7 +743,7 @@ def _write_input_stage(
     defaults = topology.defaults
     model = {
         "structure": str(Path(args.structure).resolve()),
-        "topology": str(Path(args.topology).resolve()),
+        "topology": str(input_topology.resolve()),
         "molecule": topology.name,
         "natoms": topology.natoms,
         "nbonds": len(topology.bonds),
@@ -756,11 +763,21 @@ def _write_input_stage(
         model["torsion_set_1_based"] = [[d.ai, d.aj, d.ak, d.al] for d in torsion_set]
     if defaults is None:
         _warn(
-            f"{args.topology} has no [ defaults ] directive, so fudgeQQ/fudgeLJ could not "
+            f"{input_topology} has no [ defaults ] directive, so fudgeQQ/fudgeLJ could not "
             "be read. The fitted torsion is only valid with the 1-4 conventions it was "
             "fitted against (spec section 9.3); record them yourself."
         )
     (target / "model.json").write_text(json.dumps(model, indent=2) + "\n")
+
+
+def _input_topology(args: argparse.Namespace) -> str:
+    """The topology the user passed with ``-p``.
+
+    Usually ``args.topology`` itself.  ``cmd_run`` repoints ``args.topology``
+    at the charge-refined file after the charges stage, and records the
+    user's own path as ``args.input_topology`` before doing so.
+    """
+    return getattr(args, "input_topology", None) or args.topology
 
 
 def _prepare(
@@ -1946,11 +1963,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     Ruling R33: the "before" state handed to
     :func:`ffrefine.mm.validate_fit.validate_refit` is ``topology`` -- the
-    ORIGINAL force-field topology read from ``--topology``, carrying the force
-    field's own pre-fit parameters.  Nothing in this function zeroes it first,
-    and the zeroed copy ``mmscan`` writes into ``02_mm_scan/`` is never read
-    here.  Using that zeroed copy would report improvement over *no torsion at
-    all* as the headline number.
+    topology read from ``--topology``, carrying the force field's own pre-fit
+    torsion parameters.  Nothing in this function zeroes it first, and the
+    zeroed copy ``mmscan`` writes into ``02_mm_scan/`` is never read here.
+    Using that zeroed copy would report improvement over *no torsion at all*
+    as the headline number.
+
+    In a ``run`` that refined charges first, ``--topology`` has been
+    repointed at ``04_charges/molecule_charged.itp``, so "before" is that
+    charge-refined topology: the force field's torsion terms with the new
+    charges.  ``validation.json`` records the file actually used
+    (``before_topology``), whether it is this outdir's charges-stage output
+    (``charges_refined``) and the user's own ``-p`` (``input_topology``)
+    (ruling R24).
     """
     if args.dry_run:
         _, topology, quad = _load_inputs(args)
@@ -2010,7 +2035,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     final = stage_dir(args.outdir, "final")
     result = validate_refit(
         binaries,
-        topology,  # R33: the ORIGINAL topology, never a zeroed one.
+        topology,  # R33: --topology as given (charge-refined in a chained run), never zeroed.
         quad,
         structure,
         frames,
@@ -2037,6 +2062,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
         )
 
     shutil.copyfile(final / "after.itp", final / "molecule_refined.itp")
+    before_topology = Path(args.topology).resolve()
+    charged_output = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
+    charges_refined = before_topology == charged_output.resolve()
     plot_validation(
         result.phi_deg,
         result.qm_kj,
@@ -2058,7 +2086,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "qm_kj_per_mol": [float(v) for v in result.qm_kj],
                 "mm_before_kj_per_mol": [float(v) for v in result.mm_before_kj],
                 "mm_after_kj_per_mol": [float(v) for v in result.mm_after_kj],
-                "before_topology": "the original force field topology, unmodified",
+                "before_topology": str(before_topology),
+                "charges_refined": bool(charges_refined),
+                "input_topology": str(Path(_input_topology(args)).resolve()),
             },
             indent=2,
         )
@@ -2118,6 +2148,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     f"the charges stage reported success but wrote no {charged}, so the "
                     "remaining stages have no refined topology to use."
                 )
+            # 00_input/ and validation.json must still be able to name the
+            # user's own input once -p points at a stage output (ruling R24).
+            args.input_topology = _input_topology(args)
             args.topology = str(charged)
             print(f"run: remaining stages will use {charged}")
     return 0

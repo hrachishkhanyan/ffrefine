@@ -854,3 +854,172 @@ def test_a_dry_run_warns_about_a_partial_equivalence_group(
     err = capsys.readouterr().err
     assert "[6, 7]" in err
     assert "[7] are not selected" in err
+
+
+# ---------------------------------------------------------------------------
+# provenance of a chained run (final review I5, ruling R24)
+# ---------------------------------------------------------------------------
+
+
+def _run_args(butane_pdb, butane_itp, outdir):
+    import ffrefine.cli as cli
+
+    return cli.build_parser().parse_args(
+        [
+            "run",
+            "-s",
+            str(butane_pdb),
+            "-p",
+            str(butane_itp),
+            "--dihedral",
+            "1,5,8,11",
+            "--outdir",
+            str(outdir),
+            "--charge-atoms",
+            "1",
+        ]
+    )
+
+
+def _fake_charges_stage(butane_itp):
+    """Stands in for cmd_charges: prepares 00_input as the real one does, then
+    writes a charged topology visibly different from the input."""
+    import ffrefine.cli as cli
+
+    def fake(a):
+        cli._prepare(a, need_quad=False)
+        charged = cli.stage_dir(a.outdir, "charges") / "molecule_charged.itp"
+        charged.write_text(
+            butane_itp.read_text().replace("-0.270", "-0.300", 1).replace("0.090", "0.100", 1)
+        )
+        return 0
+
+    return fake
+
+
+def test_a_chained_run_keeps_the_users_topology_in_00_input(
+    butane_pdb, butane_itp, tmp_path, monkeypatch
+):
+    """00_input/ is the user's input, never a stage output.
+
+    After cmd_run repoints -p at 04_charges/molecule_charged.itp, each later
+    stage's _prepare used to copy that file into 00_input/ and name it in
+    model.json, so the run's record of its own input named its own output.
+    """
+    import ffrefine.cli as cli
+
+    def later_stage(a):
+        cli._prepare(a)
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_charges", _fake_charges_stage(butane_itp))
+    for name in ("cmd_scan", "cmd_mmscan", "cmd_fit", "cmd_validate"):
+        monkeypatch.setattr(cli, name, later_stage)
+
+    outdir = tmp_path / "out"
+    assert cli.cmd_run(_run_args(butane_pdb, butane_itp, outdir)) == 0
+
+    input_dir = outdir / "00_input"
+    assert sorted(p.name for p in input_dir.iterdir()) == ["butane.itp", "butane.pdb", "model.json"]
+    assert (input_dir / "butane.itp").read_text() == butane_itp.read_text()
+    model = json.loads((input_dir / "model.json").read_text())
+    assert model["topology"] == str(butane_itp.resolve())
+
+
+def _fake_validation_inputs(outdir, butane_pdb):
+    """scan.json and fit.json that cmd_validate's pairing checks accept."""
+    from ffrefine.io.structure import read_pdb
+    from ffrefine.stages import hash_array
+
+    frames = np.stack([read_pdb(butane_pdb).coords] * 2)
+    (outdir / "01_qm_scan").mkdir(parents=True, exist_ok=True)
+    (outdir / "01_qm_scan" / "scan.json").write_text(
+        json.dumps({"energy_kj": [0.0, 1.0], "frames_nm": frames.tolist()})
+    )
+    (outdir / "03_fit").mkdir(parents=True, exist_ok=True)
+    (outdir / "03_fit" / "fit.json").write_text(
+        json.dumps(
+            {
+                "terms": [{"multiplicity": 3, "k_kj_per_mol": 1.0, "phase_deg": 0.0}],
+                "provenance": {"quad_1_based": [1, 5, 8, 11], "frames_sha256": hash_array(frames)},
+            }
+        )
+    )
+
+
+def _fake_validate_refit(seen):
+    from types import SimpleNamespace
+
+    def fake(binaries, topology, quad, structure, frames, qm, k, delta, mult, final, **kw):
+        seen.append(topology)
+        (final / "after.itp").write_text("; after\n")
+        zeros = np.zeros(len(qm))
+        return SimpleNamespace(
+            rmse_before=1.0,
+            rmse_after=0.5,
+            improved=True,
+            phi_deg=zeros,
+            qm_kj=np.asarray(qm),
+            mm_before_kj=zeros,
+            mm_after_kj=zeros,
+        )
+
+    return fake
+
+
+def test_validation_json_names_the_charge_refined_topology_it_measured_before_against(
+    butane_pdb, butane_itp, tmp_path, monkeypatch
+):
+    """validation.json claimed "the original force field topology, unmodified"
+    even when the before-RMSE was measured against 04_charges/molecule_charged.itp."""
+    import ffrefine.cli as cli
+
+    outdir = tmp_path / "out"
+    _fake_validation_inputs(outdir, butane_pdb)
+    seen = []
+    monkeypatch.setattr(cli, "cmd_charges", _fake_charges_stage(butane_itp))
+    for name in ("cmd_scan", "cmd_mmscan", "cmd_fit"):
+        monkeypatch.setattr(cli, name, lambda a: 0)
+    monkeypatch.setattr(cli, "validate_refit", _fake_validate_refit(seen))
+    monkeypatch.setattr(cli, "plot_validation", lambda *a, **k: None)
+
+    assert cli.cmd_run(_run_args(butane_pdb, butane_itp, outdir)) == 0
+
+    charged = outdir / "04_charges" / "molecule_charged.itp"
+    assert seen[0].atoms[0].charge == pytest.approx(-0.300)  # before really was the charged file
+    validation = json.loads((outdir / "final" / "validation.json").read_text())
+    assert validation["before_topology"] == str(charged.resolve())
+    assert validation["charges_refined"] is True
+    assert validation["input_topology"] == str(butane_itp.resolve())
+
+
+def test_validation_json_names_the_users_topology_when_no_charges_ran(
+    butane_pdb, butane_itp, tmp_path, monkeypatch
+):
+    import ffrefine.cli as cli
+
+    outdir = tmp_path / "out"
+    _fake_validation_inputs(outdir, butane_pdb)
+    monkeypatch.setattr(cli, "validate_refit", _fake_validate_refit([]))
+    monkeypatch.setattr(cli, "plot_validation", lambda *a, **k: None)
+
+    args = cli.build_parser().parse_args(
+        [
+            "validate",
+            "-s",
+            str(butane_pdb),
+            "-p",
+            str(butane_itp),
+            "--dihedral",
+            "1,5,8,11",
+            "--outdir",
+            str(outdir),
+        ]
+    )
+    cli._apply_config(args)
+    assert cli.cmd_validate(args) == 0
+
+    validation = json.loads((outdir / "final" / "validation.json").read_text())
+    assert validation["before_topology"] == str(butane_itp.resolve())
+    assert validation["charges_refined"] is False
+    assert validation["input_topology"] == str(butane_itp.resolve())

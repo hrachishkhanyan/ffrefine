@@ -310,7 +310,11 @@ the same geometries, and reports MM-against-QM RMSE **before and after**
 refitting. Spec section 4.9 calls this the number that matters. "Before" is the
 original force field's own parameters -- not the zeroed topology -- so the
 improvement reported is improvement over the force field, not over having no
-torsion at all.
+torsion at all. After a `run` that refined charges first, "before" is the
+charge-refined topology (the force field's own torsion terms, with the new
+charges); `validation.json` records the file it actually measured against as
+`before_topology`, whether that was this outdir's charges output as
+`charges_refined`, and your own `-p` as `input_topology`.
 
 ### Or all of it at once
 
@@ -325,6 +329,7 @@ remaining stages pick up the charge-refined topology automatically:
 
 `run` then chains `charges -> scan -> mmscan -> fit -> validate`, swapping
 `-p` to `04_charges/molecule_charged.itp` for every stage after `charges`.
+`00_input/` still holds, and `model.json` still names, the topology you passed.
 
 ## Output layout
 

@@ -236,7 +236,11 @@ The QM scan does not depend on MM charges, so only mmscan, fit and validate are 
 ### The refined topology reaches later stages by path, not by magic
 
 `charges` writes `04_charges/molecule_charged.itp`. `run` then points `args.topology` at that
-file for the remaining stages. Stages invoked on their own use `-p` exactly as given; to work
+file for the remaining stages, keeping the user's own `-p` as `args.input_topology`:
+`00_input/` always copies and `model.json` always names the user's input, never a stage
+output, and `validation.json` records the topology the "before" RMSE was actually measured
+against (`before_topology`), whether it is this outdir's charges output (`charges_refined`),
+and the user's input (`input_topology`) (final-review ruling R24). Stages invoked on their own use `-p` exactly as given; to work
 step by step, the user passes the charged file, and `charges` prints the exact command.
 
 Two alternatives were rejected. Letting later stages auto-discover `04_charges/` makes `-p`
