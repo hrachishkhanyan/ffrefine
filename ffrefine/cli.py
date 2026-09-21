@@ -86,7 +86,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .charges.apply import apply_charges
+from .charges.apply import apply_charges, charge_decimals
 from .charges.equivalence import average_within_groups, equivalent_hydrogen_groups
 from .charges.esp import inverse_distances, potential_from_charges, rrms
 from .charges.grid import MK_SHELL_SCALES, VDW_RADII_ANGSTROM, mk_grid
@@ -1435,18 +1435,22 @@ def cmd_charges(args: argparse.Namespace) -> int:
             "--charge-atoms is the safer choice."
         )
 
-    assignments = apply_charges(topology, raw, selected_atoms, target_total)
+    # One precision for the arithmetic and the file: never coarser than the
+    # input's own, so untouched atoms keep their exact values (ruling R22).
+    decimals = charge_decimals(topology)
+    assignments = apply_charges(topology, raw, selected_atoms, target_total, decimals=decimals)
     for a in assignments:
         if a.source == "redistributed":
             log.info(
-                "charges: atom %d (%s) %+.4f -> %+.4f, absorbing the redistribution residual",
+                f"charges: atom %d (%s) %+.{decimals}f -> %+.{decimals}f, absorbing the "
+                "redistribution residual",
                 a.nr,
                 a.name,
                 a.before,
                 a.after,
             )
     charged_itp = workdir / "molecule_charged.itp"
-    write_charged_topology(args.topology, assignments, charged_itp)
+    write_charged_topology(args.topology, assignments, charged_itp, decimals=decimals)
 
     # Ruling R20: in selected mode the written topology carries only a few
     # fitted charges, so the fitted set's RRMS describes charges that were
@@ -1501,6 +1505,7 @@ def cmd_charges(args: argparse.Namespace) -> int:
             "charge": int(target_total),
             "uhf": int(args.uhf),
             "equivalence_groups": groups,
+            "charge_decimals": int(decimals),
             "npoints": npoints,
             "grid": grid_provenance,
             "restraint": restraint_provenance,

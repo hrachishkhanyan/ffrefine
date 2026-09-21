@@ -265,3 +265,73 @@ def test_all_mode_refuses_fitted_charges_that_do_not_sum_to_target(butane_itp):
 
     with pytest.raises(ValidationError, match="drift"):
         apply_charges(top, q, selected=None, target_total=0)
+
+
+# Six-decimal charges, as GAFF/antechamber RESP output carries; each charge
+# group still sums to zero, so the molecule stays neutral.
+SIX_DECIMAL_BUTANE = {
+    "C1": -0.270123,
+    "H11": 0.090041,
+    "H12": 0.090041,
+    "H13": 0.090041,
+    "C2": -0.180246,
+    "H21": 0.090123,
+    "H22": 0.090123,
+    "C3": -0.180246,
+    "H31": 0.090123,
+    "H32": 0.090123,
+    "C4": -0.270123,
+    "H41": 0.090041,
+    "H42": 0.090041,
+    "H43": 0.090041,
+}
+
+
+def _six_decimal_butane(butane_itp):
+    top = read_topology(butane_itp)
+    for atom in top.atoms:
+        atom.charge = SIX_DECIMAL_BUTANE[atom.name]
+    return top
+
+
+def test_output_precision_follows_the_input_never_below_four(butane_itp):
+    """Final review I3 (ruling R22): decimals = max(4, the input's own precision)."""
+    from ffrefine.charges.apply import charge_decimals
+
+    assert charge_decimals(read_topology(butane_itp)) == 4  # butane is written to 3
+    assert charge_decimals(_six_decimal_butane(butane_itp)) == 6
+
+    top = read_topology(butane_itp)
+    top.atoms[1].charge = 0.12345678  # one atom at 8 decimals sets the precision
+    assert charge_decimals(top) == 8
+
+
+def test_untouched_atoms_keep_their_exact_six_decimal_input_values(butane_itp):
+    """Selecting one atom must not rewrite a dozen others by rounding them.
+
+    Rounding every atom to 4 decimals rewrote every atom of a 6-decimal
+    topology, labelled the untouched ones "redistributed" and logged them as
+    absorbing the redistribution residual (ruling R22).
+    """
+    top = _six_decimal_butane(butane_itp)
+    fitted = _fitted()
+    fitted[0] = -0.3512345678
+
+    out = apply_charges(top, fitted, selected=[1], target_total=0)
+
+    for a in out[4:]:  # everything outside C1's charge group
+        assert a.after == a.before == SIX_DECIMAL_BUTANE[a.name]
+        assert a.source == "unchanged"
+    assert [a.nr for a in out if a.source == "redistributed"] == [2, 3, 4]
+    assert out[0].source == "fitted"
+    assert out[0].after == pytest.approx(-0.351235, abs=1e-12)  # rounded at 6, not 4
+    assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-9)
+    assert all(a.after == pytest.approx(round(a.after, 6), abs=1e-12) for a in out)
+
+
+def test_an_explicit_precision_coarser_than_the_input_is_refused(butane_itp):
+    """Untouched 6-decimal atoms cannot sum exactly with 4-decimal changed ones."""
+    top = _six_decimal_butane(butane_itp)
+
+    with pytest.raises(ValidationError, match="decimal"):
+        apply_charges(top, _fitted(), selected=[1], target_total=0, decimals=4)

@@ -19,12 +19,56 @@ from ..io.validate import element_of
 from ..qm.xtb import CHARGE_TOLERANCE
 
 CHARGE_DECIMALS = 4
-"""Decimal places written into ``[ atoms ]``.
+"""The fewest decimal places a changed charge is written with.
 
-Every written charge is then a multiple of 1e-4, so compensating the rounding
-residual on one atom makes the total exactly the target rather than merely
-close to it.
+The precision actually used is :func:`charge_decimals`: this, or the input
+topology's own precision when that is finer.  Every charge in the result is
+then a multiple of ``10**-decimals`` -- the changed ones because they are
+rounded to it, the untouched ones because they already were -- so compensating
+the rounding residual on one atom makes the total exactly the target rather
+than merely close to it.
 """
+
+MAX_INPUT_DECIMALS = 8
+"""The finest input precision :func:`input_precision` will report."""
+
+
+def input_precision(topology: Topology) -> int:
+    """How many decimal places the topology's charges are written to.
+
+    For each charge, the smallest ``d`` in ``0..MAX_INPUT_DECIMALS`` with
+    ``|round(q, d) - q| < 1e-9``; the maximum over atoms.  A charge that
+    matches at no ``d`` counts as ``MAX_INPUT_DECIMALS``.
+
+    Args:
+        topology: the parsed molecule.
+
+    Returns:
+        The inferred precision; butane's ``-0.270`` gives 2, antechamber's
+        six-decimal RESP output gives 6.
+    """
+    worst = 0
+    for atom in topology.atoms:
+        places = MAX_INPUT_DECIMALS
+        for d in range(MAX_INPUT_DECIMALS + 1):
+            if abs(round(atom.charge, d) - atom.charge) < 1e-9:
+                places = d
+                break
+        worst = max(worst, places)
+    return worst
+
+
+def charge_decimals(topology: Topology) -> int:
+    """The decimal places this stage writes: ``max(CHARGE_DECIMALS, input precision)``.
+
+    Never coarser than the input (ruling R22): rounding a six-decimal GAFF
+    topology to four would rewrite atoms nothing selected, and an untouched
+    charge that is not a multiple of ``10**-decimals`` would stop the total
+    from being exact.  :func:`~ffrefine.io.topwriter.write_charged_topology`
+    must be given the same value, which is why ``cmd_charges`` computes it
+    once and passes it to both.
+    """
+    return max(CHARGE_DECIMALS, input_precision(topology))
 
 
 def check_selection(topology: Topology, selected: list[int] | None, target_total: int) -> None:
@@ -103,7 +147,7 @@ def apply_charges(
     fitted_e: np.ndarray,
     selected: list[int] | None,
     target_total: int,
-    decimals: int = CHARGE_DECIMALS,
+    decimals: int | None = None,
 ) -> list[ChargeAssignment]:
     """Combine fitted charges with the topology's, keeping the total exact.
 
@@ -116,13 +160,21 @@ def apply_charges(
     global offset (an explicit ``--charge`` differing from the topology's sum
     by no more than :data:`~ffrefine.qm.xtb.CHARGE_TOLERANCE`) is spread over
     the pooled recipients; a larger offset is refused before anything is
-    changed (see :func:`check_selection`). After rounding to
-    the output precision, any remaining drift is absorbed by the largest-
-    magnitude atom among the redistribution recipients (or, in ``all`` mode,
-    any atom). This ensures an atom reported as ``source="fitted"`` carries
-    its fitted value unchanged: drift is kept off fitted atoms when there is
-    anywhere else to put it. The molecular total is then exact rather than
-    merely close.
+    changed (see :func:`check_selection`).
+
+    Only the atoms this stage changes -- the fitted atoms and the
+    redistribution recipients -- are rounded, to ``decimals``; every other
+    atom keeps its exact input value (ruling R22). Each atom's ``source`` is
+    decided by what the algorithm did to it, never by comparing rounded
+    values, so an atom nothing touched is never labelled ``redistributed``.
+    After rounding, any remaining drift is absorbed by the largest-magnitude
+    atom among the redistribution recipients (or, in ``all`` mode, any atom),
+    which then counts as ``redistributed`` if it was not fitted. This ensures
+    an atom reported as ``source="fitted"`` carries its fitted value
+    unchanged: drift is kept off fitted atoms when there is anywhere else to
+    put it. Because ``decimals`` is never coarser than the input, every
+    charge is a multiple of ``10**-decimals`` and the molecular total is
+    exact rather than merely close.
 
     That rounding-drift step is only allowed to absorb a rounding-sized
     drift (at most about ``natoms * 0.5 * 10**-decimals``), in every mode,
@@ -139,7 +191,9 @@ def apply_charges(
             (``--charge-mode all``).
         target_total: the molecular charge the result must sum to, from
             ``derive_charge``.
-        decimals: output precision.
+        decimals: output precision for the changed atoms. ``None`` (the
+            default) uses :func:`charge_decimals`; an explicit value coarser
+            than the input's own precision is refused.
 
     Returns:
         One :class:`ChargeAssignment` per atom, in topology order.
@@ -147,8 +201,8 @@ def apply_charges(
     Raises:
         ValidationError: a selected atom number is out of range, the target
             total disagrees with the topology by more than
-            ``CHARGE_TOLERANCE`` in ``selected`` mode, or the residual has
-            nowhere to go.
+            ``CHARGE_TOLERANCE`` in ``selected`` mode, the residual has
+            nowhere to go, or ``decimals`` is coarser than the input.
     """
     natoms = topology.natoms
     fitted = np.asarray(fitted_e, float)
@@ -157,11 +211,24 @@ def apply_charges(
 
     check_selection(topology, selected, target_total)
     chosen = set(range(1, natoms + 1)) if selected is None else set(selected)
+    precision = input_precision(topology)
+    if decimals is None:
+        decimals = charge_decimals(topology)
+    elif decimals < precision:
+        raise ValidationError(
+            f"cannot write charges at {decimals} decimal places: the topology's own charges "
+            f"carry {precision}, so the atoms left untouched would not be multiples of "
+            f"1e-{decimals} and the molecular total could not be made exact."
+        )
 
     before = np.array([a.charge for a in topology.atoms], dtype=float)
     after = before.copy()
     index = sorted(nr - 1 for nr in chosen)
     after[index] = fitted[index]
+    # What this stage did to each atom, recorded as it happens: the rounding
+    # below applies to these atoms only, and `source` is read from here.
+    touched = np.zeros(natoms, dtype=bool)
+    touched[index] = True
 
     recipients = []
     if selected is not None:
@@ -208,6 +275,7 @@ def apply_charges(
             # Spread residual only if nonzero
             if abs(residual_g) > 1e-12:
                 after[group_recipients] += residual_g / len(group_recipients)
+                touched[group_recipients] = True
 
         # After per-group redistribution, handle any remaining global offset
         global_offset = float(target_total) - float(after.sum())
@@ -220,10 +288,16 @@ def apply_charges(
                 )
             recipients_set = sorted(set(recipients))
             after[recipients_set] += global_offset / len(recipients_set)
+            touched[recipients_set] = True
 
-    after = np.round(after, decimals)
+    # Round only what this stage changed; untouched atoms keep their exact
+    # input values, which are already multiples of 10**-decimals.
+    after[touched] = np.round(after[touched], decimals)
     drift = float(target_total) - float(after.sum())
-    if abs(drift) > 0.0:
+    # Every charge is now a multiple of 10**-decimals, so a real drift is at
+    # least one unit in the last place; anything under half of one is float
+    # noise in the sum and must not mark an atom as changed.
+    if abs(drift) >= 0.5 * 10**-decimals:
         # After rounding, the drift can only be rounding-sized: each atom's own
         # rounding moves it by at most half a unit in the last decimal place, so
         # natoms atoms can drift the total by at most natoms * 0.5 * 10**-decimals
@@ -245,6 +319,7 @@ def apply_charges(
         else:
             largest = int(np.argmax(np.abs(after)))
         after[largest] = round(after[largest] + drift, decimals)
+        touched[largest] = True
     final_total = float(after.sum())
     if abs(final_total - target_total) > 1e-6:
         raise ValidationError(
@@ -256,7 +331,7 @@ def apply_charges(
     for i, atom in enumerate(topology.atoms):
         if atom.nr in chosen:
             source = "fitted"
-        elif after[i] != before[i]:
+        elif touched[i]:
             source = "redistributed"
         else:
             source = "unchanged"

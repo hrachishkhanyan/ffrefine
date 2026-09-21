@@ -337,11 +337,14 @@ def write_charged_topology(
         assignments: from :func:`ffrefine.charges.apply.apply_charges`.  Entries
             whose charge did not move are skipped.
         out_path: destination.
-        decimals: decimal places written into the charge field.  Defaults to
-            :data:`ffrefine.charges.apply.CHARGE_DECIMALS`; pass that value
-            (or a matching custom precision) explicitly if it ever changes,
-            so the written charges stay consistent with what
-            :func:`ffrefine.charges.apply.apply_charges` rounded to.
+        decimals: decimal places written into the charge field.  Pass the
+            value :func:`ffrefine.charges.apply.charge_decimals` returned
+            for this topology -- the same one given to
+            :func:`ffrefine.charges.apply.apply_charges` -- so the file
+            carries exactly the precision the charges were rounded to;
+            ``cmd_charges`` does.  The default of 4 is
+            :data:`ffrefine.charges.apply.CHARGE_DECIMALS`, the floor, and is
+            too coarse for a topology whose own charges carry more.
 
     Returns:
         The 1-based atom numbers whose lines were rewritten, in file order.

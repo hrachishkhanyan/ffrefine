@@ -329,14 +329,24 @@ freezing is impossible for CHELPG, where ORCA owns the fit. Recorded in section 
 
 ### 6.5 Rounding leaves the total exact
 
-Charges are written to four decimals. After rounding, any residual drift is absorbed by the
-largest-magnitude atom among the redistribution recipients (when there are any); otherwise the
-largest-magnitude atom overall. This ensures an atom reported as `source="fitted"` carries
-exactly the fitted value: drift compensation is kept off fitted atoms when there is anywhere
-else to put it. The final total is asserted to be within 1e-6 of the target integer. Four
-decimals makes every written charge a multiple of 1e-4, so the compensated total is exact
-rather than merely close. (The two compensation strategies yield identical totals to 1e-6,
-differing only in which atom bears the rounding error.)
+Only the atoms this stage changes — the fitted atoms and the redistribution recipients — are
+rounded, and they are rounded to `decimals = max(4, input precision)`, where the input
+precision is inferred from the topology's own charges (for each charge the smallest `d` in
+0..8 with `|round(q, d) - q| < 1e-9`, the maximum over atoms). Every other atom keeps its
+exact input value, and each atom's `source` is decided by what the algorithm did to it before
+rounding, so an atom nothing touched is never labelled `redistributed`. The same `decimals`
+is passed to the topology writer. (Final-review ruling R22: rounding every atom to four
+decimals rewrote, relabelled and logged every atom of a six-decimal GAFF topology when one
+atom was selected.)
+
+After rounding, any residual drift is absorbed by the largest-magnitude atom among the
+redistribution recipients (when there are any); otherwise the largest-magnitude atom overall.
+This ensures an atom reported as `source="fitted"` carries exactly the fitted value: drift
+compensation is kept off fitted atoms when there is anywhere else to put it. The final total
+is asserted to be within 1e-6 of the target integer. Because `decimals` is never coarser than
+the input, every charge — rounded or untouched — is a multiple of `10**-decimals`, so the
+compensated total is exact rather than merely close. (The two compensation strategies yield
+identical totals to 1e-6, differing only in which atom bears the rounding error.)
 
 This compensation step is only allowed to absorb a rounding-sized drift — at most about
 `natoms * 0.5 * 10**-decimals` — and this bound is checked in every mode, including `all`.

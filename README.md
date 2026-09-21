@@ -503,9 +503,14 @@ larger disagreement is refused before any QM runs: `--charge -1` on a neutral
 topology would otherwise push a whole electron onto the two or three atoms
 sharing the selected atoms' charge groups. Use `--charge-mode all`, which
 refits every charge at the declared charge, or correct the topology.
-Charges are written to four decimal places, and any leftover rounding residue
-is absorbed by the largest-magnitude redistributed atom -- kept off a fitted
-atom's own value whenever an unselected atom exists to take it instead. Under
+Only the atoms this stage actually changes -- the fitted ones and the ones
+absorbing a residual -- are rounded; every other atom keeps its exact input
+value, and is recorded as `unchanged`. Changed charges are written to four
+decimal places, or to the input's own precision when that is finer (a GAFF
+topology from antechamber carries six, and keeps six). Any leftover rounding
+residue is absorbed by the largest-magnitude redistributed atom -- kept off a
+fitted atom's own value whenever an unselected atom exists to take it
+instead. Under
 `--charge-mode all`, where every atom is fitted and none is left to redistribute
 onto, the residue lands on the largest-magnitude atom regardless. A drift
 bigger than rounding can explain, or an offset with nowhere to go, is refused

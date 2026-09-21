@@ -632,3 +632,66 @@ def test_a_charge_that_disagrees_with_the_topology_is_refused_in_selected_mode(
     assert "--charge-mode all" in err
     assert "Traceback" not in err
     assert not (outdir / "04_charges" / "molecule_charged.itp").exists()
+
+
+def _six_decimal_itp(butane_itp, path):
+    """butane.itp with 6-decimal charges (as antechamber writes), spacing kept."""
+    import re
+
+    charges = {
+        "C1": "-0.270123",
+        "C2": "-0.180246",
+        "C3": "-0.180246",
+        "C4": "-0.270123",
+        "H11": "0.090041",
+        "H12": "0.090041",
+        "H13": "0.090041",
+        "H21": "0.090123",
+        "H22": "0.090123",
+        "H31": "0.090123",
+        "H32": "0.090123",
+        "H41": "0.090041",
+        "H42": "0.090041",
+        "H43": "0.090041",
+    }
+    out, section = [], ""
+    for line in butane_itp.read_text().splitlines():
+        body = line.split(";", 1)[0].strip()
+        if body.startswith("["):
+            section = body.strip("[] ")
+        elif section == "atoms" and body:
+            tokens = list(re.finditer(r"\S+", line))
+            q = tokens[6]
+            line = line[: q.start()] + charges[tokens[4].group()] + line[q.end() :]
+        out.append(line)
+    path.write_text("\n".join(out) + "\n")
+    return path
+
+
+def test_a_six_decimal_topology_keeps_every_untouched_line(
+    butane_pdb, butane_itp, tmp_path, fake_esp
+):
+    """Final review I3 (ruling R22), through cmd_charges and the writer.
+
+    With C1 selected, only C1's charge group may change. Every other
+    ``[ atoms ]`` line must be byte-identical to the input, every untouched
+    atom labelled ``unchanged``, and the changed charges written at the
+    input's own 6 decimals rather than 4.
+    """
+    itp = _six_decimal_itp(butane_itp, tmp_path / "butane6.itp")
+    outdir = tmp_path / "out"
+    rc = main(_args(butane_pdb, itp, outdir, "--charge-atoms", "1", "--charge-geom", "input"))
+    assert rc == 0
+
+    payload = _charges_json(outdir)
+    assert payload["provenance"]["charge_decimals"] == 6
+    assert [a["source"] for a in payload["atoms"][4:]] == ["unchanged"] * 10
+    assert sum(a["charge_after"] for a in payload["atoms"]) == pytest.approx(0.0, abs=1e-9)
+
+    written = (outdir / "04_charges" / "molecule_charged.itp").read_text().splitlines()
+    original = itp.read_text().splitlines()
+    differing = [w for w, o in zip(written, original) if w != o]
+    assert len(written) == len(original)
+    assert len(differing) == 4  # C1 and its three hydrogens, nothing else
+    for line in differing:
+        assert len(line.split()[6].split(".")[1]) == 6
