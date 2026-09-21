@@ -475,8 +475,7 @@ chase -- with the restraint disabled, the two schemes agree to within about
 0.05 e.
 
 Exit codes: `0` success, `1` a reported ffrefine error (printed as
-`error: ...`, never a traceback), `2` a usage error or an unimplemented
-subcommand.
+`error: ...`, never a traceback), `2` a usage error.
 
 One torsion per run. `--dihedral` is repeatable in the parser to match the spec's
 CLI surface, but the stage layout holds a single scan and a single fit per output

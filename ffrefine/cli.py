@@ -31,8 +31,7 @@ input:
   caught in :func:`main`, reported as ``error: ...`` on stderr, and turned
   into exit code 1.
 
-Exit codes: 0 success, 1 a reported ffrefine failure, 2 a usage error or a
-subcommand that is not implemented in this build.
+Exit codes: 0 success, 1 a reported ffrefine failure, 2 a usage error.
 
 Stage files this module reads and writes
 ----------------------------------------
@@ -1063,21 +1062,6 @@ def _check_stage_pairing(
 # ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
-
-
-def cmd_not_implemented(name: str, milestone: int) -> int:
-    """Report a subcommand that belongs to a later milestone.
-
-    Writes nothing and touches no directory, so a caller cannot mistake the
-    call for a stage that ran.
-    """
-    print(
-        f"ffrefine {name}: NOT IMPLEMENTED -- this subcommand arrives in milestone "
-        f"{milestone} and nothing was written. Implemented in this build: mmscan, fit, "
-        f"validate, run.",
-        file=sys.stderr,
-    )
-    return 2
 
 
 def _xtb_version(binaries: Binaries) -> str:
@@ -2163,11 +2147,11 @@ def main(argv: list[str] | None = None) -> int:
         argv: argument list, defaulting to ``sys.argv[1:]``.
 
     Returns:
-        0 on success, 1 for a reported ffrefine failure, 2 for a subcommand
-        this build does not implement.  argparse usage errors (and ``--help``
-        / ``--version``) raise ``SystemExit`` before this function can return,
-        which is argparse's own convention and still produces a clean message
-        rather than a traceback.
+        0 on success, 1 for a reported ffrefine failure.  argparse usage
+        errors (exit 2, and ``--help`` / ``--version``, exit 0) raise
+        ``SystemExit`` before this function can return, which is argparse's
+        own convention and still produces a clean message rather than a
+        traceback.
     """
     args = build_parser().parse_args(argv)
     handlers = {
