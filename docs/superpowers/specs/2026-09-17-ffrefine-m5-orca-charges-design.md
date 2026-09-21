@@ -414,7 +414,11 @@ no ORCA installed.
 
 **With ORCA (`needs_orca`):** CHELPG and RESP end to end on butane; charges summing to zero;
 methyl hydrogens equal to 1e-6 after equivalence; RRMS reported for both. The CHELPG
-regression is pinned against the measured C1 -0.405761 and C4 -0.409052.
+regression is pinned against the measured C1 -0.405761 and C4 -0.409052, through the CLI at the
+default `! HF 6-31G*` on the input geometry, on the `04_charges/esp.chelpg.xyz` ORCA writes:
+that file carries ORCA's own unaveraged charge, while `charge_after` is rounded to the output
+precision and, in `all` mode, may carry the rounding compensation (the carbons are in no
+equivalence group, so averaging does not touch them either way).
 
 A skipped test is not a passing one: these must be run in an interactive WSL shell, and the
 count of executing `needs_orca` tests checked, not just the pass count.

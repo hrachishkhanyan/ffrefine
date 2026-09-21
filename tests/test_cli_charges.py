@@ -104,9 +104,47 @@ def test_charges_needs_no_dihedral(butane_pdb, butane_itp, tmp_path, capsys):
 
 
 @pytest.mark.needs_orca
-def test_chelpg_end_to_end_writes_a_usable_topology(
-    butane_pdb, butane_itp, tmp_path, orca_bin, xtb_bin
+def test_chelpg_at_the_default_level_reproduces_the_pinned_reference_charges(
+    butane_pdb, butane_itp, tmp_path, orca_bin
 ):
+    """Design section 8's CHELPG regression pin, through the real CLI.
+
+    At the default ``! HF 6-31G*`` on the input geometry, ORCA 6.1.1 gave
+    C1 -0.405761 and C4 -0.409052 in the design probe (section 2).
+
+    Which recorded value carries ORCA's own, unaveraged charge: the
+    ``04_charges/esp.chelpg.xyz`` ORCA wrote in this run. The carbons are in
+    no equivalence group (checked below from charges.json's provenance), so
+    averaging leaves them alone -- but ``charge_after`` is that value
+    rounded to 4 decimals, and in ``all`` mode the rounding compensation
+    lands on the largest-magnitude atom, which is C4 here. So the file is
+    pinned, and ``charge_after`` is only checked to derive from it.
+    """
+    from ffrefine.qm.orca import parse_chelpg_charges
+
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-mode", "all", "--charge-geom", "input")
+    )
+    assert rc == 0
+
+    payload = json.loads((outdir / "04_charges" / "charges.json").read_text())
+    assert payload["provenance"]["orca_esp_keywords"] == "! HF 6-31G*"
+    grouped = {nr for group in payload["provenance"]["equivalence_groups"] for nr in group}
+    assert 1 not in grouped and 11 not in grouped
+
+    orca = parse_chelpg_charges(outdir / "04_charges" / "esp.chelpg.xyz")
+    assert orca[0] == pytest.approx(-0.405761, abs=1e-4)
+    assert orca[10] == pytest.approx(-0.409052, abs=1e-4)
+
+    # Rounding moves each by at most 5e-5; a compensation, if one landed,
+    # by a whole number of 1e-4 units within the drift guard's bound.
+    for i in (0, 10):
+        assert payload["atoms"][i]["charge_after"] == pytest.approx(orca[i], abs=14 * 0.5e-4)
+
+
+@pytest.mark.needs_orca
+def test_chelpg_end_to_end_writes_a_usable_topology(butane_pdb, butane_itp, tmp_path, orca_bin):
     """Cheap keywords: the default level is hybrid DFT on a real molecule."""
     outdir = tmp_path / "out"
     rc = main(
