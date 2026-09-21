@@ -13,22 +13,22 @@ mandatory self-consistency check (spec section 4.5) verifies the edit against
 an independent analytic evaluation before any fitting happens, and aborts if it
 disagrees by more than 1e-3 kJ/mol.
 
-## Status: milestones 1-4 of 6
+## Status: milestones 1-5 of 6
 
 | Subcommand | State |
 |---|---|
 | `ffrefine scan` | works -- relaxed xtb torsion scan, bidirectional by default, reports conformational hops and hydrogen bonding, optional `--sp-refine` |
 | `ffrefine mmscan` | works -- MM single points with and without the torsion, plus the mandatory self-check |
 | `ffrefine fit` | works -- weighted linear cosine fit, BIC model selection, `.itp`/`.prm`/`fit.json`/plots |
+| `ffrefine charges` | works -- ESP-derived partial charges via ORCA, CHELPG or two-stage restrained RESP, equivalent hydrogens constrained equal, `selected` mode by default |
 | `ffrefine validate` | works -- rebuild with the fitted series, re-run MM, report RMSE before and after |
-| `ffrefine run` | works -- chains the four above and says which stage it skipped |
-| `ffrefine charges` | **not implemented** (milestone 5, ORCA ESP/RESP). Exits 2, writes nothing. |
+| `ffrefine run` | works -- chains all five stages, charges first when asked, and says which stage it skipped |
 
-Also not implemented: CGenFF `.str` penalty parsing and automatic torsion
-selection (`--str`, milestone 6), the `final/report.md` summary document
-(milestone 6), and `--mm-relax` (spec 4.6).
+Also not implemented: CGenFF `.str` penalty parsing and the automatic torsion
+and charge-atom selection it would drive (`--str`, milestone 6), the
+`final/report.md` summary document (milestone 6), and `--mm-relax` (spec 4.6).
 
-### What the scan does not do
+### What the scan and charges do not do
 
 It **reports** conformational hops and intramolecular hydrogen bonds; it does
 not correct or reject a profile containing them. Both make a smooth cosine
@@ -41,17 +41,41 @@ something to fit through.
 `--sp-refine` defaults to `! wB97X-D3 def2-TZVP TightSCF`, a hybrid DFT single
 point on every frame of the grid. It is opt-in for that reason.
 
+`ffrefine charges` has its own boundaries:
+
+- **Equivalence is local.** Two hydrogens are treated as equivalent exactly
+  when they share a heavy-atom parent and an atom type -- a methyl or
+  methylene group. Molecule-wide symmetry is not detected, so butane's two
+  chemically-identical terminal carbons come back a few thousandths of an
+  electron apart. That gap is ESP-fitting noise, and it is reported in
+  `charges.json`, not smoothed away by guessing at a symmetry the tool never
+  checked.
+- **Gas-phase ESP charges are not condensed-phase charges.** The default level
+  of theory, HF/6-31G*, is chosen because its systematic overpolarisation
+  partly compensates for the missing solvent -- the same reasoning Amber and
+  CHARMM-adjacent charge workflows use -- but `--charge-mode all` on a CGenFF
+  topology is still a change of derivation scheme, not a refinement of the
+  existing one. `ffrefine` warns when it looks like you are doing that.
+- **`--conformers` (pooled multi-conformer fitting) and `--charge-geom orca`
+  are not implemented.** Geometry is either the input structure as given or a
+  single xtb `--opt tight` minimum.
+
 ## Requirements
 
 - Python 3.10+ with `numpy`, `scipy` and `matplotlib` -- no other runtime
   dependencies, and no chemistry libraries: every file format is parsed
   in-house.
 - GROMACS 2023 or newer on `PATH` (or `--gmx-bin /path/to/gmx`).
-- xtb 6.7 or newer on `PATH` (or `--xtb-bin /path/to/xtb`), for `ffrefine scan`.
-- ORCA only for `--sp-refine`. It is usually on no `PATH` at all, so reach it
-  with `--orca-bin /path/to/orca`. A shared ORCA build will not start unless
-  its own directory is on `LD_LIBRARY_PATH`; ffrefine sets that from
-  `orca_libdir`, which defaults to the directory holding the binary you named.
+- xtb 6.7 or newer on `PATH` (or `--xtb-bin /path/to/xtb`), for `ffrefine scan`
+  and for `ffrefine charges`'s default `--charge-geom xtb`.
+- ORCA, for `ffrefine scan --sp-refine` (optional) and for `ffrefine charges`
+  (required: every charge scheme needs ORCA's electrostatic potential).
+  `--charge-scheme resp` also needs `orca_vpot`, which ffrefine looks for next
+  to the `orca` binary unless told otherwise. ORCA is usually on no `PATH` at
+  all, so reach it with `--orca-bin /path/to/orca`. A shared ORCA build will
+  not start unless its own directory is on `LD_LIBRARY_PATH`; ffrefine sets
+  that from `orca_libdir`, which defaults to the directory holding the binary
+  you named.
 - No network access is used at any point.
 
 ## Install
@@ -123,7 +147,39 @@ nine distinct dihedral quadruplets (ten term-lines: the target itself is split
 across two multiplicities). All of them are zeroed to build the MM reference --
 zeroing only the selected quadruplet is spec section 9.1's first named pitfall.
 
-### 1. MM energies, with and without the torsion
+### 1. Charges (optional, but first if you want them)
+
+    ffrefine charges \
+        -s fixtures/butane/butane.pdb \
+        -p fixtures/butane/butane.itp \
+        --charge-atoms 1,11 \
+        --outdir butane_out
+
+This optimises the geometry with xtb, runs one ORCA ESP job, fits CHELPG
+charges to it, and writes `butane_out/04_charges/molecule_charged.itp` along
+with `charges.json` recording every atom's charge before and after and why it
+changed. `--charge-mode selected` is the default, so only atoms 1 and 11 (the
+terminal carbons) are replaced; the rest of each carbon's charge group absorbs
+the change so the group's own net charge stays put.
+
+The run prints an RRMS: how well the fitted charges reproduce ORCA's own
+electrostatic potential. On this fixture at the default HF/6-31G* it comes out
+around 0.7, well above the 0.5 warning threshold -- and that is expected, not
+a bug. Butane's potential is weak and dominated by its quadrupole, which point
+charges are a poor model for; an independent least-squares fit on our own grid
+reproduces ORCA's own CHELPG charges to within about 0.06 e, confirming the
+fitting code is right and the poor RRMS is the molecule's, not ours.
+
+**Charges come before the torsion, not after.** The fitted torsion absorbs
+whatever the 1-4 electrostatics do not already account for, so a torsion fitted
+against one set of charges does not belong in a topology carrying another. Pass
+the charge-refined topology to the later stages:
+
+    ffrefine mmscan -s ... -p butane_out/04_charges/molecule_charged.itp ...
+
+`ffrefine run` does that swap for you.
+
+### 2. MM energies, with and without the torsion
 
     ffrefine mmscan \
         -s fixtures/butane/butane.pdb \
@@ -142,7 +198,7 @@ With no `01_qm_scan/scan.json` present, only the input structure's single frame
 is available, so this checks the topology edit but produces no profile. Supply
 a scan to get one.
 
-### 2. Running the QM scan
+### 3. Running the QM scan
 
     ffrefine scan         -s fixtures/butane/butane.pdb         -p fixtures/butane/butane.itp         --dihedral 1,5,8,11         --outdir butane_out
 
@@ -189,7 +245,7 @@ rather than a plausible-looking answer.
 The angles used for fitting are then measured from those geometries, never from
 a requested grid (spec section 9.5).
 
-### 3. Fit
+### 4. Fit
 
     ffrefine fit \
         -s fixtures/butane/butane.pdb \
@@ -228,7 +284,7 @@ the one to compare with a literature expectation. `fit.json` keeps the same
 split under `correction_curve_profile` and `qm_profile`. The refined torsion
 profile itself is MM plus the correction, and `validate` is what reports it.
 
-### 4. Validate
+### 5. Validate
 
     ffrefine validate \
         -s fixtures/butane/butane.pdb \
@@ -243,12 +299,19 @@ original force field's own parameters -- not the zeroed topology -- so the
 improvement reported is improvement over the force field, not over having no
 torsion at all.
 
-### Or all three at once
+### Or all of it at once
 
     ffrefine run -s ... -p ... --dihedral 1,5,8,11 --outdir butane_out
 
-`run` chains `scan -> mmscan -> fit -> validate` and states up front that it is
-skipping `charges` (milestone 5).
+By itself, `run` chains `scan -> mmscan -> fit -> validate` and states up front
+that it is skipping `charges`, because neither `--charge-atoms` nor
+`--charge-mode all` was given. Ask for charges and they run first, and the
+remaining stages pick up the charge-refined topology automatically:
+
+    ffrefine run -s ... -p ... --dihedral 1,5,8,11 --charge-atoms 1,11 --outdir butane_out
+
+`run` then chains `charges -> scan -> mmscan -> fit -> validate`, swapping
+`-p` to `04_charges/molecule_charged.itp` for every stage after `charges`.
 
 ## Output layout
 
@@ -263,12 +326,19 @@ skipping `charges` (milestone 5).
       03_fit/       fit.json (every number), dihedral.itp (the fitted [ dihedrals ]
                     lines, funct 9, kJ/mol and degrees), dihedral.prm (CHARMM
                     DIHEDRALS block in kcal/mol), plots/
+      04_charges/   charges.json (every atom's charge before/after and why),
+                    molecule_charged.itp, the ORCA ESP job's inputs and outputs
+                    (esp.inp, esp.gbw, esp.chelpg.xyz, esp.vpot and its logs),
+                    opt/ (xtb --opt tight working directory, --charge-geom xtb
+                    only), and, under --charge-scheme resp, grid.xyz and
+                    grid_out.vpot (the MK grid sent to and read back from
+                    orca_vpot)
       final/        molecule_refined.itp, validation.json, plots/validation.png,
                     plus the before/after topologies and GROMACS logs
       run.log       every external command with its full command line
 
-`04_charges/` and `final/report.md` are part of the layout but belong to
-milestones 5 and 6 and are not produced.
+`final/report.md` is part of the layout but belongs to milestone 6 and is not
+produced.
 
 Plots: `03_fit/plots/` holds the QM profile, the MM-zeroed profile, the target
 difference with the fitted series overlaid, and the residuals.
@@ -328,6 +398,59 @@ Accepted by `ffrefine scan`, and by `ffrefine run`, which chains it.
 - `--orca-sp-keywords` the ORCA keyword line for `--sp-refine`
   (default `! wB97X-D3 def2-TZVP TightSCF`).
 
+### Charge flags
+
+Accepted by `ffrefine charges`, and by `ffrefine run`, which chains it.
+`--charge` and `--uhf`, listed under Scan flags above, apply here too: charges
+needs the same molecular charge and spin state the scan does.
+
+- `--charge-scheme {chelpg,resp}` (default `chelpg`) -- ORCA fits the CHELPG
+  charges itself; `resp` has ffrefine fit its own two-stage restrained least
+  squares to the same ORCA-computed potential, on our own MK grid, so it can
+  impose the equivalence constraints and report a comparable RRMS.
+- `--charge-geom {input,xtb}` (default `xtb`) -- fit against the structure as
+  given, or against an `xtb --opt tight --gfn 2` minimum computed first.
+  Charges fitted to a strained input geometry describe a molecule nobody is
+  going to simulate.
+- `--charge-mode {selected,all}` (default `selected`) -- replace only the
+  atoms named by `--charge-atoms`, or every charge in the topology.
+  **`selected` refuses to run without `--charge-atoms`**: replacing every
+  charge on a CGenFF topology changes the derivation scheme entirely, so
+  defaulting silently to `all` would be the wrong kind of convenient.
+  Automatic atom selection from CGenFF penalties arrives in milestone 6; until
+  then, you name the atoms yourself.
+- `--charge-atoms i,j,k` (default: none) -- 1-based atom numbers to replace
+  under `--charge-mode selected`. Repeatable; every atom named across every
+  occurrence is pooled into one set.
+- `--orca-esp-keywords` (default `! HF 6-31G*`) -- the ORCA level of theory
+  for the ESP job. **This carries the level of theory only**: the scheme
+  appends `CHELPG` to the keyword line itself, so overriding the level can
+  never silently turn the scheme off.
+- `--esp-density` (default `1.0`) -- MK grid points per square Angstrom of
+  shell surface, `--charge-scheme resp` only; CHELPG's grid is ORCA's own and
+  ignores it.
+
+ORCA is usually on no `PATH` at all, so `--orca-bin /path/to/orca` is the
+normal way to reach it, same as for `--sp-refine`. A shared ORCA build will
+not start unless its own directory is on `LD_LIBRARY_PATH`; ffrefine sets that
+from `orca_libdir`, which defaults to the directory holding the binary you
+named (see Requirements, above).
+
+RESP's restraint follows the reference implementations (Bayly et al.'s
+`resp.f`, and psi4-resp): the objective minimised is
+`1/2 * sum(V - Phi q)^2 + a * sum(sqrt(q^2 + b^2) - b)` over the restrained
+(non-hydrogen) atoms, with `a = 0.0005` in stage 1, `a = 0.001` in stage 2, and
+`b = 0.1` throughout. Anyone checking numbers against another RESP program
+should confirm it uses the same convention before comparing.
+
+Expect RESP's charges to differ markedly from CHELPG's, and for a reason: the
+restraint pulls heavy-atom charges toward zero, which is exactly what it is
+for. On the butane fixture at HF/STO-3G, CHELPG's terminal carbons come out
+around -0.40 e; RESP's come out around -0.15 e, and the internal CH2 carbons
+move to almost nothing. That is the restraint working, not a discrepancy to
+chase -- with the restraint disabled, the two schemes agree to within about
+0.05 e.
+
 Exit codes: `0` success, `1` a reported ffrefine error (printed as
 `error: ...`, never a traceback), `2` a usage error or an unimplemented
 subcommand.
@@ -349,11 +472,26 @@ assumed, and recorded in `00_input/model.json`. CHARMM and Amber/GAFF differ
 here. Moving a fitted dihedral between force fields is not meaningful, and
 nothing in the output file will stop you from doing it.
 
-**Milestones 4-6 do not exist.** There is no xtb scan driver, no ORCA charge
-refinement, and no CGenFF `.str` parsing. The charge module of the spec is
-entirely unimplemented: this tool changes torsions and nothing else. If a
-subcommand for one of those appears to accept your arguments, it will still
-refuse to run and write nothing.
+**Milestone 6 does not exist yet.** There is no CGenFF `.str` parser, so there
+is no automatic torsion or charge-atom selection: `--dihedral` and
+`--charge-atoms` are the only way to point ffrefine at anything, and there is
+no `final/report.md` summary document. `--mm-relax` (spec 4.6) is also
+unimplemented.
+
+**A charge-group's net charge is preserved, and the molecular total is exact.**
+`--charge-mode selected` redistributes the fit's residual per charge group, not
+across the whole molecule: each group containing a selected atom absorbs the
+charge its own atoms gained or lost, spread over that group's unselected atoms
+(falling back to unselected heavy atoms bonded to a selected one in that group
+when the group has none). Only a leftover global offset -- from an explicit
+`--charge` that differs from the topology's own sum -- is pooled across groups.
+Charges are written to four decimal places, and any leftover rounding residue
+is absorbed by the largest-magnitude redistributed atom -- kept off a fitted
+atom's own value whenever an unselected atom exists to take it instead. Under
+`--charge-mode all`, where every atom is fitted and none is left to redistribute
+onto, the residue lands on the largest-magnitude atom regardless. A drift
+bigger than rounding can explain, or an offset with nowhere to go, is refused
+rather than folded in quietly.
 
 **Molecule-specific by default.** Without `--distribute` the fitted series is
 written onto one quadruplet and the other torsions about that bond are set to
@@ -408,6 +546,9 @@ has exercised none of the code that drives them, so run where they are
 available before trusting the result.
 
     pytest -m "needs_gmx or needs_xtb or needs_orca"   # and check nothing skipped
+
+As of this milestone the suite holds 517 tests: 16 marked `needs_gmx`, 4
+`needs_xtb` and 8 `needs_orca`. The rest need nothing external and always run.
 
 The load-bearing one is spec section 7.1's round trip, which covers the whole
 pipeline except xtb and ORCA: take the MM energies with the original
