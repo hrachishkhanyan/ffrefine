@@ -602,3 +602,33 @@ def test_all_mode_written_and_fitted_rrms_agree(butane_pdb, butane_itp, tmp_path
         fake_esp.rrms([a["charge_before"] for a in payload["atoms"]]), rel=1e-6
     )
     assert "poorly" not in captured.err
+
+
+def test_a_charge_that_disagrees_with_the_topology_is_refused_in_selected_mode(
+    butane_pdb, butane_itp, tmp_path, fake_esp, capsys
+):
+    """--charge -1 on neutral butane with one atom selected (ruling R21).
+
+    Before the fix this exited 0 with C1's three hydrogens taken from +0.090
+    to about -0.2 each. Now it is refused, and no charged topology is written.
+    """
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(
+            butane_pdb,
+            butane_itp,
+            outdir,
+            "--charge-atoms",
+            "1",
+            "--charge",
+            "-1",
+            "--charge-geom",
+            "input",
+        )
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--charge-mode all" in err
+    assert "Traceback" not in err
+    assert not (outdir / "04_charges" / "molecule_charged.itp").exists()

@@ -66,13 +66,19 @@ def test_the_residual_falls_back_to_bonded_heavy_atoms(butane_itp):
 
 
 def test_no_recipient_anywhere_is_refused(butane_itp):
-    """Silently leaving the total wrong would be the worst option."""
+    """Silently leaving the total wrong would be the worst option.
+
+    Every atom is selected and sits in its own charge group, so each group's
+    nonzero residual has nowhere to go. (This used target_total=1, which is
+    now refused earlier as a whole-electron offset -- ruling R21 -- so it no
+    longer reached this path; the residual alone is enough to reach it.)
+    """
     top = read_topology(butane_itp)
     for atom in top.atoms:
         atom.cgnr = atom.nr
 
-    with pytest.raises(ValidationError, match="redistribute"):
-        apply_charges(top, _fitted(), selected=list(range(1, 15)), target_total=1)
+    with pytest.raises(ValidationError, match="nothing left to redistribute"):
+        apply_charges(top, _fitted(), selected=list(range(1, 15)), target_total=0)
 
 
 def test_the_total_is_exact_after_rounding(butane_itp):
@@ -88,12 +94,39 @@ def test_the_total_is_exact_after_rounding(butane_itp):
     assert all(a.after == pytest.approx(round(a.after, 4)) for a in out)
 
 
-def test_a_nonzero_target_total_is_honoured(butane_itp):
+def test_a_whole_electron_offset_is_refused_in_selected_mode(butane_itp):
+    """Final review I2 (ruling R21, amending R10/R11).
+
+    Butane's charges sum to 0, so a target of -1 leaves a whole electron that
+    selected mode could only spread over the three hydrogens sharing C1's
+    charge group (taking them from +0.090 to about -0.2). That is not a
+    rounding correction; it is refused, naming both remedies.
+    """
     top = read_topology(butane_itp)
 
-    out = apply_charges(top, _fitted(), selected=[1], target_total=-1)
+    with pytest.raises(ValidationError, match="--charge-mode all") as exc:
+        apply_charges(top, _fitted(), selected=[1], target_total=-1)
+    assert "correct the topology" in str(exc.value)
 
-    assert sum(a.after for a in out) == pytest.approx(-1.0, abs=1e-6)
+
+def test_a_small_offset_is_still_spread_over_the_recipients(butane_itp):
+    """Offsets up to CHARGE_TOLERANCE (0.05 e) are rounding-sized and still absorbed.
+
+    C1's input charge is nudged to -0.290 so the topology sums to -0.02; with
+    C1 selected, the group residual and the +0.02 offset both land on C1's
+    group-mates, equally, and nothing outside that group moves.
+    """
+    top = read_topology(butane_itp)
+    top.atoms[0].charge = -0.290
+
+    out = apply_charges(top, _fitted(), selected=[1], target_total=0)
+
+    assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)
+    assert out[0].after == pytest.approx(-0.35)
+    assert [a.nr for a in out if a.source == "redistributed"] == [2, 3, 4]
+    deltas = [out[i].after - out[i].before for i in (1, 2, 3)]
+    assert deltas == pytest.approx([(0.06 + 0.02) / 3] * 3, abs=1e-4)
+    assert all(a.after == a.before for a in out[4:])
 
 
 def test_an_out_of_range_atom_is_refused(butane_itp):
@@ -143,37 +176,55 @@ def test_redistribution_is_per_charge_group_not_global(butane_itp):
     assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)
 
 
-def test_global_offset_lands_on_group_recipients_not_drifted_atoms(butane_itp):
-    """Global offset (explicit --charge) routes to group recipients, not largest atom.
+def test_a_whole_electron_offset_on_a_zero_residual_group_is_refused(butane_itp):
+    """The R12 structure (atom 6 selected, its own residual zero) with a -1 offset.
 
-    Atom 6 (H21, cgnr 2 = atoms 5-7) is selected with a fitted value equal to
-    its topology charge, so its group's own residual is zero -- the fallback
-    bug (round 2, commit 8fd5400) skips collecting that group's recipients in
-    this case and instead dumps the global offset on argmax(|after|), which
-    for butane is atom 1 or atom 11 (both -0.270, C1 winning the tie) -- an
-    atom outside cgnr 2 entirely. The fix must route the offset to atom 6's
-    own group-mates (atoms 5 and 7), not to C1.
+    This used to spread the whole electron over atoms 5 and 7. It is now
+    refused: nothing about a zero-residual selection makes a whole-electron
+    disagreement between --charge and the topology a rounding matter.
     """
     top = read_topology(butane_itp)
-
     fitted = _fitted()
     fitted[5] = 0.090  # atom 6 (index 5): matches its topology charge exactly
 
-    out = apply_charges(top, fitted, selected=[6], target_total=-1)
+    with pytest.raises(ValidationError, match="--charge-mode all"):
+        apply_charges(top, fitted, selected=[6], target_total=-1)
+
+
+def test_a_small_global_offset_lands_on_the_selected_atoms_own_group(butane_itp):
+    """A small global offset routes to group recipients, not the largest atom.
+
+    Atom 6 (H21, cgnr 2 = atoms 5-7) is selected with a fitted value equal to
+    its topology charge, so its group's own residual is zero -- the fallback
+    bug (round 2, commit 8fd5400) skipped collecting that group's recipients in
+    this case and instead dumped the global offset on argmax(|after|), an atom
+    outside cgnr 2 entirely. C1's input charge is nudged to -0.290 so the
+    topology sums to -0.02 -- a +0.02 offset, within CHARGE_TOLERANCE -- and C1
+    is then the unique largest-magnitude atom, exactly where that bug would put
+    it. The offset must go to atom 6's own group-mates, atoms 5 and 7.
+    """
+    top = read_topology(butane_itp)
+    top.atoms[0].charge = -0.290
+    fitted = _fitted()
+    fitted[5] = 0.090  # atom 6 (index 5): matches its topology charge exactly
+
+    out = apply_charges(top, fitted, selected=[6], target_total=0)
 
     # Atom 6 keeps its fitted value exactly.
     assert out[5].after == pytest.approx(0.090)
     assert out[5].source == "fitted"
 
-    # The -1 offset lands only on atom 6's group-mates (atoms 5 and 7 of cgnr 2),
-    # spread evenly between them, never on C1 (atom 1) or C4 (atom 11).
+    # The +0.02 offset lands only on atom 6's group-mates (atoms 5 and 7 of
+    # cgnr 2), spread evenly between them, never on C1 (atom 1) or C4 (atom 11).
     redistributed = sorted(a.nr for a in out if a.source == "redistributed")
     assert redistributed == [5, 7]
     deltas = {a.nr: a.after - a.before for a in out if a.nr in (5, 7)}
-    assert deltas[5] == pytest.approx(deltas[7])
+    assert deltas[5] == pytest.approx(0.01, abs=1e-9)
+    assert deltas[7] == pytest.approx(0.01, abs=1e-9)
+    assert out[0].after == out[0].before == pytest.approx(-0.290)
 
     # Total must be exact.
-    assert sum(a.after for a in out) == pytest.approx(-1.0, abs=1e-6)
+    assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_no_recipients_with_nonzero_offset_is_refused(butane_itp):
@@ -181,18 +232,21 @@ def test_no_recipients_with_nonzero_offset_is_refused(butane_itp):
 
     If every atom is selected and there are no recipients to absorb a global
     offset (e.g. from an explicit --charge), the function must refuse rather
-    than silently dumping it on one atom.
+    than silently dumping it on one atom. The offset is a small +0.02 e (C1
+    nudged to -0.290): it used to be a whole electron, which ruling R21 now
+    refuses earlier, before this path is reached.
     """
     top = read_topology(butane_itp)
     for atom in top.atoms:  # every atom in its own charge group
         atom.cgnr = atom.nr
+    top.atoms[0].charge = -0.290  # topology sums to -0.02
 
     # All atoms selected, fitted equals topology (no group residuals),
-    # but target differs by 1 (global offset nonzero)
+    # but target differs by 0.02 (global offset nonzero)
     fitted = np.array([a.charge for a in top.atoms], dtype=float)
 
-    with pytest.raises(ValidationError, match="nothing left"):
-        apply_charges(top, fitted, selected=list(range(1, 15)), target_total=1)
+    with pytest.raises(ValidationError, match="nothing left.*global offset"):
+        apply_charges(top, fitted, selected=list(range(1, 15)), target_total=0)
 
 
 def test_all_mode_refuses_fitted_charges_that_do_not_sum_to_target(butane_itp):

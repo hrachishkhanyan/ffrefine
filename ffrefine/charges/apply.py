@@ -16,6 +16,7 @@ import numpy as np
 from ..errors import ValidationError
 from ..io.topology import Topology
 from ..io.validate import element_of
+from ..qm.xtb import CHARGE_TOLERANCE
 
 CHARGE_DECIMALS = 4
 """Decimal places written into ``[ atoms ]``.
@@ -24,6 +25,57 @@ Every written charge is then a multiple of 1e-4, so compensating the rounding
 residual on one atom makes the total exactly the target rather than merely
 close to it.
 """
+
+
+def check_selection(topology: Topology, selected: list[int] | None, target_total: int) -> None:
+    """Refuse a request :func:`apply_charges` could only answer with nonsense.
+
+    Cheap -- it needs only the topology -- so a caller can run it before any
+    QM job as well; :func:`apply_charges` runs it again regardless.
+
+    Two refusals, both in ``selected`` mode only:
+
+    * a selected atom number that does not exist in the topology; and
+    * a target total that disagrees with the topology's own charge sum by
+      more than :data:`~ffrefine.qm.xtb.CHARGE_TOLERANCE` (ruling R21,
+      amending R10/R11).  ``selected`` mode replaces only the named atoms,
+      so the whole disagreement would have to be absorbed by the two or
+      three atoms sharing their charge groups: ``--charge -1`` on neutral
+      butane with C1 selected took its three hydrogens from +0.090 to
+      -0.198 each.  An offset that size is not rounding; it means the
+      declared charge and the topology describe different molecules.
+      ``all`` mode has no such problem, because the ESP job runs at the
+      declared charge and every atom is refitted.
+
+    Args:
+        topology: the parsed molecule.
+        selected: 1-based atom numbers, or ``None`` for ``--charge-mode all``.
+        target_total: the molecular charge the result must sum to.
+
+    Raises:
+        ValidationError: either condition above.
+    """
+    if selected is None:
+        return
+    natoms = topology.natoms
+    bad = sorted(nr for nr in set(selected) if not 1 <= nr <= natoms)
+    if bad:
+        raise ValidationError(
+            f"--charge-atoms names atom(s) {bad}, but the topology has {natoms} atoms "
+            "(indices are 1-based, matching [ atoms ])."
+        )
+    total = float(sum(atom.charge for atom in topology.atoms))
+    offset = float(target_total) - total
+    if abs(offset) > CHARGE_TOLERANCE:
+        raise ValidationError(
+            f"the molecular charge is {target_total}, but the topology's [ atoms ] charges "
+            f"sum to {total:+.4f}: a {offset:+.4f} e disagreement, beyond the "
+            f"{CHARGE_TOLERANCE} e that rounding can explain. --charge-mode selected replaces "
+            "only the atoms you named, so the whole difference would be pushed onto the few "
+            "atoms sharing their charge groups -- a chemically meaningless result, not a "
+            "rounding correction. Use --charge-mode all to refit every charge at the declared "
+            f"charge, or correct the topology's charges so they sum to {target_total}."
+        )
 
 
 @dataclass
@@ -61,8 +113,10 @@ def apply_charges(
     charge change the fit made within it) is redistributed to unselected atoms
     in that same group, falling back to bonded heavy atoms if no in-group
     recipients exist. After all per-group redistributions, any remaining
-    global offset (e.g. from an explicit ``--charge`` differing from the
-    topology's sum) is spread over the pooled recipients. After rounding to
+    global offset (an explicit ``--charge`` differing from the topology's sum
+    by no more than :data:`~ffrefine.qm.xtb.CHARGE_TOLERANCE`) is spread over
+    the pooled recipients; a larger offset is refused before anything is
+    changed (see :func:`check_selection`). After rounding to
     the output precision, any remaining drift is absorbed by the largest-
     magnitude atom among the redistribution recipients (or, in ``all`` mode,
     any atom). This ensures an atom reported as ``source="fitted"`` carries
@@ -91,24 +145,18 @@ def apply_charges(
         One :class:`ChargeAssignment` per atom, in topology order.
 
     Raises:
-        ValidationError: a selected atom number is out of range, or the
-            residual has nowhere to go.
+        ValidationError: a selected atom number is out of range, the target
+            total disagrees with the topology by more than
+            ``CHARGE_TOLERANCE`` in ``selected`` mode, or the residual has
+            nowhere to go.
     """
     natoms = topology.natoms
     fitted = np.asarray(fitted_e, float)
     if fitted.shape != (natoms,):
         raise ValidationError(f"fitted charges have shape {fitted.shape}, expected ({natoms},)")
 
-    if selected is None:
-        chosen = set(range(1, natoms + 1))
-    else:
-        chosen = set(selected)
-        bad = sorted(nr for nr in chosen if not 1 <= nr <= natoms)
-        if bad:
-            raise ValidationError(
-                f"--charge-atoms names atom(s) {bad}, but the topology has {natoms} atoms "
-                "(indices are 1-based, matching [ atoms ])."
-            )
+    check_selection(topology, selected, target_total)
+    chosen = set(range(1, natoms + 1)) if selected is None else set(selected)
 
     before = np.array([a.charge for a in topology.atoms], dtype=float)
     after = before.copy()

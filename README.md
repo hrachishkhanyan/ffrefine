@@ -496,8 +496,13 @@ unimplemented.
 across the whole molecule: each group containing a selected atom absorbs the
 charge its own atoms gained or lost, spread over that group's unselected atoms
 (falling back to unselected heavy atoms bonded to a selected one in that group
-when the group has none). Only a leftover global offset -- from an explicit
-`--charge` that differs from the topology's own sum -- is pooled across groups.
+when the group has none). Only a small leftover global offset -- an explicit
+`--charge` that differs from the topology's own sum by no more than 0.05 e,
+the same tolerance used to derive the charge -- is pooled across groups. A
+larger disagreement is refused before any QM runs: `--charge -1` on a neutral
+topology would otherwise push a whole electron onto the two or three atoms
+sharing the selected atoms' charge groups. Use `--charge-mode all`, which
+refits every charge at the declared charge, or correct the topology.
 Charges are written to four decimal places, and any leftover rounding residue
 is absorbed by the largest-magnitude redistributed atom -- kept off a fitted
 atom's own value whenever an unselected atom exists to take it instead. Under

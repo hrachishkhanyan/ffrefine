@@ -311,11 +311,17 @@ containing a selected atom, that group's residual (the charge change the fit mad
 is spread evenly over the unselected atoms in that group, falling back to unselected heavy
 atoms bonded to a selected atom in that group, and refused when neither exists. This keeps
 each charge group's net charge intact — that is what CHARMM charge groups are for. After all
-per-group residuals are absorbed, any remaining global offset (e.g. from an explicit
-`--charge` differing from the topology's sum) is spread over the pooled recipients. A nonzero
-global offset with no recipients anywhere (every selected group has zero residual and none
-has a recipient) is refused rather than silently misplaced — leaving the molecular total
-wrong would be worse than stopping. Every reassignment is logged atom by atom.
+per-group residuals are absorbed, any remaining global offset (an explicit `--charge`
+differing from the topology's sum) is spread over the pooled recipients — but only when it is
+rounding-sized, at most `CHARGE_TOLERANCE` (0.05 e, the tolerance `derive_charge` already
+applies). A larger offset is refused in `selected` mode (final-review ruling R21, amending
+R10/R11): `--charge -1` on a neutral butane with C1 selected took C1's three hydrogens from
++0.090 to -0.198 each, which is not a rounding correction but a chemically meaningless
+answer. The refusal names `--charge-mode all` and correcting the topology as the remedies,
+and is checked before any QM job runs. A nonzero global offset with no recipients anywhere
+(every selected group has zero residual and none has a recipient) is refused rather than
+silently misplaced — leaving the molecular total wrong would be worse than stopping. Every
+reassignment is logged atom by atom.
 
 The alternative, freezing the unselected atoms inside the fit as ffTK does, is better physics
 and was considered and rejected for this milestone: spec 5.3 specifies redistribution, and
