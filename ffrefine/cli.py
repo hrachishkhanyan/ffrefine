@@ -348,8 +348,10 @@ def _atom_list(text: str) -> tuple[int, ...]:
 
     Raises:
         ValidationError: a field is not a positive integer.  Ruling R29 makes
-            every validation failure a ValidationError, which the parser adapts
-            to argparse's own error channel.
+            every validation failure a ValidationError; :func:`_atom_list_arg`
+            is what adapts it to argparse's own error channel when this is
+            used as a ``type=`` callback, the same way :func:`_dihedral_arg`
+            adapts :func:`parse_dihedral`.
     """
     out = []
     for field in text.split(","):
@@ -367,6 +369,25 @@ def _atom_list(text: str) -> tuple[int, ...]:
     if not out:
         raise ValidationError("--charge-atoms: no atoms given")
     return tuple(out)
+
+
+def _atom_list_arg(text: str) -> tuple[int, ...]:
+    """argparse ``type=`` adapter for :func:`_atom_list`.
+
+    Mirrors :func:`_dihedral_arg`: argparse only recognises ``ValueError``,
+    ``TypeError`` and ``ArgumentTypeError`` as "this value is bad" from a
+    ``type=`` callback; anything else -- including ``_atom_list``'s own
+    ``ValidationError`` -- propagates as an unhandled traceback instead of
+    argparse's clean usage error, because ``parse_args()`` runs before
+    ``main``'s ``try/except FFRefineError``. Translating here keeps
+    ``_atom_list`` raising the project's own ``ValidationError`` (ruling R29)
+    while still giving the user argparse's clean ``invalid value`` message
+    and exit code 2.
+    """
+    try:
+        return _atom_list(text)
+    except ValidationError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _add_charge_flags(parser: argparse.ArgumentParser) -> None:
@@ -392,7 +413,7 @@ def _add_charge_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--charge-atoms",
         action="append",
-        type=_atom_list,
+        type=_atom_list_arg,
         default=None,
         metavar="i,j,k",
         help="1-based atoms whose charges to replace; repeatable",

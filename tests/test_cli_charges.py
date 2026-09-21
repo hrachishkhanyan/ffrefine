@@ -35,6 +35,37 @@ def test_atom_list_rejects_zero_and_negatives():
         _atom_list("0,3")
 
 
+def test_bad_charge_atoms_on_the_command_line_exits_cleanly(capsys):
+    """Bad user input gets argparse's message and exit 2, never a traceback.
+
+    ``--charge-atoms`` is wired as ``type=_atom_list_arg`` precisely so this
+    never reaches ``main``'s ``try/except FFRefineError`` as a raw
+    ``ValidationError``: argparse's own ``type=`` machinery runs during
+    ``parse_args()``, before that except block exists, and only converts
+    ``ValueError``/``TypeError``/``ArgumentTypeError`` into a clean usage
+    error. ``test_atom_list_rejects_zero_and_negatives`` calls ``_atom_list``
+    directly and so could never have caught a missing adapter here.
+    """
+    with pytest.raises(SystemExit) as exc:
+        main(["charges", "-s", "a.pdb", "-p", "a.itp", "--charge-atoms", "0,3"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--charge-atoms" in err
+    assert "1-based" in err
+    assert "Traceback" not in err
+
+
+def test_non_integer_charge_atoms_on_the_command_line_exits_cleanly(capsys):
+    """A non-integer field is the same class of bad input, not a traceback either."""
+    with pytest.raises(SystemExit) as exc:
+        main(["charges", "-s", "a.pdb", "-p", "a.itp", "--charge-atoms", "x,3"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--charge-atoms" in err
+    assert "not an integer" in err
+    assert "Traceback" not in err
+
+
 def test_charges_defaults_to_selected_and_chelpg():
     args = build_parser().parse_args(["charges", "-s", "a.pdb", "-p", "a.itp"])
 
