@@ -744,3 +744,67 @@ def test_charges_json_records_each_atoms_element(butane_pdb, butane_itp, tmp_pat
 
     elements = [a["element"] for a in _charges_json(outdir)["atoms"]]
     assert elements == ["C", "H", "H", "H", "C", "H", "H", "C", "H", "H", "C", "H", "H", "H"]
+
+
+def test_out_of_range_charge_atoms_is_refused_in_a_dry_run(
+    butane_pdb, butane_itp, tmp_path, capsys
+):
+    """Final review M4: a dry run must not promise a run that would be refused."""
+    outdir = tmp_path / "out"
+    rc = main(_args(butane_pdb, butane_itp, outdir, "--charge-atoms", "1,15", "--dry-run"))
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--charge-atoms names atom(s) [15], but the topology has 14 atoms" in err
+    assert not outdir.exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--charge-atoms", "15"),
+        ("--charge-atoms", "1", "--charge", "-1"),
+    ],
+    ids=["atom-out-of-range", "whole-electron-offset"],
+)
+def test_a_bad_selection_is_refused_before_any_qm_job_runs(
+    butane_pdb, butane_itp, tmp_path, fake_esp, monkeypatch, capsys, extra
+):
+    """Final review M4: refuse before xtb and ORCA, not after them.
+
+    Both refusals need only the topology. They used to fire inside
+    apply_charges, after the default --charge-geom xtb optimisation and the
+    ORCA ESP job had already run.
+    """
+    import ffrefine.cli as cli
+
+    xtb_calls = []
+    monkeypatch.setattr(cli, "optimize_geometry", lambda *a, **k: xtb_calls.append(1) or a[2])
+
+    rc = main(_args(butane_pdb, butane_itp, tmp_path / "out", *extra))
+
+    assert rc == 1
+    assert xtb_calls == []
+    assert fake_esp.calls == 0
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_charge_atoms_with_charge_mode_all_is_refused(butane_pdb, butane_itp, tmp_path, capsys):
+    """--charge-mode all replaces every charge; a --charge-atoms list would be ignored."""
+    rc = main(
+        _args(
+            butane_pdb,
+            butane_itp,
+            tmp_path / "out",
+            "--charge-mode",
+            "all",
+            "--charge-atoms",
+            "1",
+            "--dry-run",
+        )
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--charge-atoms" in err
+    assert "--charge-mode all" in err

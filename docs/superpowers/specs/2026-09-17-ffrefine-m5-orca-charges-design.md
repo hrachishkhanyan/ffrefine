@@ -366,7 +366,9 @@ Every avoidable ambiguity is a refusal with a named remedy.
 | Condition | Behaviour |
 |---|---|
 | `selected` with no `--charge-atoms` | Refuse; name both `--charge-atoms` and `--charge-mode all` |
-| `--charge-atoms` index out of range | Refuse, naming the index and the atom count |
+| `--charge-atoms` index out of range | Refuse, naming the index and the atom count, before any xtb or ORCA job and in `--dry-run` |
+| `--charge-atoms` together with `--charge-mode all` | Refuse: `all` replaces every charge, so the list would be silently ignored |
+| `selected` mode, declared charge differs from the topology's sum by more than 0.05 e | Refuse before any QM job, naming `--charge-mode all` and correcting the topology (section 6.4) |
 | Element with no vdW radius | Refuse, naming the element and atom |
 | `orca_vpot` produced no output, or the wrong point count | Refuse, naming the gbw and the density |
 | RESP did not converge | Refuse, with the iteration count and last movement |

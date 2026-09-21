@@ -434,7 +434,10 @@ needs the same molecular charge and spin state the scan does.
   then, you name the atoms yourself.
 - `--charge-atoms i,j,k` (default: none) -- 1-based atom numbers to replace
   under `--charge-mode selected`. Repeatable; every atom named across every
-  occurrence is pooled into one set.
+  occurrence is pooled into one set. Checked against the topology's atom count
+  before any xtb or ORCA job runs, and by `--dry-run`. Refused together with
+  `--charge-mode all`, which replaces every charge and would otherwise ignore
+  the list without a word.
 - `--orca-esp-keywords` (default `! HF 6-31G*`) -- the ORCA level of theory
   for the ESP job. **This carries the level of theory only**: the scheme
   appends `CHELPG` to the keyword line itself, so overriding the level can

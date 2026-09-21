@@ -88,7 +88,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .charges.apply import apply_charges, charge_decimals
+from .charges.apply import apply_charges, charge_decimals, check_selection
 from .charges.equivalence import average_within_groups, equivalent_hydrogen_groups
 from .charges.esp import inverse_distances, potential_from_charges, rrms
 from .charges.grid import MK_SHELL_SCALES, VDW_RADII_ANGSTROM, mk_grid
@@ -1391,9 +1391,19 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
                 "a CGenFF .str file arrives in milestone 6."
             )
         selected_atoms = sorted({nr for group in args.charge_atoms for nr in group})
+    elif args.charge_atoms:
+        raise ValidationError(
+            "--charge-atoms names the atoms to replace under --charge-mode selected, but "
+            "--charge-mode all replaces every charge, so the list would be ignored. Drop "
+            "--charge-atoms to replace every charge, or drop --charge-mode all to replace only "
+            "the atoms you named."
+        )
 
     if args.dry_run:
         structure, topology = _load_structure_and_topology(args)
+        # The same refusals the real run makes, so a dry run never promises a
+        # run that would be refused.
+        check_selection(topology, selected_atoms, derive_charge(topology, args.charge))
         what = "every charge" if selected_atoms is None else f"atoms {selected_atoms}"
         print(
             f"would fit {args.charge_scheme} charges for {what} of {topology.name} "
@@ -1404,6 +1414,9 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
 
     structure, topology, _ = _prepare(args, need_quad=False)
     target_total = derive_charge(topology, args.charge)
+    # Needs only the topology, so it runs before any xtb or ORCA job rather
+    # than after them inside apply_charges (which checks again regardless).
+    check_selection(topology, selected_atoms, target_total)
     settings = {
         "scheme": args.charge_scheme,
         "geom": args.charge_geom,
