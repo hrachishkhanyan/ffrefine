@@ -6,10 +6,24 @@ the fit assigns them large, arbitrary charges that happen to cancel.  RESP adds
 a hyperbolic restraint pulling heavy-atom charges toward zero, which costs
 almost nothing in fit quality and removes most of that arbitrariness.
 
+The objective minimised at each stage is::
+
+    1/2 * sum_i (V_i - sum_j Phi_ij q_j)^2 + a * sum_j restrain_j * (sqrt(q_j^2 + b^2) - b)
+
+which is the convention of the reference RESP implementations (Bayly et al.'s
+``resp.f`` and psi4-resp) -- the convention spec 5.2's ``a`` values were
+calibrated against.  ``esp.normal_equations`` returns ``A = Phi^T Phi`` and
+``B = Phi^T V``, the *unscaled* normal equations for the first term (no factor
+of 2), so the restraint's diagonal contribution is added straight to ``A``
+(see ``_run_stage``), not to ``2 * A``.
+
 Stage 1 fits every atom.  Stage 2 refits only the atoms in equivalence groups
 and their parents, with a stronger restraint and the group members constrained
 equal, leaving everything else at its stage 1 value -- so imposing methyl
-symmetry cannot quietly rearrange the rest of the molecule.
+symmetry cannot quietly rearrange the rest of the molecule.  A group with an
+atom outside stage 2's free set is refused rather than silently dropped: the
+usual way that happens is a caller passing 1-based groups without converting
+them to 0-based.
 
 Every constraint is an extra row in a bordered system: one for the total
 charge, one per equivalence pair, one per frozen atom.  One mechanism rather
@@ -115,11 +129,14 @@ def _run_stage(
 ) -> tuple[np.ndarray, int]:
     """Iterate one restrained stage to convergence.
 
-    The hyperbolic penalty ``a * sum(sqrt(q^2 + b^2) - b)`` is not quadratic, so
-    its second derivative depends on the charges.  Linearising it as a diagonal
-    ``a / sqrt(q^2 + b^2)`` built from the previous iteration's charges and
-    re-solving is the standard treatment, and it converges in a handful of
-    passes.
+    Each restrained atom contributes ``a * (sqrt(q^2 + b^2) - b)`` to the
+    objective, whose gradient is ``a * q / sqrt(q^2 + b^2)``.  Dividing that
+    gradient by ``q`` gives the iteratively-reweighted weight ``a / sqrt(q^2 +
+    b^2)`` -- not a second derivative -- built from the previous iteration's
+    charges; adding it to the diagonal of the normal-equations matrix and
+    re-solving reproduces the same gradient at that linearisation point. This
+    is the standard IRLS treatment of a hyperbolic penalty, and it converges
+    in a handful of passes.
     """
     c, d = constraints
     charges = _solve(a_matrix, b_vector, c, d)
@@ -160,6 +177,10 @@ def resp_fit(
         restrain: per-atom mask, True where the hyperbolic restraint applies.
             Spec 5.2 restrains non-hydrogen atoms.
         groups: **0-based** equivalence groups, constrained equal in stage 2.
+            Every atom in every group must be in ``stage2_free``; groups given
+            while ``stage2_free`` is empty are refused too, because a group
+            that stage 2 never sees would otherwise vanish silently instead
+            of enforcing the symmetry the caller asked for.
         stage2_free: **0-based** atoms refit in stage 2; everything else is
             frozen at its stage 1 charge.  Empty means stage 2 does nothing.
         total_charge: the molecular charge, enforced exactly.
@@ -172,14 +193,20 @@ def resp_fit(
         A :class:`RespResult`.
 
     Raises:
-        ValidationError: either stage failed to converge, or the system is
-            singular.
+        ValidationError: either stage failed to converge, the system is
+            singular, or a group is not entirely contained in ``stage2_free``.
     """
     inv_r = np.asarray(inv_r, float)
     natoms = inv_r.shape[1]
     restrain = np.asarray(restrain, bool)
     if restrain.shape != (natoms,):
         raise ValidationError(f"restrain mask has shape {restrain.shape}, expected ({natoms},)")
+    if groups and not stage2_free:
+        raise ValidationError(
+            "groups were given but stage2_free is empty, so stage 2 would never run and the "
+            "equivalence constraint would silently do nothing. Pass the group's atoms in "
+            "stage2_free, or pass groups=[] if no equivalence is wanted."
+        )
 
     a_matrix, b_vector = normal_equations(inv_r, v_ref)
 
@@ -198,12 +225,19 @@ def resp_fit(
     charges, iter2 = stage1, 0
     if stage2_free:
         free = set(stage2_free)
+        for group in groups:
+            if not all(i in free for i in group):
+                raise ValidationError(
+                    f"equivalence group {group} is not entirely contained in stage2_free "
+                    f"{sorted(free)}; an atom stage 2 does not refit cannot be constrained "
+                    "equal there. This is the usual symptom of passing 1-based groups "
+                    "without converting them to 0-based."
+                )
         frozen = {i: float(stage1[i]) for i in range(natoms) if i not in free}
-        active_groups = [g for g in groups if all(i in free for i in g)]
         charges, iter2 = _run_stage(
             a_matrix,
             b_vector,
-            _constraint_rows(natoms, total_charge, active_groups, frozen),
+            _constraint_rows(natoms, total_charge, groups, frozen),
             restrain,
             a_stage2,
             b,
