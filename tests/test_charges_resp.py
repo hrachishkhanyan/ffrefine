@@ -1,9 +1,18 @@
 import numpy as np
 import pytest
 
+from ffrefine.charges.equivalence import average_within_groups, equivalent_hydrogen_groups
 from ffrefine.charges.esp import inverse_distances, normal_equations, potential_from_charges
+from ffrefine.charges.grid import mk_grid
 from ffrefine.charges.resp import RESP_A_STAGE1, RESP_B, resp_fit
+from ffrefine.config import discover_binaries
 from ffrefine.errors import ValidationError
+from ffrefine.io.structure import read_pdb
+from ffrefine.io.topology import read_topology
+from ffrefine.io.validate import adopt_topology_naming, element_of
+from ffrefine.qm.orca import parse_chelpg_charges, run_esp_job, run_vpot
+from ffrefine.qm.xtb import derive_charge
+from ffrefine.units import nm_to_bohr
 
 
 def _case(seed: int = 0, natoms: int = 5):
@@ -215,3 +224,70 @@ def test_a_fit_that_will_not_converge_is_refused():
             max_iterations=1,
             tol=1e-15,
         )
+
+
+@pytest.mark.needs_orca
+def test_unrestrained_resp_on_our_own_grid_reproduces_orca_chelpg(
+    butane_pdb, butane_itp, tmp_path, orca_bin
+):
+    """End-to-end check of the grid, orca_vpot, units and the fit together.
+
+    Does not go through the CLI, because the CLI has no way to switch the
+    restraint off. With ``a_stage1 = a_stage2 = 0``, ``resp_fit`` is just a
+    constrained least-squares ESP fit -- the same problem ORCA's own CHELPG
+    solves, just on a different (MK, not Breneman) grid. If the MK grid, the
+    ``orca_vpot`` invocation, the bohr conversion, or the fit itself were
+    wrong, this fit would not land anywhere near ORCA's own CHELPG answer;
+    agreeing to within 0.06 e is the strongest evidence available that the
+    whole RESP wiring in ``cmd_charges`` computes the right numbers, with the
+    restraint's own (expected, large) effect on buried atoms excluded from
+    the comparison.
+    """
+    binaries = discover_binaries({"orca": orca_bin})
+    topology = read_topology(butane_itp)
+    structure = adopt_topology_naming(read_pdb(butane_pdb), topology)
+    target_total = derive_charge(topology, None)
+    coords_nm = structure.coords
+
+    base = run_esp_job(
+        binaries,
+        structure,
+        coords_nm,
+        tmp_path,
+        "! HF STO-3G",
+        charge=target_total,
+        mult=1,
+        nprocs=1,
+        chelpg=True,
+    )
+
+    groups = equivalent_hydrogen_groups(topology)
+    raw_chelpg = parse_chelpg_charges(tmp_path / "esp.chelpg.xyz")
+    chelpg = average_within_groups(raw_chelpg, groups)
+
+    elements = [element_of(topology, atom.nr) for atom in topology.atoms]
+    zero_based = [[nr - 1 for nr in group] for group in groups]
+    parents = {
+        n - 1
+        for group in groups
+        for n in topology.bonded_neighbours(group[0])
+        if element_of(topology, n) != "H"
+    }
+    stage2_free = sorted(parents.union(i for g in zero_based for i in g))
+
+    grid_nm = mk_grid(coords_nm, elements, density_per_angstrom2=1.0)
+    v_grid = run_vpot(binaries, base, grid_nm, tmp_path)
+    inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
+
+    result = resp_fit(
+        inv_r,
+        v_grid,
+        restrain=np.array([e != "H" for e in elements]),
+        groups=zero_based,
+        stage2_free=stage2_free,
+        total_charge=float(target_total),
+        a_stage1=0.0,
+        a_stage2=0.0,
+    )
+
+    assert np.abs(result.charges - chelpg).max() < 0.06

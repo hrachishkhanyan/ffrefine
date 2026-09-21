@@ -5,6 +5,7 @@ import pytest
 
 from ffrefine.cli import build_parser, main
 from ffrefine.io.topology import read_topology
+from ffrefine.io.validate import element_of
 
 
 def _args(butane_pdb, butane_itp, outdir, *extra):
@@ -287,8 +288,21 @@ def test_resp_end_to_end_gives_equal_methyl_hydrogens(butane_pdb, butane_itp, tm
 
 
 @pytest.mark.needs_orca
-def test_resp_and_chelpg_broadly_agree_on_butane(butane_pdb, butane_itp, tmp_path, orca_bin):
-    """Two schemes on one molecule should not disagree about its chemistry."""
+def test_resp_shrinks_heavy_atom_charges_relative_to_chelpg(
+    butane_pdb, butane_itp, tmp_path, orca_bin
+):
+    """RESP's restraint only ever pulls a heavy atom's charge toward zero, so
+    an *absolute*-agreement tolerance between the two schemes is the wrong
+    thing to assert: on a badly-conditioned fit -- which is exactly what the
+    cheap ``! HF STO-3G`` keywords below give, RRMS 0.6-0.8 for both schemes
+    -- CHELPG's unrestrained fit hands buried carbons "large, arbitrary
+    charges that happen to cancel" (``charges/resp.py``'s own words for why
+    the restraint exists), and pulling those back toward zero can move a
+    heavy atom by several tenths of an electron. That used to be asserted as
+    a bug (max diff < 0.2 e); it is RESP working as designed. What must still
+    hold is the direction (never away from zero) and the chemistry (no sign
+    flip on a terminal carbon), so that is what this checks instead.
+    """
     charges = {}
     for scheme in ("chelpg", "resp"):
         outdir = tmp_path / scheme
@@ -314,8 +328,14 @@ def test_resp_and_chelpg_broadly_agree_on_butane(butane_pdb, butane_itp, tmp_pat
         )
         payload = json.loads((outdir / "04_charges" / "charges.json").read_text())
         charges[scheme] = np.array([a["charge_after"] for a in payload["atoms"]])
+        assert payload["total_after"] == pytest.approx(0.0, abs=1e-6)
 
-    # RESP restrains the buried carbons, so the two differ; they must still
-    # agree on the sign of every terminal carbon and be within 0.2 e overall.
-    assert np.abs(charges["chelpg"] - charges["resp"]).max() < 0.2
+    topology = read_topology(butane_itp)
+    heavy = [i for i, atom in enumerate(topology.atoms) if element_of(topology, atom.nr) != "H"]
+
+    # The restraint only ever pulls toward zero; 1e-3 is slack for the fit's
+    # own numerical tolerance, not room for it to grow a charge.
+    assert np.all(np.abs(charges["resp"][heavy]) <= np.abs(charges["chelpg"][heavy]) + 1e-3)
+    # atoms 1 and 11 (0-based 0 and 10) are the terminal carbons.
     assert np.sign(charges["chelpg"][0]) == np.sign(charges["resp"][0])
+    assert np.sign(charges["chelpg"][10]) == np.sign(charges["resp"][10])
