@@ -317,6 +317,13 @@ def test_resp_shrinks_heavy_atom_charges_relative_to_chelpg(
     this test (ffrefine task-14 report, round 2). This is calibrated for
     HF/STO-3G butane specifically -- the only level and molecule this test
     uses -- not a general property of RESP vs CHELPG.
+
+    The band is two-sided (``0.25 <= ratio <= 0.6``). An upper bound alone
+    passed a ``cmd_charges`` that dropped ``nm_to_bohr`` from the RESP
+    wiring: every ``1/r`` then comes out about 18.9 times too large, the fit
+    shrinks every charge to match, and the terminal carbons land at ~0.05 of
+    CHELPG -- "shrunk", so the old one-sided check was satisfied (final
+    review, ruling R23).
     """
     charges = {}
     for scheme in ("chelpg", "resp"):
@@ -356,8 +363,114 @@ def test_resp_shrinks_heavy_atom_charges_relative_to_chelpg(
     assert np.sign(charges["chelpg"][10]) == np.sign(charges["resp"][10])
     # The upper bound above cannot distinguish a working restraint from a
     # disabled one (the MK grid alone already shrinks every carbon a little).
-    # This lower bound can: with the restraint on, the terminal carbons land
-    # at ~0.39/0.35 of the CHELPG magnitude; with it off, ~0.93/0.88. 0.6 has
-    # margin on both sides (see the docstring for the measured ratios).
-    assert np.abs(charges["resp"][0]) <= 0.6 * np.abs(charges["chelpg"][0])
-    assert np.abs(charges["resp"][10]) <= 0.6 * np.abs(charges["chelpg"][10])
+    # This two-sided band can: with the restraint on, the terminal carbons
+    # land at ~0.39/0.35 of the CHELPG magnitude; with it off, ~0.93/0.88;
+    # with the bohr conversion dropped from the RESP wiring, ~0.05. Both
+    # edges have margin (see the docstring for the measured ratios).
+    for i in (0, 10):
+        ratio = np.abs(charges["resp"][i]) / np.abs(charges["chelpg"][i])
+        assert 0.25 <= ratio <= 0.6, f"atom {i + 1}: |RESP|/|CHELPG| = {ratio:.3f}"
+
+
+# CODATA 2018, written out so this file's arithmetic does not lean on
+# ffrefine.units, which is part of what the RRMS tests below check.
+BOHR_IN_NM = 0.0529177210903
+
+
+def _write_chelpg_vpot(path, atoms_bohr, grid_bohr, v):
+    """Write a ``.vpot`` in the layout a CHELPG run leaves: ``V x y z``, bohr."""
+    lines = [f"{len(atoms_bohr):6d} {len(grid_bohr):6d}"]
+    lines += [f"   {x: .10E} {y: .10E} {z: .10E}" for x, y, z in atoms_bohr]
+    lines += [f"   {p: .10E} {x: .10E} {y: .10E} {z: .10E}" for p, (x, y, z) in zip(v, grid_bohr)]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _shell_points_bohr(atoms_bohr, n=400, seed=0):
+    """Points on shells well outside the molecule, so none sits on an atom."""
+    rng = np.random.default_rng(seed)
+    directions = rng.normal(size=(n, 3))
+    directions /= np.linalg.norm(directions, axis=1)[:, None]
+    centre = atoms_bohr.mean(axis=0)
+    radius = np.linalg.norm(atoms_bohr - centre, axis=1).max() + 4.0
+    return centre + directions * radius * rng.uniform(1.0, 1.5, size=(n, 1))
+
+
+def _inverse_distances_bohr(atoms_bohr, grid_bohr):
+    return 1.0 / np.linalg.norm(grid_bohr[:, None, :] - atoms_bohr[None, :, :], axis=-1)
+
+
+def test_the_rrms_helper_scores_charges_against_a_potential_in_atomic_units(tmp_path, butane_pdb):
+    """The helper ``cmd_charges`` uses for every RRMS it reports.
+
+    The potential here is made from known charges, in bohr and Hartree/e, so
+    the exact answers are known: the true charges score 0, half of them score
+    exactly 0.5, none score 1. Dropping the nm -> bohr conversion inside the
+    helper multiplies every ``1/r`` by about 18.9, and the true charges would
+    then score about 17.9 (final review, ruling R23, mutant 2).
+    """
+    from ffrefine.cli import _rrms_on_orca_grid
+    from ffrefine.io.structure import read_pdb
+
+    s = read_pdb(butane_pdb)
+    atoms_bohr = s.coords / BOHR_IN_NM
+    grid_bohr = _shell_points_bohr(atoms_bohr)
+    truth = np.array([-0.4, 0.1, 0.1, 0.1, 0.2, -0.05, -0.05] * 2)
+    v = _inverse_distances_bohr(atoms_bohr, grid_bohr) @ truth
+    _write_chelpg_vpot(tmp_path / "esp.vpot", atoms_bohr, grid_bohr, v)
+
+    scores, npoints = _rrms_on_orca_grid(
+        tmp_path / "esp.vpot",
+        s.coords,
+        {"truth": truth, "half": truth / 2.0, "none": np.zeros(14)},
+    )
+
+    assert npoints == len(grid_bohr)
+    assert scores["truth"] == pytest.approx(0.0, abs=1e-8)
+    assert scores["half"] == pytest.approx(0.5, rel=1e-8)
+    assert scores["none"] == pytest.approx(1.0, rel=1e-12)
+
+
+@pytest.mark.needs_orca
+def test_the_rrms_helper_agrees_with_an_independent_fit_on_orcas_own_grid(
+    tmp_path, butane_pdb, orca_bin
+):
+    """A pinned, independently known RRMS from a real ORCA run.
+
+    ORCA's CHELPG charges are the total-charge-constrained least-squares fit
+    to the potential on the grid it writes to ``esp.vpot`` (probe,
+    2026-09-21: an independent fit reproduces them to 3e-8 e). So the RRMS
+    of ORCA's charges is the minimum RRMS on that grid, which this test
+    computes from the raw file -- its own atom coordinates, in bohr, with no
+    ffrefine parser and no unit conversion -- and requires the helper to
+    reproduce from the structure's nm coordinates.
+    """
+    from ffrefine.cli import _rrms_on_orca_grid
+    from ffrefine.config import discover_binaries
+    from ffrefine.io.structure import read_pdb
+    from ffrefine.qm.orca import parse_chelpg_charges, run_esp_job
+
+    s = read_pdb(butane_pdb)
+    run_esp_job(discover_binaries({"orca": orca_bin}), s, s.coords, tmp_path, "! HF STO-3G", 0, 1)
+    orca_charges = parse_chelpg_charges(tmp_path / "esp.chelpg.xyz")
+
+    lines = (tmp_path / "esp.vpot").read_text().splitlines()
+    natoms, npoints = (int(x) for x in lines[0].split()[:2])
+    atoms_bohr = np.array([[float(x) for x in ln.split()[:3]] for ln in lines[1 : 1 + natoms]])
+    rows = np.array(
+        [[float(x) for x in ln.split()[:4]] for ln in lines[1 + natoms : 1 + natoms + npoints]]
+    )
+    v, grid_bohr = rows[:, 0], rows[:, 1:4]
+    inv_r = _inverse_distances_bohr(atoms_bohr, grid_bohr)
+    bordered = np.zeros((natoms + 1, natoms + 1))
+    bordered[:natoms, :natoms] = inv_r.T @ inv_r
+    bordered[:natoms, natoms] = bordered[natoms, :natoms] = 1.0
+    least_squares = np.linalg.solve(bordered, np.append(inv_r.T @ v, 0.0))[:natoms]
+    minimum_rrms = float(np.sqrt(((v - inv_r @ least_squares) ** 2).sum() / (v**2).sum()))
+
+    # The premise: ORCA's charges are that fit, to the 8 decimals it writes.
+    assert least_squares == pytest.approx(orca_charges, abs=1e-6)
+
+    scores, count = _rrms_on_orca_grid(tmp_path / "esp.vpot", s.coords, {"orca": orca_charges})
+
+    assert count == npoints
+    assert scores["orca"] == pytest.approx(minimum_rrms, rel=1e-6)

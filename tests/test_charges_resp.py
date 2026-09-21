@@ -3,16 +3,14 @@ import pytest
 
 from ffrefine.charges.equivalence import average_within_groups, equivalent_hydrogen_groups
 from ffrefine.charges.esp import inverse_distances, normal_equations, potential_from_charges
-from ffrefine.charges.grid import mk_grid
 from ffrefine.charges.resp import RESP_A_STAGE1, RESP_B, resp_fit
 from ffrefine.config import discover_binaries
 from ffrefine.errors import ValidationError
 from ffrefine.io.structure import read_pdb
 from ffrefine.io.topology import read_topology
-from ffrefine.io.validate import adopt_topology_naming, element_of
-from ffrefine.qm.orca import parse_chelpg_charges, run_esp_job, run_vpot
+from ffrefine.io.validate import adopt_topology_naming
+from ffrefine.qm.orca import parse_chelpg_charges, run_esp_job
 from ffrefine.qm.xtb import derive_charge
-from ffrefine.units import nm_to_bohr
 
 
 def _case(seed: int = 0, natoms: int = 5):
@@ -232,17 +230,26 @@ def test_unrestrained_resp_on_our_own_grid_reproduces_orca_chelpg(
 ):
     """End-to-end check of the grid, orca_vpot, units and the fit together.
 
-    Does not go through the CLI, because the CLI has no way to switch the
-    restraint off. With ``a_stage1 = a_stage2 = 0``, ``resp_fit`` is just a
-    constrained least-squares ESP fit -- the same problem ORCA's own CHELPG
-    solves, just on a different (MK, not Breneman) grid. If the MK grid, the
-    ``orca_vpot`` invocation, the bohr conversion, or the fit itself were
-    wrong, this fit would not land anywhere near ORCA's own CHELPG answer;
-    agreeing to within 0.06 e is the strongest evidence available that the
-    whole RESP wiring in ``cmd_charges`` computes the right numbers, with the
-    restraint's own (expected, large) effect on buried atoms excluded from
-    the comparison.
+    Calls :func:`ffrefine.cli._resp_charges_on_mk_grid` -- the very function
+    ``cmd_charges`` calls -- with the restraint switched off. An earlier
+    version of this test re-implemented that wiring instead of calling it,
+    so dropping ``nm_to_bohr`` from ``cmd_charges`` shipped RESP charges
+    about eight times too small while this test kept passing on its own copy
+    (final review, ruling R23).
+
+    With ``a_stage1 = a_stage2 = 0``, ``resp_fit`` is just a constrained
+    least-squares ESP fit -- the same problem ORCA's own CHELPG solves, on a
+    different (MK, not Breneman) grid. If the MK grid, the ``orca_vpot``
+    invocation, the bohr conversion, or the fit itself were wrong, this fit
+    would not land anywhere near ORCA's own CHELPG answer; agreeing to within
+    0.06 e is the strongest evidence available that the RESP wiring computes
+    the right numbers, with the restraint's own (expected, large) effect on
+    buried atoms excluded from the comparison. A missing bohr conversion
+    scales every ``1/r`` by about 18.9 and every unrestrained charge down by
+    the same factor, which misses by about 0.4 e on the terminal carbons.
     """
+    from ffrefine.cli import _resp_charges_on_mk_grid
+
     binaries = discover_binaries({"orca": orca_bin})
     topology = read_topology(butane_itp)
     structure = adopt_topology_naming(read_pdb(butane_pdb), topology)
@@ -265,29 +272,19 @@ def test_unrestrained_resp_on_our_own_grid_reproduces_orca_chelpg(
     raw_chelpg = parse_chelpg_charges(tmp_path / "esp.chelpg.xyz")
     chelpg = average_within_groups(raw_chelpg, groups)
 
-    elements = [element_of(topology, atom.nr) for atom in topology.atoms]
-    zero_based = [[nr - 1 for nr in group] for group in groups]
-    parents = {
-        n - 1
-        for group in groups
-        for n in topology.bonded_neighbours(group[0])
-        if element_of(topology, n) != "H"
-    }
-    stage2_free = sorted(parents.union(i for g in zero_based for i in g))
-
-    grid_nm = mk_grid(coords_nm, elements, density_per_angstrom2=1.0)
-    v_grid = run_vpot(binaries, base, grid_nm, tmp_path)
-    inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
-
-    result = resp_fit(
-        inv_r,
-        v_grid,
-        restrain=np.array([e != "H" for e in elements]),
-        groups=zero_based,
-        stage2_free=stage2_free,
-        total_charge=float(target_total),
+    result = _resp_charges_on_mk_grid(
+        binaries,
+        base,
+        topology,
+        coords_nm,
+        tmp_path,
+        target_total,
+        1.0,
         a_stage1=0.0,
         a_stage2=0.0,
     )
 
+    assert result.restraint["a_stage1"] == 0.0
+    assert result.restraint["a_stage2"] == 0.0
+    assert result.charges.sum() == pytest.approx(0.0, abs=1e-8)
     assert np.abs(result.charges - chelpg).max() < 0.06

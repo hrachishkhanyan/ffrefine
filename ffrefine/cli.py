@@ -80,6 +80,7 @@ import os
 import re
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -1206,6 +1207,134 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclass
+class RespCharges:
+    """What :func:`_resp_charges_on_mk_grid` produced.
+
+    Attributes:
+        charges: fitted charges in e, shape (natoms,), 0-based topology order.
+        grid: the MK grid's provenance for ``charges.json``.
+        restraint: the restraint constants actually used, and the iteration
+            counts of both stages.
+    """
+
+    charges: np.ndarray
+    grid: dict[str, object]
+    restraint: dict[str, object]
+
+
+def _resp_charges_on_mk_grid(
+    binaries: Binaries,
+    base: Path,
+    topology: Topology,
+    coords_nm: np.ndarray,
+    workdir: Path,
+    target_total: int,
+    esp_density: float,
+    *,
+    a_stage1: float = RESP_A_STAGE1,
+    a_stage2: float = RESP_A_STAGE2,
+) -> RespCharges:
+    """Fit RESP charges on our own MK grid against a finished ESP job.
+
+    The whole RESP wiring, in one place: build the MK grid, evaluate the QM
+    potential on it with ``orca_vpot``, convert both coordinate sets to bohr
+    for :func:`~ffrefine.charges.esp.inverse_distances`, turn the 1-based
+    equivalence groups into 0-based ones and derive the stage-2 free set, then
+    run :func:`~ffrefine.charges.resp.resp_fit`.
+
+    It is a function rather than inline code in :func:`cmd_charges` so the
+    test that proves the wiring right -- with the restraint off, it must
+    reproduce ORCA's own CHELPG charges -- calls the code that ships instead
+    of a copy of it.  A copy is how a dropped ``nm_to_bohr`` once shipped
+    RESP charges about eight times too small past every test (ruling R23).
+
+    Args:
+        binaries: resolved binaries; ``orca_vpot`` is needed.
+        base: the ESP job's base path, from :func:`run_esp_job`.
+        topology: supplies elements, bonds and the equivalence groups.
+        coords_nm: the geometry the ESP job ran on, shape (natoms, 3), nm.
+        workdir: the stage directory ``orca_vpot`` runs in.
+        target_total: the molecular charge, enforced exactly.
+        esp_density: MK grid points per square Angstrom.
+        a_stage1, a_stage2: restraint strengths.  Only a test that needs the
+            unrestrained fit should pass anything but the defaults.
+
+    Returns:
+        The charges, with the grid and restraint provenance.
+
+    Raises:
+        ExternalToolError: ``orca_vpot`` failed.
+        ValidationError: the grid or the fit was refused.
+    """
+    elements = [element_of(topology, atom.nr) for atom in topology.atoms]
+    grid_nm = mk_grid(coords_nm, elements, density_per_angstrom2=esp_density)
+    v_grid = run_vpot(binaries, base, grid_nm, workdir)
+    inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
+    groups = equivalent_hydrogen_groups(topology)
+    zero_based = [[nr - 1 for nr in group] for group in groups]
+    parents = {
+        n - 1
+        for group in groups
+        for n in topology.bonded_neighbours(group[0])
+        if element_of(topology, n) != "H"
+    }
+    stage2_free = sorted(parents.union(i for g in zero_based for i in g))
+    result = resp_fit(
+        inv_r,
+        v_grid,
+        restrain=np.array([e != "H" for e in elements]),
+        groups=zero_based,
+        stage2_free=stage2_free,
+        total_charge=float(target_total),
+        a_stage1=a_stage1,
+        a_stage2=a_stage2,
+    )
+    return RespCharges(
+        charges=result.charges,
+        grid={
+            "npoints": int(len(grid_nm)),
+            "density_per_angstrom2": float(esp_density),
+            "shell_scales": list(MK_SHELL_SCALES),
+            "radii_angstrom": {e: VDW_RADII_ANGSTROM[e] for e in sorted(set(elements))},
+        },
+        restraint={
+            "a_stage1": float(a_stage1),
+            "a_stage2": float(a_stage2),
+            "b": RESP_B,
+            "iterations": list(result.iterations),
+        },
+    )
+
+
+def _rrms_on_orca_grid(
+    vpot_path: Path, coords_nm: np.ndarray, charge_sets: dict[str, np.ndarray]
+) -> tuple[dict[str, float], int]:
+    """RRMS of each charge set against the QM potential on ORCA's CHELPG grid.
+
+    Every set is scored on the same grid -- the ``<base>.vpot`` the ESP job
+    wrote -- so the numbers are comparable with each other and across the two
+    charge schemes.  The grid comes back from :func:`read_chelpg_vpot` in nm
+    and the atoms are in nm; both go to bohr here, because the potential is
+    in Hartree/e and ``1/r`` must be in 1/bohr to match it.
+
+    Args:
+        vpot_path: the ESP job's ``<base>.vpot``.
+        coords_nm: the geometry the ESP job ran on, shape (natoms, 3), nm.
+        charge_sets: name -> charges in e, 0-based topology order.
+
+    Returns:
+        ``(rrms_by_name, npoints)``.
+    """
+    grid_nm, v_ref = read_chelpg_vpot(vpot_path)
+    inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
+    scores = {
+        name: rrms(v_ref, potential_from_charges(inv_r, np.asarray(q, float)))
+        for name, q in charge_sets.items()
+    }
+    return scores, int(len(v_ref))
+
+
 def cmd_charges(args: argparse.Namespace) -> int:
     """Fit partial charges to an ORCA electrostatic potential (spec section 5).
 
@@ -1290,43 +1419,15 @@ def cmd_charges(args: argparse.Namespace) -> int:
         raw = parse_chelpg_charges(Path(str(base) + ".chelpg.xyz"))
         raw = average_within_groups(raw, groups)
     else:
-        elements = [element_of(topology, atom.nr) for atom in topology.atoms]
-        grid_nm_fit = mk_grid(coords_nm, elements, density_per_angstrom2=args.esp_density)
-        v_grid = run_vpot(binaries, base, grid_nm_fit, workdir)
-        inv_r_fit = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm_fit))
-        zero_based = [[nr - 1 for nr in group] for group in groups]
-        parents = {
-            n - 1
-            for group in groups
-            for n in topology.bonded_neighbours(group[0])
-            if element_of(topology, n) != "H"
-        }
-        stage2_free = sorted(parents.union(i for g in zero_based for i in g))
-        result = resp_fit(
-            inv_r_fit,
-            v_grid,
-            restrain=np.array([e != "H" for e in elements]),
-            groups=zero_based,
-            stage2_free=stage2_free,
-            total_charge=float(target_total),
+        fitted = _resp_charges_on_mk_grid(
+            binaries, base, topology, coords_nm, workdir, target_total, args.esp_density
         )
-        raw = result.charges
-        grid_provenance = {
-            "npoints": int(len(grid_nm_fit)),
-            "density_per_angstrom2": float(args.esp_density),
-            "shell_scales": list(MK_SHELL_SCALES),
-            "radii_angstrom": {e: VDW_RADII_ANGSTROM[e] for e in sorted(set(elements))},
-        }
-        restraint_provenance = {
-            "a_stage1": RESP_A_STAGE1,
-            "a_stage2": RESP_A_STAGE2,
-            "b": RESP_B,
-            "iterations": list(result.iterations),
-        }
+        raw = fitted.charges
+        grid_provenance = fitted.grid
+        restraint_provenance = fitted.restraint
 
-    grid_nm, v_ref = read_chelpg_vpot(Path(str(base) + ".vpot"))
-    inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
-    fit_rrms = rrms(v_ref, potential_from_charges(inv_r, raw))
+    scores, npoints = _rrms_on_orca_grid(Path(str(base) + ".vpot"), coords_nm, {"fitted": raw})
+    fit_rrms = scores["fitted"]
     if fit_rrms > 0.5:
         _warn(
             f"the ESP fit reproduces the QM potential poorly (RRMS {fit_rrms:.3f}). Point "
@@ -1383,7 +1484,7 @@ def cmd_charges(args: argparse.Namespace) -> int:
             "charge": int(target_total),
             "uhf": int(args.uhf),
             "equivalence_groups": groups,
-            "npoints": int(len(v_ref)),
+            "npoints": npoints,
             "grid": grid_provenance,
             "restraint": restraint_provenance,
         },
