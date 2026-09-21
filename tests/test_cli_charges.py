@@ -129,7 +129,9 @@ def test_chelpg_end_to_end_writes_a_usable_topology(
     payload = json.loads((outdir / "04_charges" / "charges.json").read_text())
     assert len(payload["atoms"]) == 14
     assert payload["total_after"] == pytest.approx(0.0, abs=1e-6)
-    assert payload["rrms"] > 0.0
+    assert payload["rrms_written"] > 0.0
+    assert payload["rrms_fitted"] > 0.0
+    assert payload["rrms_before"] > 0.0
     assert payload["provenance"]["scheme"] == "chelpg"
 
     charged = read_topology(outdir / "04_charges" / "molecule_charged.itp")
@@ -165,6 +167,11 @@ def test_selected_mode_leaves_unselected_atoms_alone(butane_pdb, butane_itp, tmp
     assert charged.atoms[0].charge != original.atoms[0].charge
     assert charged.atoms[7].charge == original.atoms[7].charge  # C3, far from the change
     assert sum(a.charge for a in charged.atoms) == pytest.approx(0.0, abs=1e-6)
+
+    # Selecting one atom writes a topology that is mostly the input's charges,
+    # so its RRMS is not the fitted set's (ruling R20).
+    payload = json.loads((outdir / "04_charges" / "charges.json").read_text())
+    assert payload["rrms_written"] > payload["rrms_fitted"]
 
 
 def test_run_skips_charges_when_none_was_asked_for(butane_pdb, butane_itp, tmp_path, capsys):
@@ -474,3 +481,124 @@ def test_the_rrms_helper_agrees_with_an_independent_fit_on_orcas_own_grid(
 
     assert count == npoints
     assert scores["orca"] == pytest.approx(minimum_rrms, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# cmd_charges end to end without ORCA
+# ---------------------------------------------------------------------------
+
+BUTANE_ESP = np.array(
+    [-0.40, 0.09, 0.09, 0.09, 0.20, -0.035, -0.035, 0.20, -0.035, -0.035, -0.40, 0.09, 0.09, 0.09]
+)
+"""Stand-in "ORCA" charges for butane: sum to zero, equal within each
+equivalence group (so averaging leaves them alone), and unlike the fixture's
+own charges, so a selected-mode result mixes two genuinely different sets."""
+
+
+class FakeEsp:
+    """What the fake ESP job wrote, and an independent RRMS against it."""
+
+    def __init__(self) -> None:
+        self.chelpg = BUTANE_ESP.copy()
+        self.calls = 0
+        self.atoms_bohr: np.ndarray | None = None
+        self.grid_bohr: np.ndarray | None = None
+        self.v: np.ndarray | None = None
+
+    def rrms(self, charges) -> float:
+        """RRMS from the arrays the fake wrote, in bohr, with no ffrefine code."""
+        inv_r = _inverse_distances_bohr(self.atoms_bohr, self.grid_bohr)
+        fit = inv_r @ np.asarray(charges, float)
+        return float(np.sqrt(((self.v - fit) ** 2).sum() / (self.v**2).sum()))
+
+
+@pytest.fixture
+def fake_esp(monkeypatch):
+    """Stand in for the ORCA ESP job, so cmd_charges runs end to end without ORCA.
+
+    Writes an ``esp.chelpg.xyz`` carrying ``FakeEsp.chelpg`` and an
+    ``esp.vpot`` whose potential those same charges produce exactly, in the
+    layouts ORCA uses. Tests pass ``--charge-geom input`` so xtb is not
+    needed either.
+    """
+    import ffrefine.cli as cli
+
+    fake = FakeEsp()
+
+    def fake_run_esp_job(binaries, structure, coords_nm, workdir, keywords, **kwargs):
+        from pathlib import Path
+
+        workdir = Path(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        fake.calls += 1
+        fake.atoms_bohr = np.asarray(coords_nm, float) / BOHR_IN_NM
+        fake.grid_bohr = _shell_points_bohr(fake.atoms_bohr)
+        fake.v = _inverse_distances_bohr(fake.atoms_bohr, fake.grid_bohr) @ fake.chelpg
+        _write_chelpg_vpot(workdir / "esp.vpot", fake.atoms_bohr, fake.grid_bohr, fake.v)
+        lines = [str(len(fake.chelpg)), "# ORCA CHELPG point charges xyz file"]
+        for element, (x, y, z), q in zip(structure.elements, coords_nm * 10.0, fake.chelpg):
+            lines.append(f"{element:<2s} {x:12.6f} {y:12.6f} {z:12.6f} {q:12.8f}")
+        (workdir / "esp.chelpg.xyz").write_text("\n".join(lines) + "\n")
+        return workdir / "esp"
+
+    monkeypatch.setattr(cli, "run_esp_job", fake_run_esp_job)
+    monkeypatch.setattr(cli, "_orca_version", lambda binaries: "fake ORCA")
+    return fake
+
+
+def _charges_json(outdir):
+    return json.loads((outdir / "04_charges" / "charges.json").read_text())
+
+
+def _summary_line(out: str) -> str:
+    return next(line for line in out.splitlines() if line.startswith("chelpg charges:"))
+
+
+def test_selected_mode_reports_the_rrms_of_the_charges_it_wrote(
+    butane_pdb, butane_itp, tmp_path, fake_esp, capsys
+):
+    """Final review I1 (ruling R20): the headline RRMS must describe the written topology.
+
+    Selecting C1 alone writes a topology whose charges mostly come from the
+    input, not from the fit. The fully fitted set reproduces this potential
+    exactly (RRMS 0); the written set reproduces it worse than the input
+    topology did. The old code printed and recorded the fitted set's 0.0000
+    next to that topology, and never warned.
+    """
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-atoms", "1", "--charge-geom", "input")
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+
+    payload = _charges_json(outdir)
+    written = [a["charge_after"] for a in payload["atoms"]]
+    before = [a["charge_before"] for a in payload["atoms"]]
+
+    assert payload["rrms_fitted"] == pytest.approx(0.0, abs=1e-6)
+    assert payload["rrms_written"] == pytest.approx(fake_esp.rrms(written), rel=1e-6)
+    assert payload["rrms_before"] == pytest.approx(fake_esp.rrms(before), rel=1e-6)
+    # The case the review measured on real butane (0.65 / 1.70 / 1.33): the
+    # written topology fits worse than the one it replaced.
+    assert payload["rrms_written"] > payload["rrms_before"] > 0.5
+    assert f"RRMS {payload['rrms_written']:.4f}" in _summary_line(captured.out)
+    assert "poorly" in captured.err
+    assert f"{payload['rrms_written']:.3f}" in captured.err
+
+
+def test_all_mode_written_and_fitted_rrms_agree(butane_pdb, butane_itp, tmp_path, fake_esp, capsys):
+    """With every atom replaced, the written set is the fitted set up to rounding."""
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(butane_pdb, butane_itp, outdir, "--charge-mode", "all", "--charge-geom", "input")
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+
+    payload = _charges_json(outdir)
+    assert payload["rrms_written"] == pytest.approx(payload["rrms_fitted"], abs=1e-3)
+    assert payload["rrms_before"] == pytest.approx(
+        fake_esp.rrms([a["charge_before"] for a in payload["atoms"]]), rel=1e-6
+    )
+    assert "poorly" not in captured.err

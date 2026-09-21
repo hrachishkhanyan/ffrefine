@@ -162,13 +162,26 @@ changed. `--charge-mode selected` is the default, so only atoms 1 and 11 (the
 terminal carbons) are replaced; the rest of each carbon's charge group absorbs
 the change so the group's own net charge stays put.
 
-The run prints an RRMS: how well the fitted charges reproduce ORCA's own
-electrostatic potential. On this fixture at the default HF/6-31G* it comes out
-around 0.7, well above the 0.5 warning threshold -- and that is expected, not
-a bug. Butane's potential is weak and dominated by its quadrupole, which point
-charges are a poor model for; an independent least-squares fit on our own grid
+The run prints three RRMS values, each measuring how well a set of charges
+reproduces ORCA's own electrostatic potential, all on the same grid: the
+charges **actually written** to the topology (the headline number, and the one
+the 0.5 warning looks at), the fully fitted set, and the input topology's own
+charges. `charges.json` keeps all three, as `rrms_written`, `rrms_fitted` and
+`rrms_before`.
+
+On this fixture at the default HF/6-31G* the fully fitted set comes out around
+0.74, above the 0.5 warning threshold -- and that is expected, not a bug.
+Butane's potential is weak and dominated by its quadrupole, which point charges
+are a poor model for; an independent least-squares fit on our own grid
 reproduces ORCA's own CHELPG charges to within about 0.06 e, confirming the
 fitting code is right and the poor RRMS is the molecule's, not ours.
+
+In `selected` mode the written charges can score worse than both: with
+`--charge-atoms 1,11` above, the written topology's RRMS is about 1.83, against
+1.36 for the input topology it replaces. A topology mixing a few ESP-fitted
+charges with force-field charges reproduces the potential neither way. That is
+why the headline number and the warning describe the written charges: the
+number that matters is the one describing the file you will use.
 
 **Charges come before the torsion, not after.** The fitted torsion absorbs
 whatever the 1-4 electrostatics do not already account for, so a torsion fitted

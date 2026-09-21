@@ -198,8 +198,17 @@ fit **RRMS is reported for both schemes**, computed against the same reference g
 asks for RRMS only under RESP, but a user choosing between the two schemes wants a comparable
 number, and here it is free.
 
+Three charge sets are scored on that grid: the charges **written** to the topology, the fully
+**fitted** set, and the input topology's charges (**before**). The written set's RRMS is the
+headline number and the one the 0.5 warning applies to. In `all` mode it equals the fitted
+set's up to rounding; in `selected` mode it can be worse than both, because the written
+topology mixes a few fitted charges with force-field ones, and reporting the fitted set's
+number next to that topology would describe charges that were never written (final-review
+ruling R20).
+
 `charges.json` records, per atom: `nr`, `name`, `element`, `charge_before`, `charge_after`,
-and `source` (`fitted`, `redistributed`, `unchanged`); plus both totals, the RRMS, and
+and `source` (`fitted`, `redistributed`, `unchanged`); plus both totals, the three RRMS values
+(`rrms_written`, `rrms_fitted`, `rrms_before`), and
 provenance: scheme, level of theory, geometry source, ORCA version, grid settings, the radii
 used, the restraint constants, and the equivalence groups.
 
@@ -349,7 +358,7 @@ Every avoidable ambiguity is a refusal with a named remedy.
 | ORCA nonzero exit, or no CHELPG file | Refuse, with the tail of the output |
 | ORCA stdout lacks `ORCA TERMINATED NORMALLY`, or says `SCF NOT CONVERGED` (ORCA exits 0 then) | Refuse, naming the condition and `esp.stdout` |
 | `--charge-mode all` on a CGenFF topology | Warn, per spec 5.3, into the log and `charges.json` |
-| RRMS above 0.5 | Warn. A poor fit is a judgement about the molecule, not a malfunction |
+| RRMS of the written charges above 0.5 | Warn, quoting all three RRMS values. A poor fit is a judgement about the molecule (or, in `selected` mode, about mixing fitted and force-field charges), not a malfunction |
 
 ---
 

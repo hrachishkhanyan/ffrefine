@@ -1426,15 +1426,6 @@ def cmd_charges(args: argparse.Namespace) -> int:
         grid_provenance = fitted.grid
         restraint_provenance = fitted.restraint
 
-    scores, npoints = _rrms_on_orca_grid(Path(str(base) + ".vpot"), coords_nm, {"fitted": raw})
-    fit_rrms = scores["fitted"]
-    if fit_rrms > 0.5:
-        _warn(
-            f"the ESP fit reproduces the QM potential poorly (RRMS {fit_rrms:.3f}). Point "
-            "charges may simply be a poor model for this molecule; treat the result with "
-            "suspicion rather than assuming a bug."
-        )
-
     if selected_atoms is None and _looks_like_cgenff(topology):
         _warn(
             "--charge-mode all replaces every charge on what looks like a CGenFF topology. "
@@ -1457,13 +1448,39 @@ def cmd_charges(args: argparse.Namespace) -> int:
     charged_itp = workdir / "molecule_charged.itp"
     write_charged_topology(args.topology, assignments, charged_itp)
 
+    # Ruling R20: in selected mode the written topology carries only a few
+    # fitted charges, so the fitted set's RRMS describes charges that were
+    # never written. All three sets are scored on the same grid; the one the
+    # user is shown and warned about is the one in the topology.
+    scores, npoints = _rrms_on_orca_grid(
+        Path(str(base) + ".vpot"),
+        coords_nm,
+        {
+            "fitted": raw,
+            "written": np.array([a.after for a in assignments]),
+            "before": np.array([a.before for a in assignments]),
+        },
+    )
+    if scores["written"] > 0.5:
+        _warn(
+            f"the charges written to {charged_itp.name} reproduce the QM electrostatic "
+            f"potential poorly: RRMS {scores['written']:.3f} (the fully fitted set scores "
+            f"{scores['fitted']:.3f}, the input topology's charges {scores['before']:.3f}). "
+            "If the fitted set scores poorly too, point charges may simply be a poor model "
+            "for this molecule; if only the written set does, the charges kept from the "
+            "topology do not fit this potential, which --charge-mode selected cannot "
+            "change. Treat the result with suspicion rather than assuming a bug."
+        )
+
     payload = {
         "molecule": topology.name,
         "natoms": topology.natoms,
         "total_before": float(sum(a.before for a in assignments)),
         "total_after": float(sum(a.after for a in assignments)),
         "target_total": int(target_total),
-        "rrms": float(fit_rrms),
+        "rrms_written": float(scores["written"]),
+        "rrms_fitted": float(scores["fitted"]),
+        "rrms_before": float(scores["before"]),
         "atoms": [
             {
                 "nr": a.nr,
@@ -1495,7 +1512,9 @@ def cmd_charges(args: argparse.Namespace) -> int:
     changed = sum(1 for a in assignments if a.source != "unchanged")
     print(
         f"{args.charge_scheme} charges: {changed} of {topology.natoms} atoms changed, "
-        f"ESP fit RRMS {fit_rrms:.4f}, written to {charged_itp}"
+        f"ESP RRMS {scores['written']:.4f} for the charges written (fully fitted set "
+        f"{scores['fitted']:.4f}, input topology {scores['before']:.4f}), written to "
+        f"{charged_itp}"
     )
     print(f"to use them, pass -p {charged_itp} to the remaining stages")
     return 0
