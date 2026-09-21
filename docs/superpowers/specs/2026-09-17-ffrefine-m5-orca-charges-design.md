@@ -231,7 +231,8 @@ warns about. Charges first is also what ffTK and the Amber workflows do.
 charges -> scan -> mmscan -> fit -> validate
 ```
 
-The QM scan does not depend on MM charges, so only mmscan, fit and validate are affected.
+The QM scan does not depend on MM charges, so physically only mmscan, fit and validate are
+affected (`--resume` reruns the scan as well; see below).
 
 ### The refined topology reaches later stages by path, not by magic
 
@@ -240,16 +241,21 @@ file for the remaining stages, keeping the user's own `-p` as `args.input_topolo
 `00_input/` always copies and `model.json` always names the user's input, never a stage
 output, and `validation.json` records the topology the "before" RMSE was actually measured
 against (`before_topology`), whether it is this outdir's charges output (`charges_refined`),
-and the user's input (`input_topology`) (final-review ruling R24). Stages invoked on their own use `-p` exactly as given; to work
-step by step, the user passes the charged file, and `charges` prints the exact command.
+and the user's input (`input_topology`) (final-review ruling R24). Stages invoked on their
+own use `-p` exactly as given; to work step by step, the user passes the charged file, and
+`charges` prints the exact command.
 
 Two alternatives were rejected. Letting later stages auto-discover `04_charges/` makes `-p`
 stop meaning what it says and lets a stale charges output silently change a standalone
 mmscan. Threading a `--charges-from charges.json` through every stage requires all four to
 learn to apply charge edits, for no gain over swapping a path.
 
-`--resume` needs no new code: every stage already hashes `args.topology`, so pointing it at a
-different file recomputes exactly the stages that depend on it.
+`--resume` needs no new code: every stage already hashes the *content* of `args.topology`, so
+pointing it at a different file, or changing the charges in it, reruns every stage that hashes
+it. That is not exactly the stages that depend on the charges. mmscan, fit and validate do; the
+xtb QM scan does not -- xtb never sees MM charges, and the integer molecular charge it is given
+is unchanged -- but it hashes the topology file alongside the structure, so a charge change
+reruns the scan as well. That is safe, only wasteful, and the hashing is left as it is.
 
 ### `run` without charge work still works
 
