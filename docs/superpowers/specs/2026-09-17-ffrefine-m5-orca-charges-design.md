@@ -293,8 +293,10 @@ is spread evenly over the unselected atoms in that group, falling back to unsele
 atoms bonded to a selected atom in that group, and refused when neither exists. This keeps
 each charge group's net charge intact — that is what CHARMM charge groups are for. After all
 per-group residuals are absorbed, any remaining global offset (e.g. from an explicit
-`--charge` differing from the topology's sum) is spread over the pooled recipients. Every
-reassignment is logged atom by atom.
+`--charge` differing from the topology's sum) is spread over the pooled recipients. A nonzero
+global offset with no recipients anywhere (every selected group has zero residual and none
+has a recipient) is refused rather than silently misplaced — leaving the molecular total
+wrong would be worse than stopping. Every reassignment is logged atom by atom.
 
 The alternative, freezing the unselected atoms inside the fit as ffTK does, is better physics
 and was considered and rejected for this milestone: spec 5.3 specifies redistribution, and
@@ -310,6 +312,12 @@ else to put it. The final total is asserted to be within 1e-6 of the target inte
 decimals makes every written charge a multiple of 1e-4, so the compensated total is exact
 rather than merely close. (The two compensation strategies yield identical totals to 1e-6,
 differing only in which atom bears the rounding error.)
+
+This compensation step is only allowed to absorb a rounding-sized drift — at most about
+`natoms * 0.5 * 10**-decimals` — and this bound is checked in every mode, including `all`.
+Anything larger is refused rather than folded in, because it means an offset was never placed
+onto a recipient upstream; `all` mode has no legitimate large drift either, since the ESP job
+runs at `charge=target_total` so the fitted charges already sum to it.
 
 The target total comes from `derive_charge` (milestone 4), which reads the topology's own
 `[ atoms ]` sum and refuses one that is not near an integer.

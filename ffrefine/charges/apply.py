@@ -70,6 +70,13 @@ def apply_charges(
     anywhere else to put it. The molecular total is then exact rather than
     merely close.
 
+    That rounding-drift step is only allowed to absorb a rounding-sized
+    drift (at most about ``natoms * 0.5 * 10**-decimals``), in every mode,
+    including ``all``. A larger drift means an offset was never placed onto
+    a recipient upstream, and it is refused rather than silently folded in.
+    There is no legitimate large drift in ``all`` mode: the ESP job runs at
+    ``charge=target_total``, so the fitted charges already sum to it.
+
     Args:
         topology: the parsed molecule, supplying the existing charges, the
             charge groups and the bond graph.
@@ -169,16 +176,21 @@ def apply_charges(
     after = np.round(after, decimals)
     drift = float(target_total) - float(after.sum())
     if abs(drift) > 0.0:
-        # Drift should be rounding-sized only in selected mode with recipients.
-        # In selected mode without recipients or in all mode, the drift step is the path for offsets.
-        if selected is not None and recipients:
-            # Drift should be rounding-sized (max ~0.5 * 10^-decimals per atom)
-            max_rounding_drift = natoms * 0.5 * (10 ** (-decimals))
-            if abs(drift) > max_rounding_drift:
-                raise ValidationError(
-                    f"drift after rounding is {drift:+.8f}, larger than rounding error would cause "
-                    f"(max ~{max_rounding_drift:.8f}); an offset was never placed. This is an internal error."
-                )
+        # After rounding, the drift can only be rounding-sized: each atom's own
+        # rounding moves it by at most half a unit in the last decimal place, so
+        # natoms atoms can drift the total by at most natoms * 0.5 * 10**-decimals
+        # (plus a little float slack). This check runs in every mode, including
+        # ``all``: there is no legitimate large drift there either, since the ESP
+        # job runs at charge=target_total, so the fitted charges already sum to
+        # the target. A larger drift means an offset was never placed onto a
+        # recipient upstream and must not be silently absorbed here.
+        max_rounding_drift = natoms * 0.5 * (10**-decimals) + 1e-9
+        if abs(drift) > max_rounding_drift:
+            raise ValidationError(
+                f"charges drift by {drift:+.8f} e after rounding, more than rounding alone can "
+                f"cause (up to ~{max_rounding_drift:.8f} e for {natoms} atoms); an offset was "
+                "never placed onto a recipient. This is an internal error."
+            )
         # Apply drift to recipients first if available, otherwise largest magnitude atom
         if recipients:
             largest = recipients[int(np.argmax(np.abs(after[recipients])))]
