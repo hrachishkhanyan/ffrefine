@@ -1,10 +1,8 @@
 """Command line interface (spec section 3).
 
 Subcommands: ``scan``, ``mmscan``, ``fit``, ``charges``, ``validate``,
-``run``.  All are implemented.  ``ffrefine charges --charge-scheme chelpg``
-runs end to end; ``--charge-scheme resp`` is registered so the CLI surface
-matches spec section 3, but its fit arrives in a later milestone-5 task and
-is not expected to work yet.
+``run``.  All are implemented.  ``ffrefine charges`` runs both
+``--charge-scheme chelpg`` and ``--charge-scheme resp`` end to end.
 
 Atom-index convention (spec section 8)
 --------------------------------------
@@ -90,6 +88,8 @@ from . import __version__
 from .charges.apply import apply_charges
 from .charges.equivalence import average_within_groups, equivalent_hydrogen_groups
 from .charges.esp import inverse_distances, potential_from_charges, rrms
+from .charges.grid import MK_SHELL_SCALES, VDW_RADII_ANGSTROM, mk_grid
+from .charges.resp import RESP_A_STAGE1, RESP_A_STAGE2, RESP_B, resp_fit
 from .config import Binaries, discover_binaries, load_config
 from .errors import FFRefineError, ValidationError
 from .fit.linear import DEFAULT_ASYMMETRY_TOLERANCE, asymmetry_metric, is_asymmetric
@@ -105,7 +105,7 @@ from .io.prm import write_prm_block
 from .io.structure import Structure, read_structure, write_multimodel_pdb
 from .io.topology import Topology, read_topology
 from .io.topwriter import write_charged_topology, write_refit_topology
-from .io.validate import adopt_topology_naming, validate_structure_topology
+from .io.validate import adopt_topology_naming, element_of, validate_structure_topology
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
 from .mm.validate_fit import validate_refit
@@ -126,6 +126,7 @@ from .qm.orca import (
     read_chelpg_vpot,
     refine_energies,
     run_esp_job,
+    run_vpot,
 )
 from .qm.xtb import derive_charge, optimize_geometry, run_scan, scan_grid
 from .stages import (
@@ -1214,12 +1215,6 @@ def cmd_charges(args: argparse.Namespace) -> int:
     the charges leaves a topology whose torsion was fitted against charges it
     no longer carries.
     """
-    if args.charge_scheme == "resp":
-        raise ValidationError(
-            "--charge-scheme resp is not implemented yet; it arrives later in this "
-            "milestone. --charge-scheme chelpg is the working scheme today."
-        )
-
     selected_atoms = None
     if args.charge_mode == "selected":
         if not args.charge_atoms:
@@ -1287,10 +1282,47 @@ def cmd_charges(args: argparse.Namespace) -> int:
         nprocs=args.nthreads,
         chelpg=True,
     )
-    raw = parse_chelpg_charges(Path(str(base) + ".chelpg.xyz"))
-
     groups = equivalent_hydrogen_groups(topology)
-    raw = average_within_groups(raw, groups)
+    grid_provenance: dict[str, object] | None = None
+    restraint_provenance: dict[str, object] | None = None
+
+    if args.charge_scheme == "chelpg":
+        raw = parse_chelpg_charges(Path(str(base) + ".chelpg.xyz"))
+        raw = average_within_groups(raw, groups)
+    else:
+        elements = [element_of(topology, atom.nr) for atom in topology.atoms]
+        grid_nm_fit = mk_grid(coords_nm, elements, density_per_angstrom2=args.esp_density)
+        v_grid = run_vpot(binaries, base, grid_nm_fit, workdir)
+        inv_r_fit = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm_fit))
+        zero_based = [[nr - 1 for nr in group] for group in groups]
+        parents = {
+            n - 1
+            for group in groups
+            for n in topology.bonded_neighbours(group[0])
+            if element_of(topology, n) != "H"
+        }
+        stage2_free = sorted(parents.union(i for g in zero_based for i in g))
+        result = resp_fit(
+            inv_r_fit,
+            v_grid,
+            restrain=np.array([e != "H" for e in elements]),
+            groups=zero_based,
+            stage2_free=stage2_free,
+            total_charge=float(target_total),
+        )
+        raw = result.charges
+        grid_provenance = {
+            "npoints": int(len(grid_nm_fit)),
+            "density_per_angstrom2": float(args.esp_density),
+            "shell_scales": list(MK_SHELL_SCALES),
+            "radii_angstrom": {e: VDW_RADII_ANGSTROM[e] for e in sorted(set(elements))},
+        }
+        restraint_provenance = {
+            "a_stage1": RESP_A_STAGE1,
+            "a_stage2": RESP_A_STAGE2,
+            "b": RESP_B,
+            "iterations": list(result.iterations),
+        }
 
     grid_nm, v_ref = read_chelpg_vpot(Path(str(base) + ".vpot"))
     inv_r = inverse_distances(nm_to_bohr(coords_nm), nm_to_bohr(grid_nm))
@@ -1352,6 +1384,8 @@ def cmd_charges(args: argparse.Namespace) -> int:
             "uhf": int(args.uhf),
             "equivalence_groups": groups,
             "npoints": int(len(v_ref)),
+            "grid": grid_provenance,
+            "restraint": restraint_provenance,
         },
     }
     _charges_path(args).write_text(json.dumps(payload, indent=2) + "\n", newline="\n")

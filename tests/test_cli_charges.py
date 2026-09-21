@@ -86,27 +86,6 @@ def test_selected_mode_without_atoms_is_refused(butane_pdb, butane_itp, tmp_path
     assert "Traceback" not in err
 
 
-def test_charge_scheme_resp_is_refused_for_now(butane_pdb, butane_itp, tmp_path, capsys):
-    """RESP isn't implemented yet; nothing may silently mislabel a CHELPG fit as RESP."""
-    rc = main(
-        _args(
-            butane_pdb,
-            butane_itp,
-            tmp_path / "out",
-            "--charge-scheme",
-            "resp",
-            "--charge-mode",
-            "all",
-        )
-    )
-
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert err.startswith("error: ")
-    assert "chelpg" in err.lower()
-    assert "Traceback" not in err
-
-
 def test_charges_dry_run_writes_nothing(butane_pdb, butane_itp, tmp_path):
     outdir = tmp_path / "out"
     rc = main(_args(butane_pdb, butane_itp, outdir, "--charge-mode", "all", "--dry-run"))
@@ -270,3 +249,73 @@ def test_run_points_later_stages_at_the_charged_topology(
     )
     assert cli.cmd_run(args) == 0
     assert seen == [str(charged)] * 4
+
+
+@pytest.mark.needs_orca
+def test_resp_end_to_end_gives_equal_methyl_hydrogens(butane_pdb, butane_itp, tmp_path, orca_bin):
+    """Stage 2 constrains the group exactly equal, not merely close."""
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(
+            butane_pdb,
+            butane_itp,
+            outdir,
+            "--charge-scheme",
+            "resp",
+            "--charge-mode",
+            "all",
+            "--charge-geom",
+            "input",
+            "--orca-esp-keywords",
+            "! HF STO-3G",
+            "--esp-density",
+            "1.0",
+            "--nthreads",
+            "1",
+        )
+    )
+    assert rc == 0
+
+    payload = json.loads((outdir / "04_charges" / "charges.json").read_text())
+    assert payload["provenance"]["scheme"] == "resp"
+    assert payload["provenance"]["restraint"]["a_stage1"] == pytest.approx(0.0005)
+    assert payload["provenance"]["grid"]["npoints"] > 500
+    assert payload["total_after"] == pytest.approx(0.0, abs=1e-6)
+
+    charged = read_topology(outdir / "04_charges" / "molecule_charged.itp")
+    assert charged.atoms[1].charge == charged.atoms[2].charge == charged.atoms[3].charge
+
+
+@pytest.mark.needs_orca
+def test_resp_and_chelpg_broadly_agree_on_butane(butane_pdb, butane_itp, tmp_path, orca_bin):
+    """Two schemes on one molecule should not disagree about its chemistry."""
+    charges = {}
+    for scheme in ("chelpg", "resp"):
+        outdir = tmp_path / scheme
+        assert (
+            main(
+                _args(
+                    butane_pdb,
+                    butane_itp,
+                    outdir,
+                    "--charge-scheme",
+                    scheme,
+                    "--charge-mode",
+                    "all",
+                    "--charge-geom",
+                    "input",
+                    "--orca-esp-keywords",
+                    "! HF STO-3G",
+                    "--nthreads",
+                    "1",
+                )
+            )
+            == 0
+        )
+        payload = json.loads((outdir / "04_charges" / "charges.json").read_text())
+        charges[scheme] = np.array([a["charge_after"] for a in payload["atoms"]])
+
+    # RESP restrains the buried carbons, so the two differ; they must still
+    # agree on the sign of every terminal carbon and be within 0.2 e overall.
+    assert np.abs(charges["chelpg"] - charges["resp"]).max() < 0.2
+    assert np.sign(charges["chelpg"][0]) == np.sign(charges["resp"][0])
