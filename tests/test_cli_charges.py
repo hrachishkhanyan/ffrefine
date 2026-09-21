@@ -302,6 +302,21 @@ def test_resp_shrinks_heavy_atom_charges_relative_to_chelpg(
     a bug (max diff < 0.2 e); it is RESP working as designed. What must still
     hold is the direction (never away from zero) and the chemistry (no sign
     flip on a terminal carbon), so that is what this checks instead.
+
+    The plain ``|RESP| <= |CHELPG| + 1e-3`` bound alone cannot tell a working
+    restraint from a missing one: the MK grid differs slightly from ORCA's own
+    CHELPG grid, and that grid difference *alone* already shrinks every carbon
+    a little (measured directly, restraint off: C1 0.367 < 0.395, C5 0.078 <
+    0.082, C8 0.069 < 0.090, C11 0.351 < 0.399 -- all satisfy the ``<=`` bound
+    with the restraint disabled). A lower bound closes that gap. On the two
+    terminal carbons, the restrained fit measures ~0.39 and ~0.35 of the
+    CHELPG magnitude; an unrestrained fit on the same MK grid measures ~0.93
+    and ~0.88. ``0.6`` sits with margin on both sides of that gap and would
+    fail if the restraint were silently disabled -- verified directly by
+    temporarily zeroing ``RESP_A_STAGE1``/``RESP_A_STAGE2`` and re-running
+    this test (ffrefine task-14 report, round 2). This is calibrated for
+    HF/STO-3G butane specifically -- the only level and molecule this test
+    uses -- not a general property of RESP vs CHELPG.
     """
     charges = {}
     for scheme in ("chelpg", "resp"):
@@ -339,3 +354,10 @@ def test_resp_shrinks_heavy_atom_charges_relative_to_chelpg(
     # atoms 1 and 11 (0-based 0 and 10) are the terminal carbons.
     assert np.sign(charges["chelpg"][0]) == np.sign(charges["resp"][0])
     assert np.sign(charges["chelpg"][10]) == np.sign(charges["resp"][10])
+    # The upper bound above cannot distinguish a working restraint from a
+    # disabled one (the MK grid alone already shrinks every carbon a little).
+    # This lower bound can: with the restraint on, the terminal carbons land
+    # at ~0.39/0.35 of the CHELPG magnitude; with it off, ~0.93/0.88. 0.6 has
+    # margin on both sides (see the docstring for the measured ratios).
+    assert np.abs(charges["resp"][0]) <= 0.6 * np.abs(charges["chelpg"][0])
+    assert np.abs(charges["resp"][10]) <= 0.6 * np.abs(charges["chelpg"][10])
