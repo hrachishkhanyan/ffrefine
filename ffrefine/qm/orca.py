@@ -150,6 +150,28 @@ def refine_energies(
     return hartree_to_kj(np.array(out, dtype=float))
 
 
+ESP_ARTEFACTS: tuple[str, ...] = (
+    ".chelpg.xyz",
+    ".vpot",
+    ".gbw",
+    ".densities",
+    ".densitiesinfo",
+)
+"""Suffixes of the ESP job's outputs that later steps read, deleted before each run.
+
+``.chelpg.xyz`` and ``.vpot`` feed the CHELPG charges and the RRMS; ``.gbw``,
+``.densities`` and ``.densitiesinfo`` are what ``orca_vpot`` reads under RESP.
+There is no ``.scfp`` file to delete: that is the density's name inside
+``.densities``.
+"""
+
+ORCA_NORMAL_TERMINATION_MARKER = "ORCA TERMINATED NORMALLY"
+"""Printed at the very end of a run that finished; absent after any error."""
+
+ORCA_SCF_FAILED_MARKER = "SCF NOT CONVERGED"
+"""Printed when the SCF gives up -- and ORCA 6.1.1 still exits 0."""
+
+
 def esp_keyword_line(keywords: str, chelpg: bool) -> str:
     """The ORCA keyword line for an ESP job, adding CHELPG when the scheme needs it."""
     if chelpg and "chelpg" not in keywords.lower():
@@ -175,17 +197,38 @@ def run_esp_job(
     -- ORCA's own grid carrying the QM potential -- which is what lets the
     CHELPG path report a fit RRMS comparable with RESP's.
 
+    **Exit 0 proves nothing here.**  ORCA 6.1.1 exits 0 when its SCF does
+    not converge, prints ``SCF NOT CONVERGED`` and ``ORCA finished by error
+    termination``, and writes no ``.chelpg.xyz`` (probed 2026-09-21 with
+    ``%scf MaxIter 3 end``).  ``04_charges/`` is reused when a stage is
+    re-run into the same outdir, so a check that the output files merely
+    exist would find the previous run's files and return its charges under
+    the new run's keyword line.  Two things close that:
+
+    * every artefact a later step reads (:data:`ESP_ARTEFACTS`) is deleted
+      before ORCA starts, so nothing from an earlier run can survive a
+      failed one; and
+    * the run is refused unless ORCA's stdout says ``ORCA TERMINATED
+      NORMALLY`` and does not say ``SCF NOT CONVERGED``.
+
     Returns:
-        The job's base path.  ``<base>.gbw``, ``<base>.scfp``,
-        ``<base>.chelpg.xyz`` and ``<base>.vpot`` hang off it.
+        The job's base path.  ``<base>.gbw``, ``<base>.densities``,
+        ``<base>.chelpg.xyz`` and ``<base>.vpot`` hang off it.  The SCF
+        density lives *inside* ``<base>.densities`` under the name
+        ``<base>.scfp``; that name is not a file on disk, and it is exactly
+        what :func:`run_vpot` passes as ``orca_vpot``'s density argument.
 
     Raises:
-        ExternalToolError: ORCA failed, or produced no CHELPG file when asked.
+        ExternalToolError: ORCA exited nonzero, its SCF did not converge, it
+            did not terminate normally, or it produced no CHELPG file when
+            asked.
     """
     exe = binaries.require("orca")
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     base = workdir / "esp"
+    for suffix in ESP_ARTEFACTS:
+        Path(str(base) + suffix).unlink(missing_ok=True)
     write_sp_input(
         base.with_suffix(".inp"),
         structure,
@@ -195,12 +238,30 @@ def run_esp_job(
         mult,
         nprocs,
     )
-    run_command([exe, base.with_suffix(".inp").name], workdir, "esp", extra_env=orca_env(binaries))
+    proc = run_command(
+        [exe, base.with_suffix(".inp").name], workdir, "esp", extra_env=orca_env(binaries)
+    )
+    stdout = proc.stdout or ""
+    log_path = workdir / f"{base.name}.stdout"
+    if ORCA_SCF_FAILED_MARKER in stdout:
+        raise ExternalToolError(
+            f"ORCA's SCF did not converge in the ESP job: its output says "
+            f"'{ORCA_SCF_FAILED_MARKER}'. ORCA exits 0 when this happens, so the exit code "
+            f"proves nothing, and there is no density to take charges or a potential from. "
+            f"See {log_path}. A different geometry (--charge-geom), a corrected --charge or "
+            "--uhf, or another level of theory may converge."
+        )
+    if ORCA_NORMAL_TERMINATION_MARKER not in stdout:
+        raise ExternalToolError(
+            f"ORCA's ESP job exited without printing '{ORCA_NORMAL_TERMINATION_MARKER}', so "
+            f"it stopped before finishing even though its exit code was 0. See {log_path} "
+            "for the error ORCA reported."
+        )
     if chelpg and not Path(str(base) + ".chelpg.xyz").exists():
         raise ExternalToolError(
-            f"ORCA finished but wrote no {base.name}.chelpg.xyz, so the CHELPG charges were "
-            "never produced. Check esp.stdout in the stage directory; the usual cause is a "
-            "keyword line that does not reach the CHELPG module."
+            f"ORCA terminated normally with a converged SCF but wrote no "
+            f"{base.name}.chelpg.xyz, so the CHELPG step never produced charges. See "
+            f"{log_path} for the CHELPG section of the output."
         )
     return base
 
@@ -318,7 +379,9 @@ def run_vpot(
 
     The density argument is the **full** ``<base>.scfp``.  Passing the bare
     ``scfp`` that the usage text suggests segfaults (exit 139), and the optional
-    fifth argument is unnecessary.
+    fifth argument is unnecessary.  ``<base>.scfp`` is not a file: it is the
+    name under which ORCA 6.1.1 stores the SCF density inside
+    ``<base>.densities``, and ``orca_vpot`` looks it up there.
 
     ``binaries.orca_vpot`` defaults to ``orca_vpot`` in ``orca``'s own
     directory when not set explicitly, the same fallback :func:`orca_env`

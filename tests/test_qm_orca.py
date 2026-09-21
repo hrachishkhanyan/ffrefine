@@ -275,3 +275,140 @@ def test_run_vpot_refuses_a_stale_output_left_by_an_earlier_call(tmp_path, monke
 
     with pytest.raises(ExternalToolError):
         run_vpot(binaries, tmp_path / "esp", grid_nm, tmp_path)
+
+
+# What ORCA 6.1.1 actually printed when its SCF gave up (probe with
+# `%scf MaxIter 3 end`, 2026-09-21). The process still exited 0.
+SCF_FAILED_STDOUT = """\
+               *****************************************************
+               *                      ERROR                        *
+               *        SCF NOT CONVERGED AFTER   2 CYCLES         *
+               *****************************************************
+
+[file orca_leanscf/orca_leanscf.cpp, line 306]: Error (ORCA_LEANSCF): unfortunately, the SCF \
+has not converged. There may be a way out but we have to stop here
+
+ORCA finished by error termination in LEANSCF
+  .... aborting the run
+"""
+
+ORCA_OK_STDOUT = "...\n                             ****ORCA TERMINATED NORMALLY****\n"
+
+ESP_ARTEFACTS = ("esp.chelpg.xyz", "esp.vpot", "esp.gbw", "esp.densities", "esp.densitiesinfo")
+
+
+def _plant_stale_esp_outputs(workdir: Path) -> None:
+    """A complete, plausible set of outputs from an earlier successful ESP job."""
+    for name in ESP_ARTEFACTS:
+        (workdir / name).write_text("stale output from an earlier run\n")
+    (workdir / "esp.chelpg.xyz").write_text((ORCA_FIXTURES / "esp.chelpg.xyz").read_text())
+
+
+def _fake_orca(stdout: str, writes: tuple[str, ...] = (), seen: dict | None = None):
+    """A ``run_command`` stand-in: exit 0, the given stdout, optionally fresh files."""
+    from types import SimpleNamespace
+
+    def fake_run_command(argv, workdir, log_stem, extra_env=None, check=True, stdin=None):
+        workdir = Path(workdir)
+        if seen is not None:
+            seen.update({name: (workdir / name).exists() for name in ESP_ARTEFACTS})
+        for name in writes:
+            (workdir / name).write_text((ORCA_FIXTURES / "esp.chelpg.xyz").read_text())
+        (workdir / f"{log_stem}.stdout").write_text(stdout)
+        return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+    return fake_run_command
+
+
+def test_run_esp_job_refuses_an_unconverged_scf_with_stale_outputs_present(
+    tmp_path, butane_pdb, monkeypatch
+):
+    """ORCA exits 0 when its SCF gives up; a leftover .chelpg.xyz must not pass as fresh.
+
+    Reproduces final-review finding C1: the first run into an outdir succeeds,
+    the second (different keywords) fails its SCF, exits 0, writes no
+    ``.chelpg.xyz`` -- and the old existence check found the first run's
+    file, so ``charges.json`` recorded run 2's keyword line with run 1's
+    charges.
+    """
+    import ffrefine.qm.orca as orca_mod
+
+    _plant_stale_esp_outputs(tmp_path)
+    monkeypatch.setattr(orca_mod, "run_command", _fake_orca(SCF_FAILED_STDOUT))
+    s = read_pdb(butane_pdb)
+
+    with pytest.raises(ExternalToolError, match="esp.stdout"):
+        orca_mod.run_esp_job(Binaries(orca="/nonexistent/orca"), s, s.coords, tmp_path)
+
+    for name in ESP_ARTEFACTS:
+        assert not (tmp_path / name).exists(), f"stale {name} survived a failed run"
+
+
+def test_run_esp_job_refuses_scf_not_converged_even_if_orca_carried_on(
+    tmp_path, butane_pdb, monkeypatch
+):
+    """Isolates the SCF check: normal termination and a fresh CHELPG file do not excuse it."""
+    import ffrefine.qm.orca as orca_mod
+
+    stdout = SCF_FAILED_STDOUT + ORCA_OK_STDOUT
+    monkeypatch.setattr(orca_mod, "run_command", _fake_orca(stdout, writes=("esp.chelpg.xyz",)))
+    s = read_pdb(butane_pdb)
+
+    with pytest.raises(ExternalToolError, match="SCF NOT CONVERGED"):
+        orca_mod.run_esp_job(Binaries(orca="/nonexistent/orca"), s, s.coords, tmp_path)
+
+
+def test_run_esp_job_refuses_a_run_that_did_not_terminate_normally(
+    tmp_path, butane_pdb, monkeypatch
+):
+    """Isolates the termination check: a CHELPG file does not prove ORCA finished."""
+    import ffrefine.qm.orca as orca_mod
+
+    _plant_stale_esp_outputs(tmp_path)
+    stdout = "ORCA finished by error termination in CHELPG\n  .... aborting the run\n"
+    monkeypatch.setattr(orca_mod, "run_command", _fake_orca(stdout, writes=("esp.chelpg.xyz",)))
+    s = read_pdb(butane_pdb)
+
+    with pytest.raises(ExternalToolError, match="ORCA TERMINATED NORMALLY"):
+        orca_mod.run_esp_job(Binaries(orca="/nonexistent/orca"), s, s.coords, tmp_path)
+
+
+def test_run_esp_job_clears_earlier_outputs_before_orca_starts(tmp_path, butane_pdb, monkeypatch):
+    """Every artefact a later step reads is gone by the time ORCA runs, and a good run passes."""
+    import ffrefine.qm.orca as orca_mod
+
+    _plant_stale_esp_outputs(tmp_path)
+    seen: dict[str, bool] = {}
+    monkeypatch.setattr(
+        orca_mod, "run_command", _fake_orca(ORCA_OK_STDOUT, writes=("esp.chelpg.xyz",), seen=seen)
+    )
+    s = read_pdb(butane_pdb)
+
+    base = orca_mod.run_esp_job(Binaries(orca="/nonexistent/orca"), s, s.coords, tmp_path)
+
+    assert base == tmp_path / "esp"
+    assert seen == {name: False for name in ESP_ARTEFACTS}
+
+
+@pytest.mark.needs_orca
+def test_a_failed_esp_rerun_in_the_same_directory_is_refused(tmp_path, butane_pdb, orca_bin):
+    """The reviewer's real reproduction of C1, against real ORCA.
+
+    Run 1 succeeds. Run 2, into the same directory, has its SCF capped at
+    three cycles; ORCA 6.1.1 gives up, exits 0 and writes no ``.chelpg.xyz``.
+    The ``%scf`` block rides in on the keyword argument, on its own line
+    ahead of the ``!`` line so that ``CHELPG`` is still appended to the ``!``
+    line.
+    """
+    from ffrefine.qm.orca import run_esp_job
+
+    s = read_pdb(butane_pdb)
+    binaries = Binaries(orca=orca_bin)
+    run_esp_job(binaries, s, s.coords, tmp_path, "! HF STO-3G", charge=0, mult=1)
+    assert (tmp_path / "esp.chelpg.xyz").exists()
+
+    with pytest.raises(ExternalToolError, match="SCF NOT CONVERGED"):
+        run_esp_job(
+            binaries, s, s.coords, tmp_path, "%scf MaxIter 3 end\n! HF 6-31G*", charge=0, mult=1
+        )
+    assert not (tmp_path / "esp.chelpg.xyz").exists()

@@ -166,11 +166,14 @@ Extended, process-facing:
   +-- geometry      --charge-geom input -> coordinates as given
   |                 --charge-geom xtb   -> xtb --opt tight --gfn 2 -> 04_charges/opt/
   |
-  +-- one ORCA ESP job -> esp.gbw, esp.scfp, esp.chelpg.xyz, esp.vpot
+  +-- one ORCA ESP job -> esp.gbw, esp.densities, esp.chelpg.xyz, esp.vpot
+  |                       (the SCF density is stored inside esp.densities under
+  |                        the name esp.scfp; there is no esp.scfp file)
   |
   +-- chelpg -> parse esp.chelpg.xyz                       -> raw charges
   |   resp   -> grid.py builds the MK grid (bohr)
   |             orca_vpot esp.gbw esp.scfp grid.xyz out.vpot
+  |               (esp.scfp here names the density inside esp.densities)
   |             resp.py two-stage fit                      -> raw charges
   |
   +-- equivalence.py  equal charges within each equivalent-hydrogen group
@@ -182,6 +185,13 @@ Extended, process-facing:
 
 The ESP job runs **once** and serves both schemes. RESP needs its density regardless, and
 CHELPG costs nothing on top of it.
+
+Before it runs, every output a later step reads (`esp.chelpg.xyz`, `esp.vpot`, `esp.gbw`,
+`esp.densities`, `esp.densitiesinfo`) is deleted, and afterwards the run is refused unless
+ORCA's stdout says `ORCA TERMINATED NORMALLY` and does not say `SCF NOT CONVERGED`. ORCA
+6.1.1 exits 0 when its SCF gives up, and `04_charges/` is reused by a re-run into the same
+outdir, so an existence check alone would hand back the previous run's charges under the new
+run's keyword line.
 
 Because that job also leaves `esp.vpot` — ORCA's own grid carrying the QM potential — the ESP
 fit **RRMS is reported for both schemes**, computed against the same reference grid. Spec 5.2
@@ -337,6 +347,7 @@ Every avoidable ambiguity is a refusal with a named remedy.
 | RESP did not converge | Refuse, with the iteration count and last movement |
 | xtb optimisation did not report convergence | Refuse, as `run_scan` does for its scan block |
 | ORCA nonzero exit, or no CHELPG file | Refuse, with the tail of the output |
+| ORCA stdout lacks `ORCA TERMINATED NORMALLY`, or says `SCF NOT CONVERGED` (ORCA exits 0 then) | Refuse, naming the condition and `esp.stdout` |
 | `--charge-mode all` on a CGenFF topology | Warn, per spec 5.3, into the log and `charges.json` |
 | RRMS above 0.5 | Warn. A poor fit is a judgement about the molecule, not a malfunction |
 
