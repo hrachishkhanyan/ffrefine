@@ -103,3 +103,33 @@ def test_the_before_column_is_the_topology_not_the_fit(butane_itp):
 
     assert out[0].before == pytest.approx(-0.270)
     assert out[0].name == "C1"
+
+
+def test_redistribution_is_per_charge_group_not_global(butane_itp):
+    """Spec 5.3: residual is spread within each charge group, not between them.
+
+    Butane's charge groups are: 1-4 (cgnr 1), 5-7 (cgnr 2), 8-10 (cgnr 3),
+    11-14 (cgnr 4). Selecting atoms in two different groups must not allow
+    charge to flow between them.
+    """
+    top = read_topology(butane_itp)
+
+    # Give atoms 1 and 11 different fitted values to test per-group redistribution.
+    # With pooled redistribution, charge would leak between groups; with per-group,
+    # each group absorbs its own residual.
+    q = np.full(14, 0.05)
+    q[0] = -0.40  # atom 1: larger negative change
+    q[10] = -0.30  # atom 11: smaller negative change
+
+    out = apply_charges(top, q, selected=[1, 11], target_total=0)
+
+    # Group 1: atoms 1-4
+    group1_after = sum(a.after for a in out if 1 <= a.nr <= 4)
+    # Group 4: atoms 11-14
+    group4_after = sum(a.after for a in out if 11 <= a.nr <= 14)
+
+    # Each group's sum should be preserved to within rounding precision
+    assert group1_after == pytest.approx(0.0, abs=1e-4)
+    assert group4_after == pytest.approx(0.0, abs=1e-4)
+    # Molecular total must be exact
+    assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)

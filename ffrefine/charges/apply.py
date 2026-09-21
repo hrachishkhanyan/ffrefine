@@ -76,14 +76,20 @@ def apply_charges(
 ) -> list[ChargeAssignment]:
     """Combine fitted charges with the topology's, keeping the total exact.
 
-    In ``selected`` mode, the fitted charges replace only the named atoms; the
-    residual is redistributed to unselected atoms in the same charge group
-    (falling back to bonded heavy atoms). After rounding to the output
-    precision, any remaining drift is absorbed by the largest-magnitude atom
-    among the redistribution recipients (or, in ``all`` mode, any atom). This
-    ensures an atom reported as ``source="fitted"`` carries its fitted value
-    unchanged: drift is kept off fitted atoms when there is anywhere else to
-    put it. The molecular total is then exact rather than merely close.
+    In ``selected`` mode, the fitted charges replace only the named atoms. Per
+    CHARMM conventions, each charge group absorbs its own residual separately:
+    for each group containing a selected atom, that group's residual (the
+    charge change the fit made within it) is redistributed to unselected atoms
+    in that same group, falling back to bonded heavy atoms if no in-group
+    recipients exist. After all per-group redistributions, any remaining
+    global offset (e.g. from an explicit ``--charge`` differing from the
+    topology's sum) is spread over the pooled recipients. After rounding to
+    the output precision, any remaining drift is absorbed by the largest-
+    magnitude atom among the redistribution recipients (or, in ``all`` mode,
+    any atom). This ensures an atom reported as ``source="fitted"`` carries
+    its fitted value unchanged: drift is kept off fitted atoms when there is
+    anywhere else to put it. The molecular total is then exact rather than
+    merely close.
 
     Args:
         topology: the parsed molecule, supplying the existing charges, the
@@ -124,17 +130,52 @@ def apply_charges(
     after[index] = fitted[index]
 
     recipients = []
-    residual = float(target_total) - float(after.sum())
-    if selected is not None and abs(residual) > 1e-12:
-        recipients = _recipients(topology, chosen)
-        if not recipients:
-            raise ValidationError(
-                f"nothing left to redistribute the {residual:+.6f} e residual onto: every "
-                "atom in the selected atoms' charge groups was itself selected, and no "
-                "unselected heavy atom is bonded to one. Select fewer atoms, or use "
-                "--charge-mode all."
-            )
-        after[recipients] += residual / len(recipients)
+    if selected is not None:
+        # Per-group redistribution: each charge group absorbs its own residual
+        groups_with_selected = {topology.atoms[nr - 1].cgnr for nr in chosen}
+        for cgnr in groups_with_selected:
+            # Selected atoms in this group
+            selected_in_group = [nr - 1 for nr in chosen if topology.atoms[nr - 1].cgnr == cgnr]
+            # Residual for this group: how much the fit changed it
+            residual_g = sum(before[i] - fitted[i] for i in selected_in_group)
+
+            if abs(residual_g) < 1e-12:
+                continue
+
+            # Try to find recipients within the same group
+            recipients_in_group = [
+                i
+                for i in range(len(topology.atoms))
+                if topology.atoms[i].cgnr == cgnr and i not in selected_in_group
+            ]
+
+            if recipients_in_group:
+                after[recipients_in_group] += residual_g / len(recipients_in_group)
+                recipients.extend(recipients_in_group)
+            else:
+                # Fall back to bonded heavy atoms from this group
+                bonded = {
+                    n
+                    for nr in [topology.atoms[i].nr for i in selected_in_group]
+                    for n in topology.bonded_neighbours(nr)
+                    if n not in chosen and element_of(topology, n) != "H"
+                }
+                if not bonded:
+                    raise ValidationError(
+                        f"nothing left to redistribute the {residual_g:+.6f} e residual onto: every "
+                        "atom in the selected atoms' charge groups was itself selected, and no "
+                        "unselected heavy atom is bonded to one. Select fewer atoms, or use "
+                        "--charge-mode all."
+                    )
+                recipients_from_bonded = [nr - 1 for nr in sorted(bonded)]
+                after[recipients_from_bonded] += residual_g / len(recipients_from_bonded)
+                recipients.extend(recipients_from_bonded)
+
+        # After per-group redistribution, handle any remaining global offset
+        global_offset = float(target_total) - float(after.sum())
+        if abs(global_offset) > 1e-12 and recipients:
+            recipients_set = sorted(set(recipients))
+            after[recipients_set] += global_offset / len(recipients_set)
 
     after = np.round(after, decimals)
     drift = float(target_total) - float(after.sum())

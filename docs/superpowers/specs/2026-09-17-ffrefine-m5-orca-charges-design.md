@@ -284,11 +284,16 @@ Atomic units throughout: coordinates in bohr, potential in Hartree/e.
   free, every other charge frozen at its stage 1 value; equality constraints per group.
 - `RRMS = sqrt(sum_i (V_i - V_fit_i)^2 / sum_i V_i^2)`.
 
-### 6.4 `selected` mode redistributes, per spec 5.3
+### 6.4 `selected` mode redistributes per charge group, per spec 5.3
 
-All atoms are fitted; the new charges are taken for the selected atoms only; the residual is
-spread evenly over the unselected atoms in the same charge group (`cgnr`), falling back to
-unselected heavy atoms bonded to a selected atom, and refused when neither exists. Every
+All atoms are fitted; the new charges are taken for the selected atoms only. Per CHARMM
+conventions, the residual is absorbed separately by each charge group: for each group
+containing a selected atom, that group's residual (the charge change the fit made within it)
+is spread evenly over the unselected atoms in that group, falling back to unselected heavy
+atoms bonded to a selected atom in that group, and refused when neither exists. This keeps
+each charge group's net charge intact — that is what CHARMM charge groups are for. After all
+per-group residuals are absorbed, any remaining global offset (e.g. from an explicit
+`--charge` differing from the topology's sum) is spread over the pooled recipients. Every
 reassignment is logged atom by atom.
 
 The alternative, freezing the unselected atoms inside the fit as ffTK does, is better physics
