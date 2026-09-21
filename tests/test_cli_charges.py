@@ -185,3 +185,88 @@ def test_selected_mode_leaves_unselected_atoms_alone(butane_pdb, butane_itp, tmp
     assert charged.atoms[0].charge != original.atoms[0].charge
     assert charged.atoms[7].charge == original.atoms[7].charge  # C3, far from the change
     assert sum(a.charge for a in charged.atoms) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_run_skips_charges_when_none_was_asked_for(butane_pdb, butane_itp, tmp_path, capsys):
+    """Plain `ffrefine run` must keep working exactly as it did."""
+    rc = main(
+        [
+            "run",
+            "-s",
+            str(butane_pdb),
+            "-p",
+            str(butane_itp),
+            "--dihedral",
+            "1,5,8,11",
+            "--outdir",
+            str(tmp_path / "out"),
+            "--dry-run",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "=== charges ===" not in out
+    assert "charges" in out.lower()  # it still says it skipped them
+
+
+def test_run_chains_charges_first_when_asked(butane_pdb, butane_itp, tmp_path, capsys):
+    """Charges must come before mmscan, not after the fit."""
+    rc = main(
+        [
+            "run",
+            "-s",
+            str(butane_pdb),
+            "-p",
+            str(butane_itp),
+            "--dihedral",
+            "1,5,8,11",
+            "--outdir",
+            str(tmp_path / "out"),
+            "--charge-mode",
+            "all",
+            "--dry-run",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out.index("=== charges ===") < out.index("=== mmscan ===")
+    assert out.index("=== charges ===") < out.index("=== scan ===")
+
+
+def test_run_points_later_stages_at_the_charged_topology(
+    butane_pdb, butane_itp, tmp_path, monkeypatch
+):
+    """The swap is the whole mechanism; assert it rather than trusting it."""
+    import ffrefine.cli as cli
+
+    outdir = tmp_path / "out"
+    charged = outdir / "04_charges" / "molecule_charged.itp"
+    charged.parent.mkdir(parents=True)
+    charged.write_text(butane_itp.read_text())
+    seen = []
+
+    monkeypatch.setattr(cli, "cmd_charges", lambda a: 0)
+    monkeypatch.setattr(cli, "cmd_scan", lambda a: seen.append(a.topology) or 0)
+    monkeypatch.setattr(cli, "cmd_mmscan", lambda a: seen.append(a.topology) or 0)
+    monkeypatch.setattr(cli, "cmd_fit", lambda a: seen.append(a.topology) or 0)
+    monkeypatch.setattr(cli, "cmd_validate", lambda a: seen.append(a.topology) or 0)
+
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "-s",
+            str(butane_pdb),
+            "-p",
+            str(butane_itp),
+            "--dihedral",
+            "1,5,8,11",
+            "--outdir",
+            str(outdir),
+            "--charge-mode",
+            "all",
+        ]
+    )
+    assert cli.cmd_run(args) == 0
+    assert seen == [str(charged)] * 4

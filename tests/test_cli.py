@@ -752,13 +752,16 @@ def test_validate_without_scan_geometries_is_a_clean_error(
 
 
 def test_run_says_which_stages_it_skipped(tmp_path, butane_pdb, butane_itp, capsys):
-    """Only charges is skipped now; milestone 4 moved scan into the chain."""
+    """Plain `run` (no charge flags) skips charges -- not because it is
+    unimplemented, but because none was asked for -- and still runs scan."""
     out = tmp_path / "out"
     code = main(["run"] + _base_args(butane_pdb, butane_itp, out) + ["--dry-run"])
     assert code == 0
-    printed = capsys.readouterr().out.lower()
-    assert "charges" in printed and "milestone 5" in printed
-    assert "milestone 4" not in printed
+    printed = capsys.readouterr().out
+    assert "SKIPPING charges" in printed
+    assert "=== charges ===" not in printed
+    assert "milestone 4" not in printed.lower()
+    assert "milestone 5" not in printed.lower()
     assert "=== scan ===" in printed
 
 

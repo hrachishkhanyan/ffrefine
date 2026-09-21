@@ -1826,24 +1826,51 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Run every implemented stage in order, naming the ones it cannot run."""
-    print(
-        "ffrefine run: this build chains scan -> mmscan -> fit -> validate and "
-        "SKIPS one stage:\n"
-        "  charges (ESP/RESP charges, ORCA) -- milestone 5, not implemented\n"
-        "Charges are left exactly as the input topology has them."
-    )
-    for name, handler in (
+    """Run every implemented stage in order, naming the ones it cannot run.
+
+    Charges lead, when they were asked for: the fitted torsion absorbs whatever
+    the 1-4 electrostatics do not account for, so refining charges afterwards
+    would leave a torsion fitted against charges the topology no longer has.
+    """
+    wants_charges = bool(args.charge_atoms) or args.charge_mode == "all"
+    if wants_charges:
+        print(
+            "ffrefine run: chaining charges -> scan -> mmscan -> fit -> validate. The "
+            "remaining stages use the charge-refined topology, because a torsion fitted "
+            "against different charges than it ships with is not transferable."
+        )
+    else:
+        print(
+            "ffrefine run: chaining scan -> mmscan -> fit -> validate and SKIPPING "
+            "charges, which needs --charge-atoms or --charge-mode all. The topology keeps "
+            "the charges it came with."
+        )
+
+    stages: list[tuple[str, object]] = []
+    if wants_charges:
+        stages.append(("charges", cmd_charges))
+    stages += [
         ("scan", cmd_scan),
         ("mmscan", cmd_mmscan),
         ("fit", cmd_fit),
         ("validate", cmd_validate),
-    ):
+    ]
+
+    for name, handler in stages:
         print(f"\n=== {name} ===")
         code = handler(args)
         if code != 0:
             print(f"ffrefine run: stopping, stage {name} failed", file=sys.stderr)
             return code
+        if name == "charges" and not args.dry_run:
+            charged = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
+            if not charged.exists():
+                raise ValidationError(
+                    f"the charges stage reported success but wrote no {charged}, so the "
+                    "remaining stages have no refined topology to use."
+                )
+            args.topology = str(charged)
+            print(f"run: remaining stages will use {charged}")
     return 0
 
 

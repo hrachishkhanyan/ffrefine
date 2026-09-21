@@ -203,7 +203,10 @@ def test_run_chains_the_scan_stage_now_that_it_exists(butane_pdb, butane_itp, tm
     assert "milestone 4" not in out
     assert "must therefore be supplied" not in out
     assert "=== scan ===" in out
-    assert "milestone 5" in out  # charges is still genuinely missing, and must still say so
+    # charges is implemented but not requested on this invocation, so it is
+    # named as skipped rather than reported missing.
+    assert "milestone 5" not in out
+    assert "SKIPPING charges" in out
 
 
 def test_run_accepts_the_scan_flags(butane_pdb, butane_itp, tmp_path):
