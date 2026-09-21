@@ -325,6 +325,13 @@ def run_vpot(
     already applies to ``orca_libdir`` -- a stock ORCA unpack keeps the two
     binaries side by side.
 
+    ``out_path`` is removed before the call, not merely overwritten: a
+    segfaulting ``orca_vpot`` leaves no output at all, and without this a
+    stale file from an earlier call into the same ``workdir`` -- e.g. a
+    re-run of the RESP stage with different ESP keywords but the same grid
+    -- could carry the same point count and pass every check in
+    :func:`read_vpot_output` while holding the previous run's potentials.
+
     Returns:
         Potentials in Hartree/e, one per grid point.
 
@@ -336,6 +343,7 @@ def run_vpot(
     grid_path = workdir / "grid.xyz"
     out_path = workdir / "grid_out.vpot"
     write_vpot_grid(grid_path, grid_nm)
+    out_path.unlink(missing_ok=True)
     run_command(
         [exe, f"{base.name}.gbw", f"{base.name}.scfp", grid_path.name, out_path.name],
         workdir,

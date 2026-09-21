@@ -241,3 +241,37 @@ def test_run_vpot_reproduces_orcas_own_potential(tmp_path, butane_pdb, orca_bin)
 
     assert v.shape == (20,)
     assert v == pytest.approx(reference[:20], rel=1e-6)
+
+
+def test_run_vpot_refuses_a_stale_output_left_by_an_earlier_call(tmp_path, monkeypatch):
+    """A segfaulting orca_vpot leaves no output; a leftover file must not pass as fresh.
+
+    ``04_charges/`` is reused when a user re-runs the RESP stage in the same
+    outdir. A re-run with different ESP keywords keeps the same geometry and
+    grid, hence the same point count as the previous run; if the new
+    ``orca_vpot`` call segfaults, a stale ``grid_out.vpot`` with that same
+    point count must not be returned as though it were fresh.
+    """
+    import ffrefine.qm.orca as orca_mod
+    from ffrefine.qm.orca import run_vpot
+
+    # A plausible leftover from an earlier, successful call into this workdir:
+    # right row count, right column order, values from a different run.
+    stale = tmp_path / "grid_out.vpot"
+    stale.write_text(
+        "2\n"
+        "     0.00000000000000      0.00000000000000      0.00000000000000       0.00012345678901\n"
+        "     0.00000000000000      0.00000000000000      1.00000000000000       0.00023456789012\n"
+    )
+
+    def fake_run_command(argv, workdir, log_stem, extra_env=None, check=False, stdin=None):
+        """Mimics a segfaulting orca_vpot: the call happens but writes nothing."""
+        return None
+
+    monkeypatch.setattr(orca_mod, "run_command", fake_run_command)
+
+    binaries = Binaries(orca="/nonexistent/orca", orca_vpot="/nonexistent/orca_vpot")
+    grid_nm = np.zeros((2, 3))
+
+    with pytest.raises(ExternalToolError):
+        run_vpot(binaries, tmp_path / "esp", grid_nm, tmp_path)
