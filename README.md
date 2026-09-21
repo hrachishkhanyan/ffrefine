@@ -579,8 +579,8 @@ available before trusting the result.
 
     pytest -m "needs_gmx or needs_xtb or needs_orca"   # and check nothing skipped
 
-As of this milestone the suite holds 517 tests: 16 marked `needs_gmx`, 4
-`needs_xtb` and 8 `needs_orca`. The rest need nothing external and always run.
+As of this milestone the suite holds 547 tests: 16 marked `needs_gmx`, 4
+`needs_xtb` and 11 `needs_orca`. The rest need nothing external and always run.
 
 The load-bearing one is spec section 7.1's round trip, which covers the whole
 pipeline except xtb and ORCA: take the MM energies with the original
