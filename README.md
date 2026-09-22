@@ -474,7 +474,7 @@ needs the same molecular charge and spin state the scan does.
   **`selected` refuses to run without `--charge-atoms`**: replacing every
   charge on a CGenFF topology changes the derivation scheme entirely, so
   defaulting silently to `all` would be the wrong kind of convenient.
-  Automatic atom selection from CGenFF penalties arrives in milestone 6; until
+  Automatic atom selection from CGenFF penalties arrives in milestone 6b; until
   then, you name the atoms yourself.
 - `--charge-atoms i,j,k` (default: none) -- 1-based atom numbers to replace
   under `--charge-mode selected`. Repeatable; every atom named across every
@@ -533,7 +533,7 @@ assumed, and recorded in `00_input/model.json`. CHARMM and Amber/GAFF differ
 here. Moving a fitted dihedral between force fields is not meaningful, and
 nothing in the output file will stop you from doing it.
 
-**Milestone 6 does not exist yet.** There is no CGenFF `.str` parser, so there
+**Milestone 6b is not implemented yet.** There is no CGenFF `.str` parser, so there
 is no automatic torsion or charge-atom selection: `--dihedral` and
 `--charge-atoms` are the only way to point ffrefine at anything, and there is
 no `final/report.md` summary document. `--mm-relax` (spec 4.6) is also
