@@ -1,0 +1,6 @@
+
+[ implicit_genborn_params ]
+
+; Atom type sar		st		pi		gbr		 hct
+ H				0.1		1		1		0.115	 0.85 ; H
+ OC				0.170	1		0.922	0.148	 0.85 ; O

@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 ffrefine_out/
 .pytest_cache/
+fixtures/_full_ff/
