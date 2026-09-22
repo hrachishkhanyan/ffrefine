@@ -1,9 +1,15 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 from ffrefine.errors import ValidationError
 from ffrefine.io.structure import read_pdb
 from ffrefine.io.topology import read_topology
 from ffrefine.mm import selfcheck
+
+FIXTURES = Path(__file__).parent.parent / "fixtures"
+PFOA = FIXTURES / "pfoa_gromacs"
+CAPECITABINE = FIXTURES / "capecitabine_gromacs"
 
 
 @pytest.mark.needs_gmx
@@ -49,7 +55,7 @@ def test_self_check_raises_when_tolerance_impossible(
     s = read_pdb(butane_pdb)
     t = read_topology(butane_itp)
     frames = rotated_frames(s, 6)
-    with pytest.raises(ValidationError, match="self-consistency"):
+    with pytest.raises(ValidationError, match="self-consistency") as excinfo:
         selfcheck.check_torsion_removal(
             Binaries(gmx=gmx_bin),
             t,
@@ -59,6 +65,11 @@ def test_self_check_raises_when_tolerance_impossible(
             tmp_path,
             tolerance=1e-18,
         )
+    msg = str(excinfo.value)
+    assert "10 term(s): 10 written in the topology and 0 resolved from [ dihedraltypes ]" in msg
+    assert "full_dump.stdout" in msg
+    # The old claim is gone: typed terms are no longer refused before the run.
+    assert "checked before the run" not in msg
 
 
 TARGET_BLOCK = """\
@@ -100,53 +111,6 @@ def _typed_topology(tmp_path, butane_itp, block=TYPED_BLOCK):
     out = tmp_path / "typed.itp"
     out.write_text(text.replace(TARGET_BLOCK, block), newline="\n")
     return out
-
-
-def test_typed_dihedrals_are_refused_before_gromacs_runs(tmp_path, butane_pdb, butane_itp):
-    """Item 2: a torsion set with no explicit parameters must be diagnosed
-    precisely, not blamed on the [ dihedraltypes ] lookup surviving the edit.
-
-    Binaries carries gmx=None, so the test also proves the refusal happens
-    before any external tool is invoked -- previously two full GROMACS reruns
-    were spent to reach a wrong conclusion.
-    """
-    from ffrefine.config import Binaries
-
-    itp = _typed_topology(tmp_path, butane_itp)
-    s = read_pdb(butane_pdb)
-    t = read_topology(itp)
-    with pytest.raises(ValidationError) as excinfo:
-        selfcheck.check_torsion_removal(
-            Binaries(gmx=None), t, (1, 5, 8, 11), s, s.coords[None, :, :], tmp_path / "wd"
-        )
-    msg = str(excinfo.value)
-    # How many entries, about which bond.
-    assert "9 of the 9" in msg
-    assert "(5, 8)" in msg
-    assert "[ dihedraltypes ]" in msg
-    # The false cause must be explicitly retracted, not merely absent.
-    assert "NOT a failure of the topology edit" in msg
-    assert "explicit parameters do suppress" in msg
-    # And it must not repeat the old misdiagnosis.
-    assert "most likely the explicit zero parameters did not suppress" not in msg
-    # No GROMACS work was started.
-    assert not (tmp_path / "wd" / "full.top").exists()
-
-
-def test_typed_dihedral_message_counts_only_the_untyped_ones(tmp_path, butane_pdb, butane_itp):
-    """A partially-typed set reports the real ratio, not 'all of them'."""
-    from ffrefine.config import Binaries
-
-    partial = TARGET_BLOCK.replace(
-        "    7   5   8  10      9    0.000     0.66944     3", "    7   5   8  10      9"
-    )
-    itp = _typed_topology(tmp_path, butane_itp, block=partial)
-    s = read_pdb(butane_pdb)
-    t = read_topology(itp)
-    with pytest.raises(ValidationError, match=r"1 of the 10 proper dihedral term-line"):
-        selfcheck.check_torsion_removal(
-            Binaries(gmx=None), t, (1, 5, 8, 11), s, s.coords[None, :, :], tmp_path / "wd"
-        )
 
 
 DIHEDRALTYPES_SECTION = """\
@@ -269,3 +233,75 @@ def test_ff_include_supplies_missing_atomtypes(tmp_path, butane_pdb, butane_itp,
     )
     assert r.passed
     assert f'#include "{ff}"' in (tmp_path / "wd" / "full.top").read_text()
+
+
+@pytest.mark.needs_gmx
+def test_typed_butane_resolves_through_a_dihedraltypes_entry(
+    tmp_path, butane_pdb, butane_itp, gmx_bin, rotated_frames
+):
+    """Every term of T typed, matched by one wildcard entry: 9 quadruplets x 20 kJ/mol."""
+    from ffrefine.config import Binaries
+
+    text = _typed_topology(tmp_path, butane_itp).read_text()
+    itp = tmp_path / "typed_with_types.itp"
+    itp.write_text(text.replace("[ moleculetype ]", DIHEDRALTYPES_SECTION, 1), newline="\n")
+    s = read_pdb(butane_pdb)
+    t = read_topology(itp)
+    r = selfcheck.check_torsion_removal(
+        Binaries(gmx=gmx_bin), t, (1, 5, 8, 11), s, rotated_frames(s, 8), tmp_path / "wd"
+    )
+    assert r.passed and r.max_abs_error < 1e-3
+    assert np.abs(r.analytic_difference).max() > 50.0  # the 20 kJ/mol type is really felt
+
+
+@pytest.mark.needs_gmx
+def test_typed_butane_without_matching_types_fails_in_grompp(
+    tmp_path, butane_pdb, butane_itp, gmx_bin
+):
+    """No [ dihedraltypes ] entry for the typed lines: grompp's own error, before any rerun."""
+    from ffrefine.config import Binaries
+    from ffrefine.errors import ExternalToolError
+
+    s = read_pdb(butane_pdb)
+    t = read_topology(_typed_topology(tmp_path, butane_itp))
+    with pytest.raises(ExternalToolError):
+        selfcheck.check_torsion_removal(
+            Binaries(gmx=gmx_bin), t, (1, 5, 8, 11), s, s.coords[None, :, :], tmp_path / "wd"
+        )
+    assert not (tmp_path / "wd" / "full").exists()  # no rerun was started
+
+
+@pytest.mark.needs_gmx
+def test_self_check_passes_on_pfoa_typed_torsions(tmp_path, gmx_bin, rotate_side):
+    """The real CGenFF case: 20 terms about C1-C3, all from [ dihedraltypes ]."""
+    from ffrefine.config import Binaries
+
+    s = read_pdb(PFOA / "pfoa_gmx.pdb")
+    t = read_topology(PFOA / "pfoa_gmx.top")
+    # Turn the carboxyl group (atoms 1, 2, 25, 26) a full circle about C1-C3.
+    frames = rotate_side(
+        s.coords, t.bonds, fixed=3, moving=1, angles_deg=np.arange(0.0, 360.0, 30.0)
+    )
+    r = selfcheck.check_torsion_removal(
+        Binaries(gmx=gmx_bin), t, (25, 1, 3, 4), s, frames, tmp_path
+    )
+    assert r.passed and r.max_abs_error < 1e-3
+    assert np.ptp(r.analytic_difference) > 1.0
+
+
+@pytest.mark.needs_gmx
+def test_self_check_passes_on_capecitabine_typed_torsions(tmp_path, gmx_bin, rotate_side):
+    """Carbamate C7-N9, where two of the four typed lines resolve to no terms."""
+    from ffrefine.config import Binaries
+
+    s = read_pdb(CAPECITABINE / "capecitabine_gmx.pdb")
+    t = read_topology(CAPECITABINE / "capecitabine_gmx.top")
+    # Swing the pentyl carbamate side +-30 degrees; wider sweeps drive it into the rings.
+    frames = rotate_side(
+        s.coords, t.bonds, fixed=9, moving=7, angles_deg=np.linspace(-30.0, 30.0, 7)
+    )
+    r = selfcheck.check_torsion_removal(
+        Binaries(gmx=gmx_bin), t, (6, 7, 9, 10), s, frames, tmp_path
+    )
+    assert r.passed and r.max_abs_error < 1e-3
+    assert np.ptp(r.analytic_difference) > 1.0

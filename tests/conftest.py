@@ -94,6 +94,59 @@ def rotated_frames() -> Callable[[Structure, int], np.ndarray]:
 
 
 @pytest.fixture
+def rotate_side() -> Callable[..., np.ndarray]:
+    """Factory rotating one side of a bond rigidly about that bond.
+
+    ``fixed`` and ``moving`` are 1-based atom numbers of the bond. Every atom
+    reachable from ``moving`` without crossing the bond turns about the
+    fixed->moving axis, once per angle in ``angles_deg``; the rest stay put,
+    so only torsions about this bond change. A bond in a ring has no such
+    side and is refused.
+    """
+
+    def _make(
+        coords: np.ndarray,
+        bonds: list[tuple[int, int]],
+        fixed: int,
+        moving: int,
+        angles_deg,
+    ) -> np.ndarray:
+        adjacency: dict[int, set[int]] = {}
+        for a, b in bonds:
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+        side, stack = {moving}, [moving]
+        while stack:
+            atom = stack.pop()
+            for n in adjacency.get(atom, ()):
+                if atom == moving and n == fixed:
+                    continue
+                if n == fixed:
+                    raise AssertionError(f"bond {fixed}-{moving} is in a ring")
+                if n not in side:
+                    side.add(n)
+                    stack.append(n)
+        idx = sorted(a - 1 for a in side)  # 1-based -> 0-based
+        origin = coords[fixed - 1]
+        axis = coords[moving - 1] - origin
+        axis = axis / np.linalg.norm(axis)
+        frames = []
+        for angle in np.radians(np.asarray(angles_deg, dtype=float)):
+            c = np.array(coords, dtype=float, copy=True)
+            v = c[idx] - origin
+            c[idx] = (
+                origin
+                + v * np.cos(angle)
+                + np.cross(axis, v) * np.sin(angle)
+                + np.outer(v @ axis, axis) * (1.0 - np.cos(angle))
+            )
+            frames.append(c)
+        return np.stack(frames)
+
+    return _make
+
+
+@pytest.fixture
 def butane_xyz(tmp_path, butane_pdb) -> Path:
     """An .xyz of the butane fixture, written from the .pdb.
 

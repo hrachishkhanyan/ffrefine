@@ -12,12 +12,14 @@ correctness of the topology edit.
 Failing this means the topology edit did not do what was intended.  On failure
 the pipeline aborts; it never proceeds to fitting.
 
-One case that used to reach that failure and be *misdiagnosed* is now refused
-up front by ``_reject_typed_terms``: a torsion set containing terms whose
-parameters live in [ dihedraltypes ] rather than on the line.  The analytic
-reference cannot be built for those at all, so the check would compare a real
-GROMACS energy against an analytic zero.  Explicit parameters *do* suppress the
-[ dihedraltypes ] lookup -- that was never the cause.
+Typed torsions -- terms whose parameters live in [ dihedraltypes ], the normal
+shape of a CGenFF or GAFF molecule topology -- get their parameters from
+:func:`ffrefine.mm.tprparams.resolve_torsion_set`, which reads back the terms
+grompp itself built. The check then verifies what it always has: that the
+zeroed copy removed exactly those terms and nothing else. Explicit parameters
+on a zeroed line do suppress the [ dihedraltypes ] lookup; that is verified,
+not assumed, by
+``tests/test_selfcheck.py::test_dihedraltypes_entry_is_suppressed_by_explicit_params``.
 """
 
 from __future__ import annotations
@@ -33,11 +35,11 @@ from ..errors import ValidationError
 from ..geometry import dihedral_deg_frames
 from ..io.structure import Structure
 from ..io.topology import Topology
-from ..io.topwriter import make_system_top, write_molecule_copy, write_zeroed_topology
+from ..io.topwriter import make_system_top, write_zeroed_topology
 from ..io.validate import validate_structure_topology
 from .analytic import torsion_set_energy
 from .gromacs import single_point_energies
-from .torsionset import collect_torsion_set
+from .tprparams import SOURCE_DIHEDRALTYPES, ResolvedTorsionSet, resolve_torsion_set
 
 log = logging.getLogger("ffrefine")
 
@@ -82,60 +84,6 @@ def _as_gromacs_saw_it(frames: np.ndarray) -> np.ndarray:
     return np.round(np.asarray(frames, dtype=float), _G96_COORD_DECIMALS)
 
 
-def _reject_typed_terms(topology: Topology, quad: tuple[int, int, int, int]) -> None:
-    """Refuse a torsion set containing terms with no explicit parameters.
-
-    ``torsion_set_energy`` contributes zero for any entry whose parameters
-    live in ``[ dihedraltypes ]`` rather than on the line, because this build
-    reads the molecule topology only and never the force field's type tables.
-    The section 4.5 check would then compare GROMACS's real torsion energy
-    against an analytic *zero* and fail -- with a diagnosis blaming the
-    topology edit.
-
-    That diagnosis was false.  Explicit parameters do suppress the
-    ``[ dihedraltypes ]`` lookup: a butane variant carrying
-    ``X CG321 CG321 X 9 0.0 20.0 3`` passes the check at 9.7e-6 kJ/mol on
-    GROMACS 2025.4 (pinned by
-    ``tests/test_selfcheck.py::test_dihedraltypes_entry_is_suppressed_by_explicit_params``).
-    The real limitation is that the analytic reference cannot be built for a
-    term whose parameters this build never read.  A CGenFF or GAFF molecule
-    ``.itp`` that relies on type lookup is the normal case, so the message has
-    to say exactly that.
-
-    Args:
-        topology: parsed topology.
-        quad: 1-based target quadruplet.
-
-    Raises:
-        ValidationError: any member of T carries no explicit parameters.
-    """
-    tset = collect_torsion_set(topology, quad)
-    typed = [d for d in tset if not d.params]
-    if not typed:
-        return
-    listed = "".join(f"      {d.ai} {d.aj} {d.ak} {d.al}   funct {d.funct}\n" for d in typed[:8])
-    if len(typed) > 8:
-        listed += f"      ... and {len(typed) - 8} more\n"
-    raise ValidationError(
-        f"cannot run the spec 4.5 self-consistency check on {topology.source}: "
-        f"{len(typed)} of the {len(tset)} proper dihedral term-line(s) about the central "
-        f"bond ({quad[1]}, {quad[2]}) carry no explicit parameters, so GROMACS takes them "
-        f"from [ dihedraltypes ]:\n"
-        f"{listed}"
-        "  This build reads the molecule topology only -- it never reads the force "
-        "field's [ dihedraltypes ] tables -- so it has no force constant, phase or "
-        "multiplicity for those terms and cannot build the analytic reference the check "
-        "compares against. It would compare GROMACS's real torsion energy against an "
-        "analytic zero.\n"
-        "  This is NOT a failure of the topology edit: explicit parameters do suppress "
-        "the [ dihedraltypes ] lookup (verified against GROMACS 2025.4).\n"
-        "  Remedy: give those [ dihedrals ] lines explicit parameters -- the phase, k and "
-        "multiplicity your force field assigns them -- in a copy of the topology, and "
-        "re-run against the copy. Your input file is never modified. See 'What this "
-        "build cannot read' in the README."
-    )
-
-
 @dataclass
 class SelfCheckResult:
     """Outcome of the section 4.5 check.
@@ -170,6 +118,7 @@ def check_torsion_removal(
     tolerance: float = DEFAULT_TOLERANCE,
     strict_names: bool = True,
     ff_includes: list[str] | None = None,
+    resolved: ResolvedTorsionSet | None = None,
 ) -> SelfCheckResult:
     """Verify that zeroing removed exactly the intended torsion terms.
 
@@ -196,6 +145,11 @@ def check_torsion_removal(
             molecule in the generated wrapper ``.top`` (the CLI's
             ``--ff-include``). Needed when the molecule topology has no
             ``[ atomtypes ]`` of its own.
+        resolved: T with every term's parameters as grompp built them
+            (:func:`ffrefine.mm.tprparams.resolve_torsion_set`). ``mmscan``
+            resolves before its ``--resume`` check and passes the result in;
+            when omitted it is resolved here, in ``workdir``. Its
+            ``full_top`` is the "full" system this check runs.
 
     Returns:
         The check result when it passes.
@@ -214,18 +168,10 @@ def check_torsion_removal(
     for warning in validate_structure_topology(structure, topology, strict_names=strict_names):
         log.warning("structure/topology validation: %s", warning)
 
-    # Refuse typed terms BEFORE spending two GROMACS reruns on a comparison
-    # that cannot succeed, and before reporting a false cause. See
-    # _typed_terms_message for why the old post-hoc diagnosis was wrong.
-    _reject_typed_terms(topology, quad)
-
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-
-    full_itp = workdir / "full.itp"
-    write_molecule_copy(topology.source, full_itp)
-    full_top = workdir / "full.top"
-    make_system_top(full_itp, full_top, topology.name, ff_includes)
+    if resolved is None:
+        resolved = resolve_torsion_set(binaries, topology, quad, structure, workdir, ff_includes)
 
     zero_itp = workdir / "zeroed.itp"
     removed = write_zeroed_topology(topology, quad, zero_itp)
@@ -233,7 +179,7 @@ def check_torsion_removal(
     make_system_top(zero_itp, zero_top, topology.name, ff_includes)
 
     e_full = single_point_energies(
-        binaries, full_top, structure, frames, workdir / "full", "full", nthreads
+        binaries, resolved.full_top, structure, frames, workdir / "full", "full", nthreads
     )
     e_zero = single_point_energies(
         binaries, zero_top, structure, frames, workdir / "zeroed", "zeroed", nthreads
@@ -247,7 +193,7 @@ def check_torsion_removal(
     # frames -- otherwise the comparison measures PDB coordinate precision
     # rather than the correctness of the topology edit.
     gmx_frames = _as_gromacs_saw_it(frames)
-    analytic_difference = torsion_set_energy(removed, gmx_frames)
+    analytic_difference = torsion_set_energy(resolved.dihedrals, gmx_frames)
     # The zeroed lines contribute k*(1+cos(...)) with k=0, i.e. nothing, so the
     # analytic sum of the removed terms is the whole expected difference.
 
@@ -271,6 +217,7 @@ def check_torsion_removal(
 
     if not passed:
         worst = int(np.argmax(deviation))
+        n_typed = sum(t.source == SOURCE_DIHEDRALTYPES for t in resolved.terms)
         raise ValidationError(
             "torsion removal self-consistency check FAILED (spec section 4.5).\n"
             f"  maximum |E_full - E_zeroed - analytic| = {max_abs_error:.6g} kJ/mol "
@@ -278,14 +225,14 @@ def check_torsion_removal(
             f"  worst frame {worst}, phi = {phi[worst]:.2f} deg:\n"
             f"    GROMACS difference : {gromacs_difference[worst]:.6f} kJ/mol\n"
             f"    analytic reference : {analytic_difference[worst]:.6f} kJ/mol\n"
-            f"  {len(removed)} dihedral entries were zeroed about the central bond "
-            f"({quad[1]}, {quad[2]}).\n"
-            "  The topology edit did not do what was intended. Every term about this "
-            "bond carries explicit parameters (checked before the run), so this is not a "
-            "[ dihedraltypes ] lookup leaking through. "
-            ""
-            f"  Inspect {zero_itp} and the GROMACS logs under {workdir}. "
-            "Fitting is aborted."
+            f"  {len(removed)} dihedral term-line(s) were zeroed about the central bond "
+            f"({quad[1]}, {quad[2]}). The analytic reference sums {len(resolved.terms)} "
+            f"term(s): {len(resolved.terms) - n_typed} written in the topology and {n_typed} "
+            "resolved from [ dihedraltypes ], as grompp built them (read back from "
+            f"{resolved.dump_path}).\n"
+            "  The topology edit did not do what was intended.\n"
+            f"  Inspect {zero_itp}, {resolved.dump_path} and the GROMACS logs under "
+            f"{workdir}. Fitting is aborted."
         )
 
     log.info(
