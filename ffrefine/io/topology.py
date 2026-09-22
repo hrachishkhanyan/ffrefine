@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..errors import ParseError
+from .includes import find_marker, resolve_include_base
 
 PROPER_FUNCTS = (1, 9)
 """[ dihedrals ] funct values treated as proper dihedrals."""
@@ -88,6 +89,8 @@ class Topology:
             (including preprocessor directive lines) is kept unmodified, for
             round-tripping and downstream rewriting.
         source: path the topology was read from.
+        include_marker: the directory an ffrefine include-base marker in the
+            file names, or None.
     """
 
     name: str
@@ -101,11 +104,24 @@ class Topology:
     defaults: Defaults | None
     raw_lines: list[str]
     source: Path
+    include_marker: Path | None = None
 
     @property
     def natoms(self) -> int:
         """Number of atoms."""
         return len(self.atoms)
+
+    @property
+    def include_base(self) -> Path:
+        """Directory the file's relative ``#include`` lines resolve against.
+
+        The directory an ffrefine marker names, else the file's own directory
+        (milestone 6a design, section 5).
+
+        Raises:
+            ValidationError: the marker names a directory that does not exist.
+        """
+        return resolve_include_base(self.source, self.include_marker)
 
     def bonded_neighbours(self, nr: int) -> list[int]:
         """1-based indices bonded to atom ``nr``."""
@@ -128,6 +144,25 @@ def _comment(line: str) -> str:
     return line.split(";", 1)[1].strip() if ";" in line else ""
 
 
+def parse_defaults_fields(fields: list[str]) -> Defaults:
+    """Build a :class:`Defaults` from the fields of one ``[ defaults ]`` line.
+
+    Shared by :func:`read_topology` and the reader of grompp's preprocessed
+    topology, so the two cannot disagree about the directive's layout.
+
+    Raises:
+        IndexError, ValueError: the line is malformed.
+    """
+    gen = fields[2].lower() in ("yes", "y") if len(fields) > 2 else False
+    return Defaults(
+        nbfunc=int(fields[0]),
+        comb_rule=int(fields[1]),
+        gen_pairs=gen,
+        fudge_lj=float(fields[3]) if len(fields) > 3 else 1.0,
+        fudge_qq=float(fields[4]) if len(fields) > 4 else 1.0,
+    )
+
+
 def read_topology(path: str | Path, defines: set[str] | None = None) -> Topology:
     """Parse an .itp or .top file into a :class:`Topology`.
 
@@ -144,7 +179,8 @@ def read_topology(path: str | Path, defines: set[str] | None = None) -> Topology
 
     Raises:
         ParseError: the file could not be read (missing, a directory, or
-            unreadable), on malformed input, or a missing [ atoms ] section.
+            unreadable), on malformed input, a missing [ atoms ] section,
+            or two conflicting ffrefine include-base markers.
     """
     path = Path(path)
     defines = set(defines or ())
@@ -207,14 +243,7 @@ def read_topology(path: str | Path, defines: set[str] | None = None) -> Topology
         fields = body.split()
         try:
             if section == "defaults":
-                gen = fields[2].lower() in ("yes", "y") if len(fields) > 2 else False
-                defaults = Defaults(
-                    nbfunc=int(fields[0]),
-                    comb_rule=int(fields[1]),
-                    gen_pairs=gen,
-                    fudge_lj=float(fields[3]) if len(fields) > 3 else 1.0,
-                    fudge_qq=float(fields[4]) if len(fields) > 4 else 1.0,
-                )
+                defaults = parse_defaults_fields(fields)
             elif section == "moleculetype":
                 name = fields[0]
                 nrexcl = int(fields[1])
@@ -272,4 +301,5 @@ def read_topology(path: str | Path, defines: set[str] | None = None) -> Topology
         defaults=defaults,
         raw_lines=raw_lines,
         source=path,
+        include_marker=find_marker(all_lines, path),
     )

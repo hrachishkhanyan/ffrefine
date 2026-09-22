@@ -1,6 +1,8 @@
 import pytest
 from ffrefine.errors import ParseError
 from ffrefine.io import topology as tp
+from ffrefine.io.includes import MARKER_NOTE, MARKER_PREFIX
+from ffrefine.io.topology import Defaults, parse_defaults_fields
 
 TOP = """\
 [ defaults ]
@@ -174,3 +176,26 @@ def test_missing_atoms_section_raises(tmp_path):
     p.write_text("[ moleculetype ]\nBUT 3\n")
     with pytest.raises(ParseError, match="atoms"):
         tp.read_topology(p)
+
+
+def test_topology_include_base_defaults_to_its_directory(tmp_path):
+    p = tmp_path / "butane.itp"
+    p.write_text(TOP)
+    t = tp.read_topology(p)
+    assert t.include_base == p.resolve().parent
+
+
+def test_topology_include_base_reads_the_marker(tmp_path):
+    p = tmp_path / "copy.itp"
+    base = tmp_path.resolve()
+    p.write_text(f"{MARKER_NOTE}\n{MARKER_PREFIX}{base}\n" + TOP)
+    t = tp.read_topology(p)
+    assert t.include_marker == base
+    assert t.include_base == base
+
+
+def test_parse_defaults_fields():
+    assert parse_defaults_fields(["1", "2", "yes", "0.5", "0.8333"]) == Defaults(
+        nbfunc=1, comb_rule=2, gen_pairs=True, fudge_lj=0.5, fudge_qq=0.8333
+    )
+    assert parse_defaults_fields(["1", "1"]) == Defaults(1, 1, False, 1.0, 1.0)
