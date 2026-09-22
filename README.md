@@ -13,20 +13,20 @@ mandatory self-consistency check (spec section 4.5) verifies the edit against
 an independent analytic evaluation before any fitting happens, and aborts if it
 disagrees by more than 1e-3 kJ/mol.
 
-## Status: milestones 1-5 of 6
+## Status: milestones 1-5 and 6a of 6
 
 | Subcommand | State |
 |---|---|
 | `ffrefine scan` | works -- relaxed xtb torsion scan, bidirectional by default, reports conformational hops and hydrogen bonding, optional `--sp-refine` |
-| `ffrefine mmscan` | works -- MM single points with and without the torsion, plus the mandatory self-check |
+| `ffrefine mmscan` | works -- MM single points with and without the torsion, plus the mandatory self-check; typed (`[ dihedraltypes ]`) torsions get the parameters grompp itself built |
 | `ffrefine fit` | works -- weighted linear cosine fit, BIC model selection, `.itp`/`.prm`/`fit.json`/plots |
 | `ffrefine charges` | works -- ESP-derived partial charges via ORCA, CHELPG or two-stage restrained RESP, equivalent hydrogens constrained equal, `selected` mode by default |
 | `ffrefine validate` | works -- rebuild with the fitted series, re-run MM, report RMSE before and after |
 | `ffrefine run` | works -- chains all five stages, charges first when asked, and says which stage it skipped |
 
 Also not implemented: CGenFF `.str` penalty parsing and the automatic torsion
-and charge-atom selection it would drive (`--str`, milestone 6), the
-`final/report.md` summary document (milestone 6), and `--mm-relax` (spec 4.6).
+and charge-atom selection it would drive (`--str`), and the `final/report.md`
+summary document -- both milestone 6b -- and `--mm-relax` (spec 4.6).
 
 ### What the scan and charges do not do
 
@@ -89,8 +89,9 @@ point on every frame of the grid. It is opt-in for that reason.
 - `-p/--topology`: the molecule's `.itp` or `.top` (CHARMM36/CGenFF or GAFF
   style). A molecule `.top` carrying its own `[ system ]` and `[ molecules ]`
   works: those two sections are dropped from the working copies ffrefine builds,
-  because the wrapper it generates for `grompp` supplies its own. Read "What
-  this build cannot read" below before pointing this at a real force field.
+  because the wrapper it generates for `grompp` supplies its own. The CGenFF
+  server's GROMACS export (`<mol>_gmx.top` beside its `charmm36.ff/`) works as
+  is: see "Worked example: PFOA" below.
 - `--dihedral i,j,k,l`: the target torsion, **1-based** atom indices matching
   the topology's `[ atoms ]` numbering. This is the only index convention the
   user ever sees; the conversion to 0-based array indices happens internally at
@@ -101,41 +102,45 @@ normalized copies of the inputs land in `00_input/`.
 
 ## What this build cannot read
 
-The topology parser reads **one file**, and it reads only what is written in
-that file. Three common topologies therefore do not work, and all three fail
-with a clear message rather than a wrong number. This is a stated scope
-boundary, not a bug list.
+The topology parser reads **one file**: the one `-p` names. grompp reads
+everything that file includes, and ffrefine asks grompp for what it needs from
+there instead of reading the force field itself. One common layout still does
+not work, and it fails with a clear message rather than a wrong number.
 
-**1. Target dihedrals whose parameters come from `[ dihedraltypes ]`.**
-This is the normal shape of a CGenFF or GAFF molecule `.itp`: the
-`[ dihedrals ]` lines carry `i j k l 9` and nothing else, and GROMACS looks the
-force constants up by atom type. ffrefine never reads those type tables, so it
-cannot build the independent analytic reference the mandatory spec 4.5
-self-check compares GROMACS against -- it would be comparing a real torsion
-energy against zero. `mmscan` detects this *before* running GROMACS and refuses,
-naming the offending lines.
+**`[ atoms ]` inside an `#include`d file.** A `.top` whose molecule lives in an
+included `.itp` parses to "no `[ atoms ]` section found". Point `-p` at the file
+that actually contains the `[ moleculetype ]` you want to refit. The same
+limitation applies to `--resume`: see the `--resume` bullet under Common flags.
 
-To proceed, write those `[ dihedrals ]` lines out with their explicit `phi0`,
-`k` and multiplicity (the values your force field assigns them) in a **copy** of
-the topology, and run against the copy. Explicit parameters do suppress the
-`[ dihedraltypes ]` lookup -- that is verified against GROMACS 2025.4 by
-`tests/test_selfcheck.py::test_dihedraltypes_entry_is_suppressed_by_explicit_params`,
-not assumed.
+What used to be on this list, and now works:
 
-**2. Topologies that need force-field `#include`s to be complete.** A molecule
-`.itp` that has no `[ atomtypes ]` of its own, because it expects
-`charmm36.ff/forcefield.itp` to have been included first, cannot be turned into
-a runnable system by ffrefine alone. Pass the include with `--ff-include`, which
-is emitted ahead of the molecule in the generated wrapper `.top`; the path is
-handed to `grompp` verbatim, so relative paths resolve against the stage
-directory.
+- **Torsions whose parameters come from `[ dihedraltypes ]`**, the normal shape
+  of a CGenFF or GAFF molecule topology, where the `[ dihedrals ]` lines carry
+  `i j k l 9` and nothing else. `mmscan` runs `grompp -pp` and `gmx dump` on your
+  unmodified topology and reads back the terms grompp itself built
+  (`02_mm_scan/full_dump.stdout`), cross-checking them line by line against the
+  torsion set. Those are the numbers the mandatory self-check uses, and
+  `energies.json` records every one with its source. ffrefine does not
+  reimplement grompp's type matching, so it cannot disagree with it. grompp
+  builds no term for a `k = 0` entry; a typed line whose terms are all zero
+  simply contributes nothing.
+- **Relative `#include`s.** The copies ffrefine hands to grompp live in stage
+  directories, so their relative includes are rewritten to absolute paths. The
+  files you keep -- `03_fit/dihedral.itp`, `04_charges/molecule_charged.itp`,
+  `final/molecule_refined.itp` -- keep your include lines exactly as written, so
+  each is a drop-in replacement beside your original, and two comment lines at
+  the top name the directory those lines were written for. ffrefine reads that
+  marker when `-p` later points at such a file.
+- **`[ defaults ]` only in an include.** `fudgeQQ`, `fudgeLJ` and gen-pairs are
+  read from grompp's preprocessed topology and recorded in `energies.json`.
+- **`--resume` after editing the force field.** `mmscan` and `validate` key on a
+  digest of grompp's preprocessed topology, so editing any file grompp reads
+  makes them rerun.
 
-**3. Anything that requires following an `#include`.** `#include` lines are
-copied through verbatim and never followed. A `.top` whose `[ atoms ]` lives in
-an `#include`d `.itp` parses to "no `[ atoms ]` section found". Point `-p` at the
-file that actually contains the `[ moleculetype ]` you want to refit. Note the
-same limitation applies to `--resume`: see the `--resume` bullet under Common
-flags.
+A molecule `.itp` with no `[ atomtypes ]` and no `#include` of its own still
+needs `--ff-include` to name the force field; it is emitted ahead of the
+molecule in the generated wrapper `.top`, and a path to a file ffrefine can see
+is made absolute.
 
 ## Worked example: n-butane
 
@@ -331,6 +336,35 @@ remaining stages pick up the charge-refined topology automatically:
 `-p` to `04_charges/molecule_charged.itp` for every stage after `charges`.
 `00_input/` still holds, and `model.json` still names, the topology you passed.
 
+## Worked example: PFOA, a real CGenFF topology
+
+`fixtures/pfoa_gromacs/` holds perfluorooctanoic acid exactly as the CGenFF
+server exported it for GROMACS -- `pfoa.str`, `pfoa_gmx.top`, `pfoa_gmx.pdb` --
+beside a `charmm36.ff/` trimmed to the types it uses (see its `PROVENANCE.md`).
+Every torsion in `pfoa_gmx.top` is typed, and the `.top` includes
+`./charmm36.ff/forcefield.itp` and `pfo_ffbonded.itp`.
+
+`pfoa.str` gives the torsion `OG311 CG2O2 CG312 CG312` a penalty of 67: in
+`.top` numbering that is atoms **25, 1, 3, 4** (the hydroxyl oxygen, the
+carboxyl carbon and the first two chain carbons). The export renamed the atoms,
+so the `.str` names do not match the `.top`'s; the indices are the `.top`'s.
+
+    ffrefine run \
+        -s fixtures/pfoa_gromacs/pfoa_gmx.pdb \
+        -p fixtures/pfoa_gromacs/pfoa_gmx.top \
+        --dihedral 25,1,3,4 \
+        --outdir pfoa_out
+
+`pfoa_out/02_mm_scan/energies.json` lists the 20 terms about the C1-C3 bond,
+each with `"source": "dihedraltypes"` -- the target's four CGenFF
+multiplicities (1, 2, 3 and 6) among them -- and the CHARMM36 defaults,
+`fudgeQQ` and `fudgeLJ` both 1.0. `pfoa_out/final/molecule_refined.itp`
+carries the fitted series on the target torsion; copied next to `pfoa_gmx.top`
+and its `charmm36.ff/`, it replaces the original.
+
+Choosing the torsion from `pfoa.str`'s penalties automatically, and the
+`report.md` that summarises a run, are milestone 6b.
+
 ## Output layout
 
     butane_out/
@@ -338,9 +372,12 @@ remaining stages pick up the charge-refined topology automatically:
                     (atom/bond/dihedral counts, fudgeQQ, fudgeLJ, the torsion set)
       01_qm_scan/   scan.json, scan.pdb (the geometries as a multi-model PDB),
                     forward/ and reverse/ xtb working directories and logs
-      02_mm_scan/   mdp, tpr, edr, xvg, full.top, zeroed.top, GROMACS logs, and
+      02_mm_scan/   mdp, tpr, edr, xvg, full.top, zeroed.top, GROMACS logs,
+                    full_pp.top and full_dump.stdout (grompp's preprocessed
+                    topology, and the parameters it built, read back), and
                     energies.json (measured phi, full and zeroed potentials, the
-                    self-check residual)
+                    self-check residual, every removed term's parameters and
+                    where they came from, fudgeQQ/fudgeLJ as grompp read them)
       03_fit/       fit.json (every number), dihedral.itp (the fitted [ dihedrals ]
                     lines, funct 9, kJ/mol and degrees), dihedral.prm (CHARMM
                     DIHEDRALS block in kcal/mol), plots/
@@ -351,11 +388,13 @@ remaining stages pick up the charge-refined topology automatically:
                     only), and, under --charge-scheme resp, grid.xyz and
                     grid_out.vpot (the MK grid sent to and read back from
                     orca_vpot)
-      final/        molecule_refined.itp, validation.json, plots/validation.png,
-                    plus the before/after topologies and GROMACS logs
+      final/        molecule_refined.itp (your #include lines, drop-in),
+                    validation.json, plots/validation.png, plus the before/after
+                    topologies grompp ran (absolute includes), before_pp.top
+                    and GROMACS logs
       run.log       every external command with its full command line
 
-`final/report.md` is part of the layout but belongs to milestone 6 and is not
+`final/report.md` is part of the layout but belongs to milestone 6b and is not
 produced.
 
 Plots: `03_fit/plots/` holds the QM profile, the MM-zeroed profile, the target
@@ -579,7 +618,7 @@ available before trusting the result.
 
     pytest -m "needs_gmx or needs_xtb or needs_orca"   # and check nothing skipped
 
-As of this milestone the suite holds 547 tests: 16 marked `needs_gmx`, 4
+As of this milestone the suite holds 619 tests: 29 marked `needs_gmx`, 5
 `needs_xtb` and 11 `needs_orca`. The rest need nothing external and always run.
 
 The load-bearing one is spec section 7.1's round trip, which covers the whole
