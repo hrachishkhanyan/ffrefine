@@ -110,7 +110,9 @@ not work, and it fails with a clear message rather than a wrong number.
 **`[ atoms ]` inside an `#include`d file.** A `.top` whose molecule lives in an
 included `.itp` parses to "no `[ atoms ]` section found". Point `-p` at the file
 that actually contains the `[ moleculetype ]` you want to refit. The same
-limitation applies to `--resume`: see the `--resume` bullet under Common flags.
+limitation applies to `--resume` for `scan`, `fit` and `charges`, which hash
+only the top-level topology file; `mmscan` and `validate` key on grompp's
+preprocessed topology instead. See the `--resume` bullet under Common flags.
 
 What used to be on this list, and now works:
 
@@ -128,9 +130,11 @@ What used to be on this list, and now works:
   directories, so their relative includes are rewritten to absolute paths. The
   files you keep -- `03_fit/dihedral.itp`, `04_charges/molecule_charged.itp`,
   `final/molecule_refined.itp` -- keep your include lines exactly as written, so
-  each is a drop-in replacement beside your original, and two comment lines at
-  the top name the directory those lines were written for. ffrefine reads that
-  marker when `-p` later points at such a file.
+  each drops in beside your original as the molecule include -- wrap it with
+  your own `[ system ]`/`[ molecules ]`, or `#include` it from your own `.top`,
+  to run it -- and two comment lines at the top name the directory those lines
+  were written for. ffrefine reads that marker when `-p` later points at such a
+  file.
 - **`[ defaults ]` only in an include.** `fudgeQQ`, `fudgeLJ` and gen-pairs are
   read from grompp's preprocessed topology and recorded in `energies.json`.
 - **`--resume` after editing the force field.** `mmscan` and `validate` key on a
@@ -359,8 +363,12 @@ so the `.str` names do not match the `.top`'s; the indices are the `.top`'s.
 each with `"source": "dihedraltypes"` -- the target's four CGenFF
 multiplicities (1, 2, 3 and 6) among them -- and the CHARMM36 defaults,
 `fudgeQQ` and `fudgeLJ` both 1.0. `pfoa_out/final/molecule_refined.itp`
-carries the fitted series on the target torsion; copied next to `pfoa_gmx.top`
-and its `charmm36.ff/`, it replaces the original.
+carries the fitted series on the target torsion. It strips `[ system ]`/
+`[ molecules ]`, so it is not a runnable `.top` by itself; copied next to
+`pfoa_gmx.top` and its `charmm36.ff/`, it is the molecule include for a `.top`
+of your own -- wrapped with your own `[ system ]`/`[ molecules ]`, the way the
+end-to-end test's `make_system_top` wraps it -- not a drop-in replacement for
+`pfoa_gmx.top` itself.
 
 Choosing the torsion from `pfoa.str`'s penalties automatically, and the
 `report.md` that summarises a run, are milestone 6b.
@@ -418,10 +426,13 @@ Every subcommand accepts `--config file.json`, `--outdir`, `--nthreads`,
   names like `charmm36.ff/forcefield.itp` still resolve.
 - `--resume` skips a stage whose recorded input hashes still match. A manifest
   that is missing, corrupt, or built from different inputs always recomputes.
-  **The hash covers the top-level topology file only.** `#include` directives are
-  not followed, so editing an `#include`d `.itp` -- or the force field named by
-  `--ff-include` -- leaves the hash unchanged and the stage is skipped as current.
-  Re-run without `--resume` after changing an included file.
+  **What the hash covers depends on the stage.** `mmscan` and `validate` run
+  grompp and key on a digest of its preprocessed topology, so editing any file
+  grompp reads -- an `#include`d `.itp`, or the force field named by
+  `--ff-include` -- makes them rerun. `scan`, `fit` and `charges` never run
+  grompp; they hash the top-level topology file and their own inputs only, so
+  editing an included file leaves their hash unchanged. Re-run those three
+  without `--resume` after changing an included file.
 - `--dry-run` validates the inputs, reports what would run, and creates nothing
   at all -- not even the output directory.
 - `--no-strict-names` downgrades an atom-name mismatch between structure and

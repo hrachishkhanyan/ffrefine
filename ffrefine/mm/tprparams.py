@@ -384,7 +384,12 @@ def _sha256(path: Path) -> str:
 
 
 def _preprocess(
-    binaries: Binaries, topology: Topology, top: Path, structure: Structure, workdir, stem: str
+    binaries: Binaries,
+    topology: Topology,
+    top: Path,
+    structure: Structure,
+    workdir: str | Path,
+    stem: str,
 ) -> tuple[Path, Path]:
     """:func:`preprocess_topology`, naming the include base when an include is missing.
 

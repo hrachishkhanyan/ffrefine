@@ -608,7 +608,7 @@ def _collect_warnings() -> Iterator[list[str]]:
 
     For stages that must keep their warnings in their own output file, not
     only in ``run.log`` and on stderr -- ``charges.json``'s ``warnings`` list
-    (design section 7, ruling R25), which milestone 6's report reads.
+    (design section 7, ruling R25), which milestone 6b's report reads.
     Collecting at :func:`_warn` rather than at the call sites means a warning
     added later is kept without anyone remembering to keep it.
     """
@@ -698,7 +698,7 @@ def _resolve_quad(args: argparse.Namespace, topology: Topology) -> Quad:
         raise ValidationError(
             "no torsion selected. Pass --dihedral i,j,k,l using 1-based atom "
             "indices. Automatic selection from a CGenFF .str file arrives in "
-            "milestone 6 and is not available in this build."
+            "milestone 6b and is not available in this build."
         )
     if len(quads) > 1:
         raise ValidationError(
@@ -1432,7 +1432,7 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
                 "named. Pass --charge-atoms i,j,k (1-based), or --charge-mode all to "
                 "replace every charge -- which on a CGenFF topology changes the derivation "
                 "scheme, so read the warning it prints. Choosing atoms automatically from "
-                "a CGenFF .str file arrives in milestone 6."
+                "a CGenFF .str file arrives in milestone 6b."
             )
         selected_atoms = sorted({nr for group in args.charge_atoms for nr in group})
     elif args.charge_atoms:

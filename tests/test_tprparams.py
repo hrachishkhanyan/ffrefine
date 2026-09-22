@@ -12,8 +12,11 @@ import shutil
 from pathlib import Path
 
 import pytest
+from ffrefine.config import Binaries
 from ffrefine.errors import ValidationError
-from ffrefine.io.topology import Defaults, Dihedral
+from ffrefine.io.structure import read_pdb
+from ffrefine.io.topology import Defaults, Dihedral, read_topology
+from ffrefine.mm.torsionset import collect_torsion_set
 from ffrefine.mm.tprparams import (
     SOURCE_DIHEDRALTYPES,
     SOURCE_TOPOLOGY,
@@ -22,6 +25,8 @@ from ffrefine.mm.tprparams import (
     cross_check,
     parse_defaults,
     parse_dump_torsions,
+    preprocessed_sha256,
+    resolve_torsion_set,
 )
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -214,12 +219,6 @@ def test_an_empty_torsion_set_resolves_to_nothing():
 # --------------------------------------------------------------------------
 # resolve_torsion_set / preprocessed_sha256 (live, needs gmx)
 # --------------------------------------------------------------------------
-
-from ffrefine.config import Binaries
-from ffrefine.io.structure import read_pdb
-from ffrefine.io.topology import read_topology
-from ffrefine.mm.torsionset import collect_torsion_set
-from ffrefine.mm.tprparams import preprocessed_sha256, resolve_torsion_set
 
 CAPECITABINE = FIXTURES / "capecitabine_gromacs"
 
