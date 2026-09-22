@@ -103,13 +103,15 @@ from .fit.selection import (
     select_model,
 )
 from .fit.weights import DEFAULT_EMAX, DEFAULT_TEMPERATURE, boltzmann_weights, uniform_weights
+from .io.includes import has_includes
 from .io.prm import write_prm_block
 from .io.structure import Structure, read_structure, write_multimodel_pdb
-from .io.topology import Topology, read_topology
+from .io.topology import Defaults, Topology, read_topology
 from .io.topwriter import write_charged_topology, write_refit_topology
 from .io.validate import adopt_topology_naming, element_of, validate_structure_topology
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
+from .mm.tprparams import ResolvedTerm, resolve_torsion_set
 from .mm.validate_fit import validate_refit
 from .plots import plot_fit, plot_mm_zeroed, plot_qm_profile, plot_residuals, plot_validation
 from .qm.scan import (
@@ -761,11 +763,19 @@ def _write_input_stage(
         model["torsion_set_size"] = len(torsion_set)
         model["torsion_set_1_based"] = [[d.ai, d.aj, d.ak, d.al] for d in torsion_set]
     if defaults is None:
-        _warn(
-            f"{input_topology} has no [ defaults ] directive, so fudgeQQ/fudgeLJ could not "
-            "be read. The fitted torsion is only valid with the 1-4 conventions it was "
-            "fitted against (spec section 9.3); record them yourself."
-        )
+        if has_includes(topology.raw_lines) or _ff_includes(args):
+            # grompp reads the includes; mmscan asks it (milestone 6a design, section 4).
+            log.info(
+                "%s: [ defaults ] is not in this file itself; mmscan reads it from grompp's "
+                "preprocessed topology and records it in 02_mm_scan/energies.json",
+                input_topology,
+            )
+        else:
+            _warn(
+                f"{input_topology} has no [ defaults ] directive, so fudgeQQ/fudgeLJ could not "
+                "be read. The fitted torsion is only valid with the 1-4 conventions it was "
+                "fitted against (spec section 9.3); record them yourself."
+            )
     (target / "model.json").write_text(json.dumps(model, indent=2) + "\n")
 
 
@@ -1616,6 +1626,31 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
     return 0
 
 
+def _torsion_record(term: ResolvedTerm) -> dict:
+    """One ``energies.json`` ``torsion_parameters`` entry (milestone 6a design, section 4)."""
+    d = term.dihedral
+    return {
+        "quad_1_based": [d.ai, d.aj, d.ak, d.al],
+        "funct": d.funct,
+        "phi0_deg": float(d.params[0]),
+        "k_kj_per_mol": float(d.params[1]),
+        "multiplicity": int(round(float(d.params[2]))),
+        "source": term.source,
+    }
+
+
+def _defaults_record(defaults: Defaults | None) -> dict | None:
+    """``[ defaults ]`` as grompp read it, for ``energies.json``."""
+    if defaults is None:
+        return None
+    return {
+        "fudgeQQ": defaults.fudge_qq,
+        "fudgeLJ": defaults.fudge_lj,
+        "gen_pairs": defaults.gen_pairs,
+        "source": "grompp -pp",
+    }
+
+
 def cmd_mmscan(args: argparse.Namespace) -> int:
     """Compute MM single points with and without the target torsion.
 
@@ -1662,10 +1697,17 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         )
 
     ff_includes = _ff_includes(args)
+    binaries = _binaries(args)
+    workdir = stage_dir(args.outdir, "mm_scan")
+    # Resolved before the --resume check: the key must cover every file grompp
+    # reads, and only grompp knows which files those are (milestone 6a design,
+    # section 4). About a second, even when the stage is then skipped.
+    resolved = resolve_torsion_set(binaries, topology, quad, structure, workdir, ff_includes)
     settings = {
         "quad": list(quad),
         "nframes": int(frames.shape[0]),
         "ff_includes": ff_includes,
+        "preprocessed_topology_sha256": resolved.pp_sha256,
     }
     digest = hash_inputs(inputs, settings)
     if args.resume and stage_is_current(
@@ -1674,8 +1716,6 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         print(f"mmscan: skipping, {_energies_path(args)} is current (--resume)")
         return 0
 
-    binaries = _binaries(args)
-    workdir = stage_dir(args.outdir, "mm_scan")
     result = check_torsion_removal(
         binaries,
         topology,
@@ -1686,12 +1726,20 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         args.nthreads,
         strict_names=not args.no_strict_names,
         ff_includes=ff_includes,
+        resolved=resolved,
     )
     print(
         f"torsion {quad}: spec 4.5 self-consistency check passed over "
         f"{len(result.phi_deg)} frame(s), max deviation {result.max_abs_error:.3g} kJ/mol "
         f"(tolerance {result.tolerance:g})"
     )
+    if resolved.defaults is None:
+        _warn(
+            f"grompp's preprocessed topology {workdir / 'full_pp.top'} has no [ defaults ] "
+            "directive, so fudgeQQ/fudgeLJ could not be recorded. The fitted torsion is only "
+            "valid with the 1-4 conventions it was fitted against (spec section 9.3); record "
+            "them yourself."
+        )
 
     payload = {
         "quad": list(quad),
@@ -1707,6 +1755,12 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         "torsion_contribution_kj": [float(v) for v in result.gromacs_difference],
         "selfcheck_max_abs_error_kj": float(result.max_abs_error),
         "selfcheck_tolerance_kj": float(result.tolerance),
+        # Milestone 6a: the parameters the self-check used, as grompp built them,
+        # with where each came from; milestone 6b's report reads its "before"
+        # values here. And [ defaults ] as grompp read it, include or not.
+        "torsion_parameters": [_torsion_record(t) for t in resolved.terms],
+        "defaults": _defaults_record(resolved.defaults),
+        "preprocessed_topology_sha256": resolved.pp_sha256,
     }
     (workdir / "energies.json").write_text(json.dumps(payload, indent=2) + "\n")
     write_manifest(args.outdir, "mm_scan", digest, {"quad": list(quad)})
