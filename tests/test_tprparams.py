@@ -8,6 +8,7 @@ copies of it for every refusal.
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -208,3 +209,99 @@ def test_terms_about_other_bonds_are_ignored():
 
 def test_an_empty_torsion_set_resolves_to_nothing():
     assert cross_check([], [_term(Q, 0.0, 1.0, 3)], SRC) == []
+
+
+# --------------------------------------------------------------------------
+# resolve_torsion_set / preprocessed_sha256 (live, needs gmx)
+# --------------------------------------------------------------------------
+
+from ffrefine.config import Binaries
+from ffrefine.io.structure import read_pdb
+from ffrefine.io.topology import read_topology
+from ffrefine.mm.torsionset import collect_torsion_set
+from ffrefine.mm.tprparams import preprocessed_sha256, resolve_torsion_set
+
+CAPECITABINE = FIXTURES / "capecitabine_gromacs"
+
+
+def _quad_of(d: Dihedral) -> tuple[int, int, int, int]:
+    return (d.ai, d.aj, d.ak, d.al)
+
+
+@pytest.mark.needs_gmx
+def test_pfoa_typed_torsion_set_resolves_from_dihedraltypes(tmp_path, gmx_bin):
+    t = read_topology(PFOA / "pfoa_gmx.top")
+    s = read_pdb(PFOA / "pfoa_gmx.pdb")
+    r = resolve_torsion_set(Binaries(gmx=gmx_bin), t, (25, 1, 3, 4), s, tmp_path)
+    assert len(r.terms) == 20
+    assert {x.source for x in r.terms} == {SOURCE_DIHEDRALTYPES}
+    target = [x.dihedral for x in r.terms if _quad_of(x.dihedral) == (25, 1, 3, 4)]
+    assert [d.params[2] for d in target] == [1.0, 2.0, 3.0, 6.0]
+    assert [d.params[1] for d in target] == pytest.approx(
+        [0.66944, 0.46024, 0.33472, 1.046], rel=1e-6
+    )
+    assert r.defaults == Defaults(1, 2, True, 1.0, 1.0)
+    assert re.fullmatch(r"[0-9a-f]{64}", r.pp_sha256)
+    assert r.gromacs_version != "unknown"
+    assert r.full_top == tmp_path / "full.top"
+    assert r.dump_path == tmp_path / "full_dump.stdout" and r.dump_path.is_file()
+    ff = (PFOA / "charmm36.ff").resolve()
+    assert f'#include "{ff / "forcefield.itp"}"' in (tmp_path / "full.itp").read_text()
+
+
+@pytest.mark.needs_gmx
+def test_capecitabine_zero_k_lines_resolve_to_no_terms(tmp_path, gmx_bin):
+    """6 7 9 37 and 8 7 9 37 are typed, and every CGenFF term for them has k = 0."""
+    t = read_topology(CAPECITABINE / "capecitabine_gmx.top")
+    s = read_pdb(CAPECITABINE / "capecitabine_gmx.pdb")
+    r = resolve_torsion_set(Binaries(gmx=gmx_bin), t, (6, 7, 9, 10), s, tmp_path)
+    assert len(collect_torsion_set(t, (6, 7, 9, 10))) == 4
+    assert [(_quad_of(x.dihedral), x.dihedral.params[2]) for x in r.terms] == [
+        ((6, 7, 9, 10), 1.0),
+        ((6, 7, 9, 10), 2.0),
+        ((8, 7, 9, 10), 2.0),
+    ]
+    assert [x.dihedral.params[1] for x in r.terms] == pytest.approx(
+        [6.6944, 10.46, 8.368], rel=1e-6
+    )
+
+
+@pytest.mark.needs_gmx
+def test_explicit_butane_lines_pass_the_dump_cross_check(tmp_path, butane_itp, butane_pdb, gmx_bin):
+    """Every butane term is explicit: the cross-check runs and changes nothing."""
+    t = read_topology(butane_itp)
+    r = resolve_torsion_set(Binaries(gmx=gmx_bin), t, (1, 5, 8, 11), read_pdb(butane_pdb), tmp_path)
+    assert {x.source for x in r.terms} == {SOURCE_TOPOLOGY}
+    assert r.dihedrals == collect_torsion_set(t, (1, 5, 8, 11))
+
+
+@pytest.mark.needs_gmx
+def test_preprocessed_sha256_tracks_included_files(tmp_path, gmx_bin):
+    """Editing a file only the .top's includes reach must change the digest."""
+    work = tmp_path / "pfoa"
+    shutil.copytree(PFOA, work)
+    t = read_topology(work / "pfoa_gmx.top")
+    s = read_pdb(work / "pfoa_gmx.pdb")
+    binaries = Binaries(gmx=gmx_bin)
+    first = preprocessed_sha256(binaries, t, s, tmp_path / "a", "before")
+    assert preprocessed_sha256(binaries, t, s, tmp_path / "b", "before") == first
+    ffbonded = work / "charmm36.ff" / "pfo_ffbonded.itp"
+    ffbonded.write_text(ffbonded.read_text().replace("0.669440", "0.700000", 1))
+    assert preprocessed_sha256(binaries, t, s, tmp_path / "c", "before") != first
+
+
+@pytest.mark.needs_gmx
+def test_a_missing_include_names_the_base_it_was_resolved_against(tmp_path, gmx_bin):
+    """Design section 7: grompp's error, plus where ffrefine looked and why there."""
+    from ffrefine.errors import ExternalToolError
+
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    shutil.copyfile(PFOA / "pfoa_gmx.top", lonely / "pfoa_gmx.top")  # no charmm36.ff/ beside it
+    t = read_topology(lonely / "pfoa_gmx.top")
+    s = read_pdb(PFOA / "pfoa_gmx.pdb")
+    with pytest.raises(ExternalToolError) as excinfo:
+        resolve_torsion_set(Binaries(gmx=gmx_bin), t, (25, 1, 3, 4), s, tmp_path / "wd")
+    msg = str(excinfo.value)
+    assert 'Topology include file "./charmm36.ff/forcefield.itp" not found' in msg
+    assert f"against {lonely.resolve()} (the directory of" in msg

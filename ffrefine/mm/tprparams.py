@@ -24,13 +24,19 @@ atom indices are converted as they are read.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..errors import ValidationError
-from ..io.topology import Defaults, Dihedral, parse_defaults_fields
+from ..config import Binaries
+from ..errors import ExternalToolError, ValidationError
+from ..io.structure import Structure
+from ..io.topology import Defaults, Dihedral, Topology, parse_defaults_fields
+from ..io.topwriter import make_system_top, write_molecule_copy
+from .gromacs import dump_tpr, preprocess_topology
+from .torsionset import collect_torsion_set
 
 log = logging.getLogger("ffrefine")
 
@@ -371,3 +377,124 @@ def cross_check(
             f"(from {dump_path}).\n  {_IFDEF_HINT}"
         )
     return resolved
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _preprocess(
+    binaries: Binaries, topology: Topology, top: Path, structure: Structure, workdir, stem: str
+) -> tuple[Path, Path]:
+    """:func:`preprocess_topology`, naming the include base when an include is missing.
+
+    grompp's "Topology include file ... not found" says what it could not
+    open, not where ffrefine pointed it; design section 7 asks for both.
+    """
+    try:
+        return preprocess_topology(binaries, top, structure, workdir, stem)
+    except ExternalToolError as exc:
+        if "include file" not in str(exc):
+            raise
+        how = (
+            f"named by the ffrefine include-base marker in {topology.source}"
+            if topology.include_marker is not None
+            else f"the directory of {topology.source}"
+        )
+        raise ExternalToolError(
+            f"{exc}\n  ffrefine resolved the relative #include lines of "
+            f"{Path(topology.source).name} against {topology.include_base} ({how}). An "
+            "include with no file there is left for grompp's own search, which is what "
+            "failed above."
+        ) from exc
+
+
+def write_full_system(
+    topology: Topology, workdir: str | Path, stem: str, ff_includes: list[str] | None = None
+) -> Path:
+    """Write ``<stem>.itp`` (the unmodified topology, includes absolute) and ``<stem>.top``.
+
+    Returns:
+        The wrapper ``.top`` to hand to grompp.
+    """
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    itp = workdir / f"{stem}.itp"
+    write_molecule_copy(topology.source, itp)
+    top = workdir / f"{stem}.top"
+    make_system_top(itp, top, topology.name, ff_includes)
+    return top
+
+
+def resolve_torsion_set(
+    binaries: Binaries,
+    topology: Topology,
+    quad: Quad,
+    structure: Structure,
+    workdir: str | Path,
+    ff_includes: list[str] | None = None,
+) -> ResolvedTorsionSet:
+    """Give every term of T explicit parameters, as grompp built them.
+
+    Writes ``full.itp``/``full.top`` (the unmodified topology), runs
+    ``grompp -pp`` and ``gmx dump`` on it, and cross-checks the result
+    against T (design section 6.3). About a second on PFOA with CHARMM36.
+
+    Args:
+        binaries: ``gmx`` required.
+        topology: the unmodified topology.
+        quad: 1-based target quadruplet; only its central bond matters.
+        structure: for the conf file.
+        workdir: stage directory.
+        ff_includes: ``--ff-include`` values for the wrapper.
+
+    Raises:
+        ExternalToolError: grompp or gmx dump failed.
+        ValidationError: the dump could not be read, or the cross-check
+            refused (see :func:`cross_check`).
+    """
+    full_top = write_full_system(topology, workdir, "full", ff_includes)
+    tpr, flat = _preprocess(binaries, topology, full_top, structure, workdir, "full")
+    dump = dump_tpr(binaries, tpr, workdir, "full_dump")
+    try:
+        dumped = parse_dump_torsions(dump.text, topology.name, topology.natoms, dump.path)
+    except ValidationError as exc:
+        raise ValidationError(f"{exc} (GROMACS {dump.gromacs_version})") from exc
+    terms = cross_check(collect_torsion_set(topology, quad), dumped, dump.path)
+    n_typed = sum(t.source == SOURCE_DIHEDRALTYPES for t in terms)
+    log.info(
+        "torsion set about bond (%d, %d): %d term(s), %d of them from [ dihedraltypes ] "
+        "as grompp built them (%s)",
+        quad[1],
+        quad[2],
+        len(terms),
+        n_typed,
+        dump.path.name,
+    )
+    return ResolvedTorsionSet(
+        terms=terms,
+        defaults=parse_defaults(flat.read_text(), flat),
+        pp_sha256=_sha256(flat),
+        full_top=full_top,
+        dump_path=dump.path,
+        gromacs_version=dump.gromacs_version,
+    )
+
+
+def preprocessed_sha256(
+    binaries: Binaries,
+    topology: Topology,
+    structure: Structure,
+    workdir: str | Path,
+    stem: str,
+    ff_includes: list[str] | None = None,
+) -> str:
+    """SHA-256 of grompp's preprocessed view of ``topology``.
+
+    Covers every file grompp opens -- force-field includes too -- which the
+    ``--resume`` key of a stage that runs grompp must (design section 4).
+    Writes ``<stem>.itp``, ``<stem>.top`` and ``<stem>_pp.top`` into ``workdir``.
+    """
+    top = write_full_system(topology, workdir, stem, ff_includes)
+    _, flat = _preprocess(binaries, topology, top, structure, workdir, stem)
+    return _sha256(flat)

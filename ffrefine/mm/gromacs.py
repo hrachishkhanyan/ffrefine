@@ -12,6 +12,7 @@ round 1, ruling R22) -- see :func:`_write_g96_trajectory`.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -385,6 +386,97 @@ def single_point_energies(
         terms={name: data[:, i] for i, name in enumerate(names)},
         nframes=nframes,
         used_fallback=used_fallback,
+    )
+
+
+@dataclass
+class TprDump:
+    """``gmx dump -s`` output, where it is on disk, and the GROMACS that wrote it."""
+
+    text: str
+    path: Path
+    gromacs_version: str
+
+
+_GMX_BANNER_RE = re.compile(r":-\)\s+GROMACS - gmx \w+, (\S+)\s+\(-:")
+
+
+def preprocess_topology(
+    binaries: Binaries,
+    topology_path: str | Path,
+    structure: Structure,
+    workdir: str | Path,
+    stem: str,
+) -> tuple[Path, Path]:
+    """Run grompp once for GROMACS's own view of a topology (milestone 6a, section 4).
+
+    Writes ``<stem>_pp.top`` (``grompp -pp``: every include expanded, every
+    ``#ifdef`` resolved, exactly as grompp read it) and ``<stem>_resolve.tpr``.
+    Uses the large-box fallback mdp: bonded parameters do not depend on the
+    mdp, and every supported GROMACS accepts that one.
+
+    Args:
+        binaries: resolved binaries; ``gmx`` required.
+        topology_path: a ``.top`` grompp can process.
+        structure: coordinates and naming for the conf file.
+        workdir: directory for every file this writes, logs included.
+        stem: file-name prefix.
+
+    Returns:
+        ``(tpr, flattened_topology)``.
+
+    Raises:
+        ExternalToolError: grompp failed; its logs are named.
+    """
+    gmx = binaries.require("gmx")
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    mdp = workdir / f"{stem}_resolve.mdp"
+    write_mdp(mdp, fallback=True)
+    conf = workdir / f"{stem}_resolve_conf.gro"
+    _write_conf_gro(conf, structure, structure.coords, box=_box_line(True))
+    tpr = workdir / f"{stem}_resolve.tpr"
+    flat = workdir / f"{stem}_pp.top"
+    grompp_stem = f"{stem}_resolve_grompp"
+    run_command(
+        [
+            gmx,
+            "grompp",
+            "-f",
+            mdp.name,
+            "-c",
+            conf.name,
+            "-p",
+            str(Path(topology_path).resolve()),
+            "-pp",
+            flat.name,
+            "-po",
+            f"{stem}_resolve_mdout.mdp",
+            "-o",
+            tpr.name,
+            "-maxwarn",
+            "5",
+        ],
+        workdir,
+        grompp_stem,
+    )
+    _log_grompp_warnings(_grompp_log_text(workdir, grompp_stem))
+    return tpr, flat
+
+
+def dump_tpr(binaries: Binaries, tpr: str | Path, workdir: str | Path, stem: str) -> TprDump:
+    """``gmx dump -s tpr``; the text is also kept on disk as ``<stem>.stdout``.
+
+    Raises:
+        ExternalToolError: gmx dump failed.
+    """
+    gmx = binaries.require("gmx")
+    proc = run_command([gmx, "dump", "-s", str(Path(tpr).resolve())], workdir, stem)
+    banner = _GMX_BANNER_RE.search((proc.stderr or "") + (proc.stdout or ""))
+    return TprDump(
+        text=proc.stdout or "",
+        path=Path(workdir) / f"{stem}.stdout",
+        gromacs_version=banner.group(1) if banner else "unknown",
     )
 
 
