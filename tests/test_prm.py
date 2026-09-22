@@ -194,7 +194,9 @@ def test_prm_kchi_matches_itp_force_constant_under_distribute(tmp_path, butane_i
     delta = np.array([0.0])
     mult = np.array([3])
 
-    write_refit_topology(t, quad, k, delta, mult, tmp_path / "d.itp", distribute=True)
+    write_refit_topology(
+        t, quad, k, delta, mult, tmp_path / "d.itp", distribute=True, includes="absolute"
+    )
     text = write_prm_block(t, quad, k, delta, mult, tmp_path / "d.prm", distribute=True)
 
     # Pull the distributed k out of the .itp.  Matching on the writer's own

@@ -3,6 +3,12 @@
 Rewriting is line-oriented: everything the parser does not model -- comments,
 [ atomtypes ], #include directives -- is copied through verbatim, and only the
 [ dihedrals ] lines belonging to the target set are replaced.
+
+Every writer settles how the copy spells its ``#include`` lines (milestone 6a
+design, section 5): the copies grompp reads get absolute paths, because they
+live in stage directories; the files the user keeps get the user's own lines
+plus an include-base marker, so they are drop-in replacements beside the
+original. See :mod:`ffrefine.io.includes`.
 """
 
 from __future__ import annotations
@@ -17,6 +23,13 @@ import numpy as np
 from ..errors import ValidationError
 from ..mm.torsionset import EntryKey as _EntryKey
 from ..mm.torsionset import collect_torsion_set, distinct_entry_keys
+from .includes import (
+    IncludeMode,
+    absolutise_includes,
+    apply_include_mode,
+    include_base,
+    mark_include_base,
+)
 from .topology import Dihedral, Topology
 
 if TYPE_CHECKING:
@@ -83,7 +96,9 @@ def write_molecule_copy(source: str | Path, out_path: str | Path) -> list[str]:
     the section 4.9 before topology), which are otherwise byte-for-byte copies
     of the user's file.  Reads the *source text*, not the parsed
     ``raw_lines``, so ``#ifdef`` branches this build did not take are still
-    handed to grompp, which does its own preprocessing.
+    handed to grompp, which does its own preprocessing. Relative ``#include``
+    lines are made absolute against the source's include base: the copy
+    lives in a stage directory, where they would no longer resolve.
 
     Args:
         source: the user's topology file; never modified.
@@ -93,6 +108,7 @@ def write_molecule_copy(source: str | Path, out_path: str | Path) -> list[str]:
         The names of any sections dropped.
     """
     lines, dropped = strip_system_sections(Path(source).read_text().splitlines())
+    lines = absolutise_includes(lines, include_base(source))
     Path(out_path).write_text("\n".join(lines) + "\n", newline="\n")
     if dropped:
         log.info(
@@ -138,7 +154,10 @@ def _rewrite_dihedrals(
     """Copy the source file, substituting the dihedral lines named in ``targets``.
 
     Args:
-        topology: parsed source (supplies ``raw_lines``).
+        topology: parsed source; its file is re-read, so ``#ifdef`` branches
+            the parser did not take are copied too (a CGenFF ``.top``'s
+            ``POSRES_WATER`` block), exactly as :func:`write_molecule_copy`
+            does.
         targets: entry keys to replace or drop.
         replacement: entry key -> list of replacement lines (may be empty to drop).
 
@@ -148,7 +167,7 @@ def _rewrite_dihedrals(
     out: list[str] = []
     section = ""
     emitted: set[_EntryKey] = set()
-    for raw in topology.raw_lines:
+    for raw in Path(topology.source).read_text().splitlines():
         body = raw.split(";", 1)[0].strip()
         if body.startswith("[") and body.endswith("]"):
             section = body[1:-1].strip().lower()
@@ -185,6 +204,8 @@ def write_zeroed_topology(topology: Topology, quad: Quad, out_path: str | Path) 
 
     [ pairs ] is never touched (spec section 9.2).
 
+    Always a grompp input, so relative ``#include`` lines are made absolute.
+
     Args:
         topology: parsed source topology.
         quad: 1-based target quadruplet.
@@ -214,6 +235,7 @@ def write_zeroed_topology(topology: Topology, quad: Quad, out_path: str | Path) 
         for key in targets
     }
     lines, _ = strip_system_sections(_rewrite_dihedrals(topology, targets, replacement))
+    lines = absolutise_includes(lines, topology.include_base)
     Path(out_path).write_text("\n".join(lines) + "\n", newline="\n")
     return tset
 
@@ -226,6 +248,8 @@ def write_refit_topology(
     mult: np.ndarray,
     out_path: str | Path,
     distribute: bool = False,
+    *,
+    includes: IncludeMode,
 ) -> None:
     """Write the topology carrying the fitted torsion series (spec section 4.2).
 
@@ -240,6 +264,10 @@ def write_refit_topology(
             transferable dihedral type (spec section 9.7). Default writes the
             series onto the target quadruplet only and zeroes the rest, which
             is exact for this molecule but molecule-specific.
+        includes: ``"absolute"`` for a grompp input (``final/after.itp``),
+            ``"verbatim"`` for a file the user keeps (``03_fit/dihedral.itp``,
+            ``final/molecule_refined.itp``). Required: this writer serves both,
+            and neither is a safe default.
     """
     # N_T is the number of distinct *quadruplets*, not term-lines (9 vs 10 on
     # the butane fixture; rulings R14/R17).  It comes from the shared
@@ -279,6 +307,7 @@ def write_refit_topology(
         ]
 
     lines, _ = strip_system_sections(_rewrite_dihedrals(topology, targets, replacement))
+    lines = apply_include_mode(lines, topology.include_base, includes)
     Path(out_path).write_text("\n".join(lines) + "\n", newline="\n")
 
 
@@ -327,6 +356,10 @@ def write_charged_topology(
     Reads the source *text* rather than the parsed ``raw_lines``, for the same
     reason :func:`write_molecule_copy` does: ``#ifdef`` branches this build did
     not take must still reach grompp, which runs its own preprocessor.
+
+    The file is kept by the user and read by later stages, so its
+    ``#include`` lines stay as written and an include-base marker records
+    where they point.
 
     Only the charge field is touched.  Atom type, residue, charge group and
     mass are left exactly as written, including their spacing, so a diff
@@ -383,6 +416,7 @@ def write_charged_topology(
             "could not be written. The topology and the fitted charges disagree about "
             "how many atoms this molecule has."
         )
+    out = mark_include_base(out, include_base(source))
     Path(out_path).write_text("\n".join(out) + "\n", newline="\n")
     log.info("wrote %s with %d charge(s) changed", Path(out_path).name, len(changed))
     return changed

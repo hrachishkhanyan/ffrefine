@@ -1902,6 +1902,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         result.mults,
         outdir / "dihedral.itp",
         distribute=args.distribute,
+        includes="verbatim",
     )
     write_prm_block(
         topology,
@@ -2045,7 +2046,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
             "the 02_mm_scan diagnostics before using these parameters."
         )
 
-    shutil.copyfile(final / "after.itp", final / "molecule_refined.itp")
+    # Written, not copied from after.itp: after.itp is a grompp input and so
+    # carries absolute #include paths, while the file the user keeps carries
+    # their own (milestone 6a design, section 4). Same bytes for butane.
+    write_refit_topology(
+        topology,
+        quad,
+        k,
+        delta,
+        mult,
+        final / "molecule_refined.itp",
+        distribute=args.distribute,
+        includes="verbatim",
+    )
     before_topology = Path(args.topology).resolve()
     charged_output = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
     charges_refined = before_topology == charged_output.resolve()

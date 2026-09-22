@@ -193,7 +193,9 @@ def validate_refit(
     make_system_top(before_itp, before_top, topology.name, ff_includes)
 
     after_itp = workdir / "after.itp"
-    write_refit_topology(topology, quad, k, delta_deg, mult, after_itp, distribute=distribute)
+    write_refit_topology(
+        topology, quad, k, delta_deg, mult, after_itp, distribute=distribute, includes="absolute"
+    )
     after_top = workdir / "after.top"
     make_system_top(after_itp, after_top, topology.name, ff_includes)
 

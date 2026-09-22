@@ -1,9 +1,14 @@
+import re
+from pathlib import Path
+
 import numpy as np
 import pytest
+from ffrefine.io.includes import MARKER_NOTE, MARKER_PREFIX
 from ffrefine.io.topology import read_topology
 from ffrefine.io.topwriter import (
     make_system_top,
     strip_system_sections,
+    write_charged_topology,
     write_molecule_copy,
     write_refit_topology,
     write_zeroed_topology,
@@ -115,6 +120,7 @@ def test_refit_topology_writes_series_on_target_only(tmp_path, butane_itp):
         np.array([3, 2]),
         out,
         distribute=False,
+        includes="absolute",
     )
     r = read_topology(out)
     target = [d for d in r.propers if (d.ai, d.aj, d.ak, d.al) in ((1, 5, 8, 11), (11, 8, 5, 1))]
@@ -140,6 +146,7 @@ def test_refit_distribute_divides_by_set_size(tmp_path, butane_itp):
         np.array([3]),
         out,
         distribute=True,
+        includes="absolute",
     )
     r = read_topology(out)
     tset = collect_torsion_set(r, (1, 5, 8, 11))
@@ -221,7 +228,15 @@ def test_zeroed_and_refit_outputs_carry_no_system_sections(tmp_path, butane_itp)
     zeroed = tmp_path / "zeroed.itp"
     write_zeroed_topology(t, (1, 5, 8, 11), zeroed)
     refit = tmp_path / "refit.itp"
-    write_refit_topology(t, (1, 5, 8, 11), np.array([1.0]), np.array([0.0]), np.array([3]), refit)
+    write_refit_topology(
+        t,
+        (1, 5, 8, 11),
+        np.array([1.0]),
+        np.array([0.0]),
+        np.array([3]),
+        refit,
+        includes="absolute",
+    )
     for path in (zeroed, refit):
         text = path.read_text()
         assert "[ system ]" not in text, path.name
@@ -254,7 +269,15 @@ def test_writers_emit_lf_line_endings(tmp_path, butane_itp):
     zeroed = tmp_path / "zeroed.itp"
     write_zeroed_topology(t, (1, 5, 8, 11), zeroed)
     refit = tmp_path / "refit.itp"
-    write_refit_topology(t, (1, 5, 8, 11), np.array([1.0]), np.array([0.0]), np.array([3]), refit)
+    write_refit_topology(
+        t,
+        (1, 5, 8, 11),
+        np.array([1.0]),
+        np.array([0.0]),
+        np.array([3]),
+        refit,
+        includes="absolute",
+    )
     top = tmp_path / "topol.top"
     make_system_top(zeroed, top, "BUT")
     for path in (zeroed, refit, top):
@@ -356,3 +379,95 @@ def test_charged_topology_charge_not_confused_with_earlier_substring(tmp_path):
     assert "CG331" in text  # atom type intact, not corrupted
     assert "CG330.5000" not in text  # the bug: new charge spliced into the type
     assert "0.5000" in text  # the charge itself actually moved
+
+
+PFOA = Path(__file__).parent.parent / "fixtures" / "pfoa_gromacs"
+PFOA_FF = (PFOA / "charmm36.ff").resolve()
+
+
+def _include_lines(path) -> list[str]:
+    return [
+        line for line in Path(path).read_text().splitlines() if re.match(r"^\s*#\s*include", line)
+    ]
+
+
+def _refit_args(t, quad):
+    return (t, quad, np.array([1.0]), np.array([0.0]), np.array([3]))
+
+
+def test_grompp_facing_copies_carry_absolute_includes(tmp_path):
+    """Design section 5: a stage-directory copy must still find charmm36.ff/."""
+    t = read_topology(PFOA / "pfoa_gmx.top")
+    write_molecule_copy(t.source, tmp_path / "full.itp")
+    write_zeroed_topology(t, (25, 1, 3, 4), tmp_path / "zeroed.itp")
+    write_refit_topology(
+        *_refit_args(t, (25, 1, 3, 4)), tmp_path / "after.itp", includes="absolute"
+    )
+    for name in ("full.itp", "zeroed.itp", "after.itp"):
+        lines = _include_lines(tmp_path / name)
+        assert f'#include "{PFOA_FF / "forcefield.itp"}"' in lines, name
+        assert f'# include "{PFOA_FF / "pfo_ffbonded.itp"}"' in lines, name
+        assert '#include "posre.itp"' in lines, name  # not beside the .top: left for grompp
+        assert MARKER_PREFIX not in (tmp_path / name).read_text(), name
+
+
+def test_kept_copies_carry_the_users_includes_and_the_marker(tmp_path):
+    """Design section 5: the files the user keeps are drop-in replacements."""
+    t = read_topology(PFOA / "pfoa_gmx.top")
+    write_refit_topology(
+        *_refit_args(t, (25, 1, 3, 4)), tmp_path / "molecule_refined.itp", includes="verbatim"
+    )
+    write_charged_topology(PFOA / "pfoa_gmx.top", [], tmp_path / "molecule_charged.itp")
+    for name in ("molecule_refined.itp", "molecule_charged.itp"):
+        path = tmp_path / name
+        assert _include_lines(path) == _include_lines(PFOA / "pfoa_gmx.top"), name
+        assert path.read_text().splitlines()[:2] == [
+            MARKER_NOTE,
+            f"{MARKER_PREFIX}{PFOA.resolve()}",
+        ], name
+
+
+def test_a_marked_copy_resolves_its_includes_against_the_marked_directory(tmp_path):
+    """The charged topology moves to 04_charges/, yet later copies find the force field."""
+    moved = tmp_path / "out" / "04_charges"
+    moved.mkdir(parents=True)
+    write_charged_topology(PFOA / "pfoa_gmx.top", [], moved / "molecule_charged.itp")
+    t = read_topology(moved / "molecule_charged.itp")
+    write_zeroed_topology(t, (25, 1, 3, 4), tmp_path / "zeroed.itp")
+    write_molecule_copy(moved / "molecule_charged.itp", tmp_path / "full.itp")
+    for name in ("zeroed.itp", "full.itp"):
+        assert f'#include "{PFOA_FF / "forcefield.itp"}"' in _include_lines(tmp_path / name)
+
+
+def test_rewritten_copies_keep_ifdef_branches_the_parser_did_not_take(tmp_path):
+    """Refinement 8: CGenFF's POSRES_WATER block must survive in every rewritten copy."""
+    t = read_topology(PFOA / "pfoa_gmx.top")
+    write_zeroed_topology(t, (25, 1, 3, 4), tmp_path / "zeroed.itp")
+    write_refit_topology(
+        *_refit_args(t, (25, 1, 3, 4)), tmp_path / "molecule_refined.itp", includes="verbatim"
+    )
+    for name in ("zeroed.itp", "molecule_refined.itp"):
+        lines = [line.strip() for line in (tmp_path / name).read_text().splitlines()]
+        start = lines.index("#ifdef POSRES_WATER")
+        assert lines[start : start + 5] == [
+            "#ifdef POSRES_WATER",
+            "; Position restraint for each water oxygen",
+            "[ position_restraints ]",
+            ";  i funct       fcx        fcy        fcz",
+            "1    1       1000       1000       1000",
+        ], name
+
+
+def test_butane_outputs_are_identical_in_both_modes(tmp_path, butane_itp):
+    """No #include, so no marker and no rewritten line: master's bytes exactly."""
+    t = read_topology(butane_itp)
+    write_refit_topology(*_refit_args(t, (1, 5, 8, 11)), tmp_path / "a.itp", includes="absolute")
+    write_refit_topology(*_refit_args(t, (1, 5, 8, 11)), tmp_path / "v.itp", includes="verbatim")
+    assert (tmp_path / "a.itp").read_bytes() == (tmp_path / "v.itp").read_bytes()
+    assert MARKER_PREFIX not in (tmp_path / "a.itp").read_text()
+
+
+def test_write_refit_topology_requires_an_include_mode(tmp_path, butane_itp):
+    t = read_topology(butane_itp)
+    with pytest.raises(TypeError, match="includes"):
+        write_refit_topology(*_refit_args(t, (1, 5, 8, 11)), tmp_path / "x.itp")
