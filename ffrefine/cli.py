@@ -111,7 +111,7 @@ from .io.topwriter import write_charged_topology, write_refit_topology
 from .io.validate import adopt_topology_naming, element_of, validate_structure_topology
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
-from .mm.tprparams import ResolvedTerm, resolve_torsion_set
+from .mm.tprparams import ResolvedTerm, preprocessed_sha256, resolve_torsion_set
 from .mm.validate_fit import validate_refit
 from .plots import plot_fit, plot_mm_zeroed, plot_qm_profile, plot_residuals, plot_validation
 from .qm.scan import (
@@ -2058,10 +2058,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
     _check_fit_applies_here(quad, fit_payload, fit_path, frames, scan_path)
 
     ff_includes = _ff_includes(args)
+    binaries = _binaries(args)
+    final = stage_dir(args.outdir, "final")
+    # The "before" energies depend on every force-field file grompp reads, so
+    # the key covers grompp's preprocessed view of the topology (milestone 6a
+    # design, section 4). About a second, even when the stage is then skipped.
+    pp_sha256 = preprocessed_sha256(binaries, topology, structure, final, "before", ff_includes)
     settings = {
         "quad": list(quad),
         "distribute": bool(args.distribute),
         "ff_includes": ff_includes,
+        "preprocessed_topology_sha256": pp_sha256,
     }
     digest = hash_inputs([args.topology, scan_path, fit_path], settings)
     if args.resume and stage_is_current(
@@ -2070,8 +2077,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
         print(f"validate: skipping, {Path(args.outdir) / STAGE_DIRS['final']} is current")
         return 0
 
-    binaries = _binaries(args)
-    final = stage_dir(args.outdir, "final")
     result = validate_refit(
         binaries,
         topology,  # R33: --topology as given (charge-refined in a chained run), never zeroed.

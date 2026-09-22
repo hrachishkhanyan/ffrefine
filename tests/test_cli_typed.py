@@ -15,8 +15,11 @@ import numpy as np
 import pytest
 from ffrefine import cli
 from ffrefine.cli import main
+from ffrefine.config import Binaries
 from ffrefine.io.includes import MARKER_NOTE, MARKER_PREFIX
-from ffrefine.io.topwriter import write_charged_topology, write_refit_topology
+from ffrefine.io.structure import read_pdb
+from ffrefine.io.topwriter import make_system_top, write_charged_topology, write_refit_topology
+from ffrefine.mm.gromacs import single_point_energies
 from ffrefine.mm.selfcheck import SelfCheckResult
 from ffrefine.mm.torsionset import collect_torsion_set
 from ffrefine.mm.tprparams import SOURCE_TOPOLOGY, ResolvedTerm, ResolvedTorsionSet
@@ -107,9 +110,10 @@ def _fake_validate_refit(
     )
 
 
-def _stub_validate(monkeypatch) -> None:
+def _stub_validate(monkeypatch, sha: str = "a" * 64) -> None:
     """Replace every GROMACS-facing call cmd_validate makes."""
     monkeypatch.setattr(cli, "validate_refit", _fake_validate_refit)
+    monkeypatch.setattr(cli, "preprocessed_sha256", lambda *args, **kwargs: sha)
 
 
 def test_fit_writes_dihedral_itp_with_the_users_includes(tmp_path):
@@ -298,3 +302,46 @@ def test_mmscan_resume_reruns_when_an_included_file_changes(tmp_path, gmx_bin, c
         if p["quad_1_based"] == [2, 1, 3, 4]
     ]
     assert ks[1] == pytest.approx(0.7, rel=1e-6)
+
+
+def test_validate_resume_key_covers_the_preprocessed_topology(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "out"
+    _write_pfoa_stage_inputs(out)
+    assert main(["fit"] + _pfoa_args(out)) == 0
+    _stub_validate(monkeypatch, "a" * 64)
+    assert main(["validate"] + _pfoa_args(out)) == 0
+    capsys.readouterr()
+    assert main(["validate"] + _pfoa_args(out) + ["--resume"]) == 0
+    assert "skipping" in capsys.readouterr().out
+    _stub_validate(monkeypatch, "b" * 64)
+    assert main(["validate"] + _pfoa_args(out) + ["--resume"]) == 0
+    assert "skipping" not in capsys.readouterr().out
+
+
+@pytest.mark.needs_gmx
+@pytest.mark.needs_xtb
+def test_run_on_pfoa_end_to_end_gives_a_drop_in_topology(tmp_path, gmx_bin, xtb_bin):
+    """The milestone's goal: a real CGenFF .top, no hand edits, a usable result."""
+    out = tmp_path / "out"
+    assert main(["run"] + _pfoa_args(out)) == 0
+    validation = json.loads((out / "final" / "validation.json").read_text())
+    assert validation["quad_1_based"] == list(PFOA_QUAD)
+    refined = out / "final" / "molecule_refined.itp"
+    assert _include_lines(refined) == _include_lines(PFOA / "pfoa_gmx.top")
+
+    # Drop-in: beside the original charmm36.ff/, the refined file runs as is.
+    dropin = tmp_path / "dropin"
+    dropin.mkdir()
+    shutil.copytree(PFOA / "charmm36.ff", dropin / "charmm36.ff")
+    shutil.copyfile(refined, dropin / "molecule_refined.itp")
+    make_system_top(dropin / "molecule_refined.itp", dropin / "system.top", "Other")
+    s = read_pdb(PFOA / "pfoa_gmx.pdb")
+    energies = single_point_energies(
+        Binaries(gmx=gmx_bin),
+        dropin / "system.top",
+        s,
+        s.coords[None, :, :],
+        dropin / "sp",
+        "dropin",
+    )
+    assert np.isfinite(energies.potential()).all()
