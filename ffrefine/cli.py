@@ -1255,6 +1255,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "source_per_point": merged.source if merged else ["forward"] * len(energy_kj),
             "freeze": [list(f) for f in freeze],
             "sp_refine_keywords": sp_keywords,
+            "orca_version": _orca_version(binaries) if sp_keywords else None,
             "hops": [{"frame": h.index, "phi_deg": h.phi_deg, "rmsd_nm": h.rmsd_nm} for h in hops],
             "hbond_changes": [
                 {

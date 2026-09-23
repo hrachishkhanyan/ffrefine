@@ -143,8 +143,14 @@ def refine_energies(
         inp = workdir / f"{stem}.inp"
         write_sp_input(inp, structure, frame, keywords, charge, mult, nprocs)
         proc = run_command([exe, inp.name], workdir, stem, extra_env=env)
+        stdout = proc.stdout or ""
+        if ORCA_SCF_CONVERGED_MARKER not in stdout:
+            raise ExternalToolError(
+                f"frame {index}: no '{ORCA_SCF_CONVERGED_MARKER}' line. {_IGNORECONV_HINT} "
+                f"See {workdir / (stem + '.stdout')}."
+            )
         try:
-            out.append(parse_final_energy(proc.stdout or ""))
+            out.append(parse_final_energy(stdout))
         except ExternalToolError as exc:
             raise ExternalToolError(f"frame {index}: {exc}") from exc
     return hartree_to_kj(np.array(out, dtype=float))
@@ -170,6 +176,18 @@ ORCA_NORMAL_TERMINATION_MARKER = "ORCA TERMINATED NORMALLY"
 
 ORCA_SCF_FAILED_MARKER = "SCF NOT CONVERGED"
 """Printed when the SCF gives up -- and ORCA 6.1.1 still exits 0."""
+
+ORCA_SCF_CONVERGED_MARKER = "SCF CONVERGED AFTER"
+"""What ORCA prints when its SCF really converged. Required, not merely the
+absence of a failure: with ``%scf IgnoreConv true end`` ORCA 6.1.1 exits 0,
+terminates normally and prints no failure marker for an unconverged SCF
+(probed 2026-09-23; milestone 5 ruling R29)."""
+
+_IGNORECONV_HINT = (
+    "ORCA prints 'SCF CONVERGED AFTER N CYCLES' when its SCF converges, and this output "
+    "does not. With '%scf IgnoreConv true end' ORCA exits 0 and terminates normally even "
+    "so, which is why the exit code proves nothing."
+)
 
 
 def esp_keyword_line(keywords: str, chelpg: bool) -> str:
@@ -220,8 +238,8 @@ def run_esp_job(
 
     Raises:
         ExternalToolError: ORCA exited nonzero, its SCF did not converge, it
-            did not terminate normally, or it produced no CHELPG file when
-            asked.
+            did not terminate normally, or ORCA never printed that its SCF
+            converged, or it produced no CHELPG file when asked.
     """
     exe = binaries.require("orca")
     workdir = Path(workdir)
@@ -256,6 +274,11 @@ def run_esp_job(
             f"ORCA's ESP job exited without printing '{ORCA_NORMAL_TERMINATION_MARKER}', so "
             f"it stopped before finishing even though its exit code was 0. See {log_path} "
             "for the error ORCA reported."
+        )
+    if ORCA_SCF_CONVERGED_MARKER not in stdout:
+        raise ExternalToolError(
+            f"ORCA's ESP job has no converged SCF. {_IGNORECONV_HINT} There is no "
+            f"density to take charges or a potential from. See {log_path}."
         )
     if chelpg and not Path(str(base) + ".chelpg.xyz").exists():
         raise ExternalToolError(

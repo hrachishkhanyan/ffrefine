@@ -10,6 +10,7 @@ from ffrefine.qm.orca import (
     orca_env,
     parse_final_energy,
     refine_energies,
+    run_esp_job,
     write_sp_input,
 )
 
@@ -292,7 +293,21 @@ ORCA finished by error termination in LEANSCF
   .... aborting the run
 """
 
-ORCA_OK_STDOUT = "...\n                             ****ORCA TERMINATED NORMALLY****\n"
+ORCA_OK_STDOUT = (
+    "...\n"
+    "               *           SCF CONVERGED AFTER  12 CYCLES          *\n"
+    "...\n"
+    "                             ****ORCA TERMINATED NORMALLY****\n"
+)
+
+# What ORCA 6.1.1 printed for water at HF/6-31G* with
+# `%scf IgnoreConv true MaxIter 1 end` (probed 2026-09-23). Exit status 0, a
+# normal termination, and neither "SCF NOT CONVERGED" nor "SCF CONVERGED AFTER".
+IGNORECONV_STDOUT = """\
+WARNING: Found SCFConvIgnored == true
+Warning (ORCA_LEANSCF): the SCF did not converge, but SCFConvIgnored is TRUE.
+                             ****ORCA TERMINATED NORMALLY****
+"""
 
 ESP_ARTEFACTS = ("esp.chelpg.xyz", "esp.vpot", "esp.gbw", "esp.densities", "esp.densitiesinfo")
 
@@ -412,3 +427,53 @@ def test_a_failed_esp_rerun_in_the_same_directory_is_refused(tmp_path, butane_pd
             binaries, s, s.coords, tmp_path, "%scf MaxIter 3 end\n! HF 6-31G*", charge=0, mult=1
         )
     assert not (tmp_path / "esp.chelpg.xyz").exists()
+
+
+def test_run_esp_job_refuses_an_scf_ignoreconv_let_through(tmp_path, butane_pdb, monkeypatch):
+    """Milestone 5 ruling R29: IgnoreConv makes ORCA exit 0 with no failure marker."""
+    import ffrefine.qm.orca as orca_mod
+
+    writes = ("esp.chelpg.xyz",)
+    monkeypatch.setattr(orca_mod, "run_command", _fake_orca(IGNORECONV_STDOUT, writes=writes))
+    s = read_pdb(butane_pdb)
+    with pytest.raises(ExternalToolError, match="IgnoreConv"):
+        orca_mod.run_esp_job(Binaries(orca="/nonexistent/orca"), s, s.coords, tmp_path)
+
+
+def test_refine_energies_refuses_a_frame_whose_scf_did_not_converge(
+    tmp_path, butane_pdb, monkeypatch
+):
+    import ffrefine.qm.orca as orca_mod
+
+    stdout = IGNORECONV_STDOUT + "FINAL SINGLE POINT ENERGY      -157.123456\n"
+    monkeypatch.setattr(orca_mod, "run_command", _fake_orca(stdout))
+    s = read_pdb(butane_pdb)
+    with pytest.raises(ExternalToolError, match="frame 0: .*SCF CONVERGED AFTER"):
+        orca_mod.refine_energies(
+            Binaries(orca="/nonexistent/orca"), s, s.coords[None, :, :], tmp_path
+        )
+
+
+def test_refine_energies_accepts_a_converged_frame(tmp_path, butane_pdb, monkeypatch):
+    import ffrefine.qm.orca as orca_mod
+
+    stdout = ORCA_OK_STDOUT + "FINAL SINGLE POINT ENERGY      -157.123456\n"
+    monkeypatch.setattr(orca_mod, "run_command", _fake_orca(stdout))
+    s = read_pdb(butane_pdb)
+    energies = orca_mod.refine_energies(
+        Binaries(orca="/nonexistent/orca"), s, s.coords[None, :, :], tmp_path
+    )
+    assert energies.shape == (1,)
+
+
+@pytest.mark.needs_orca
+def test_run_esp_job_refuses_real_orca_under_ignoreconv(tmp_path, orca_bin):
+    """The live counterpart: ORCA 6.1.1 itself, one SCF iteration, IgnoreConv."""
+    from ffrefine.io.structure import read_xyz
+
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text("3\nwater\nO 0.000 0.000 0.000\nH 0.000 0.757 0.587\nH 0.000 -0.757 0.587\n")
+    s = read_xyz(xyz)
+    keywords = "! HF 6-31G* CHELPG\n%scf IgnoreConv true MaxIter 1 end"
+    with pytest.raises(ExternalToolError, match="IgnoreConv"):
+        run_esp_job(Binaries(orca=orca_bin), s, s.coords, tmp_path / "esp", keywords)
