@@ -254,6 +254,24 @@ def stage_is_current(
     return True
 
 
+class WarningCollector(logging.Handler):
+    """Collects the text of every WARNING-or-worse record while attached.
+
+    ``cli._collect_warnings`` attaches one around each stage, so the stage's
+    JSON payload can carry every warning it raised -- including the ones a
+    module logs itself (GROMACS's echoed warnings, the self-check's structure
+    warnings), not only the CLI's own. :func:`setup_logging` leaves these
+    attached; they belong to whoever opened them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
 def setup_logging(outdir: str | Path, verbose: bool = False) -> None:
     """Configure the ``ffrefine`` logger to log to the console and run.log.
 
@@ -275,6 +293,8 @@ def setup_logging(outdir: str | Path, verbose: bool = False) -> None:
             directly inside it (spec section 6). Created if it does not
             already exist.
         verbose: if set, emit DEBUG-level messages; otherwise INFO.
+
+    Handlers that are :class:`WarningCollector` instances are left in place.
     """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -284,6 +304,8 @@ def setup_logging(outdir: str | Path, verbose: bool = False) -> None:
     log.propagate = False
 
     for handler in list(log.handlers):
+        if isinstance(handler, WarningCollector):
+            continue
         log.removeHandler(handler)
         handler.close()
 

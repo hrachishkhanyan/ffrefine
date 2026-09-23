@@ -72,6 +72,7 @@ round trip) stays legal.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import subprocess
 import logging
@@ -135,6 +136,7 @@ from .qm.orca import (
 from .qm.xtb import derive_charge, optimize_geometry, run_scan, scan_grid
 from .stages import (
     STAGE_DIRS,
+    WarningCollector,
     hash_array,
     hash_inputs,
     log_to_run_log,
@@ -594,47 +596,69 @@ def _reset_logging() -> None:
     :func:`_warn` falls back to stderr.
     """
     for handler in list(log.handlers):
+        if isinstance(handler, WarningCollector):
+            continue
         log.removeHandler(handler)
         handler.close()
 
 
-_WARNING_SINKS: list[list[str]] = []
-"""Lists currently collecting every :func:`_warn` message; see :func:`_collect_warnings`."""
+def _output_handlers() -> list[logging.Handler]:
+    """The ``ffrefine`` logger's handlers that actually show a message somewhere."""
+    return [h for h in log.handlers if not isinstance(h, WarningCollector)]
 
 
 @contextmanager
 def _collect_warnings() -> Iterator[list[str]]:
-    """Collect the text of every :func:`_warn` issued inside the block.
+    """Collect every warning issued inside the block, from any module.
 
-    For stages that must keep their warnings in their own output file, not
-    only in ``run.log`` and on stderr -- ``charges.json``'s ``warnings`` list
-    (design section 7, ruling R25), which milestone 6b's report reads.
-    Collecting at :func:`_warn` rather than at the call sites means a warning
-    added later is kept without anyone remembering to keep it.
+    A :class:`~ffrefine.stages.WarningCollector` is attached to the
+    ``ffrefine`` logger for the block's duration, so the text of every
+    WARNING record lands in the yielded list: the CLI's own :func:`_warn`
+    and a module's ``log.warning`` alike (milestone 6b, refinement 1). Each
+    stage writes the list into its JSON payload, which is what
+    ``report.md``'s "every warning raised" is built from.
     """
-    sink: list[str] = []
-    _WARNING_SINKS.append(sink)
+    collector = WarningCollector()
+    log.addHandler(collector)
     try:
-        yield sink
+        yield collector.messages
     finally:
-        _WARNING_SINKS.remove(sink)
+        log.removeHandler(collector)
+
+
+def _current_warnings() -> list[str]:
+    """A copy of the innermost active collector's warnings, or ``[]`` outside any."""
+    collectors = [h for h in log.handlers if isinstance(h, WarningCollector)]
+    return list(collectors[-1].messages) if collectors else []
+
+
+def _collects_warnings(func):
+    """Run a stage command inside :func:`_collect_warnings`."""
+
+    @functools.wraps(func)
+    def wrapper(args: argparse.Namespace) -> int:
+        with _collect_warnings():
+            return func(args)
+
+    return wrapper
 
 
 def _warn(message: str) -> None:
     """Emit a user-facing warning exactly once.
 
-    Once logging is configured, ``setup_logging``'s own console handler puts
-    the message on stderr *and* into ``run.log``; printing as well would
-    double it.  Before that (dry runs, argument handling) there is no logger
-    to carry it, so it goes straight to stderr.  Any collector opened with
-    :func:`_collect_warnings` also receives the text.
+    Once logging is configured, ``setup_logging``'s console handler puts the
+    message on stderr *and* into ``run.log``, and every active collector
+    receives it through the logger. Before that (dry runs, argument handling)
+    nothing would show it, so it is printed to stderr and handed to the
+    collectors directly.
     """
-    for sink in _WARNING_SINKS:
-        sink.append(message)
-    if log.handlers:
+    if _output_handlers():
         log.warning(message)
-    else:
-        print(f"warning: {message}", file=sys.stderr)
+        return
+    print(f"warning: {message}", file=sys.stderr)
+    for handler in log.handlers:
+        if isinstance(handler, WarningCollector):
+            handler.messages.append(message)
 
 
 def _ff_includes(args: argparse.Namespace) -> list[str]:
@@ -1092,6 +1116,7 @@ def _xtb_version(binaries: Binaries) -> str:
     return "unknown"
 
 
+@_collects_warnings
 def cmd_scan(args: argparse.Namespace) -> int:
     """Run the xtb relaxed torsion scan and write ``01_qm_scan/scan.json``.
 
@@ -1241,6 +1266,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "energy_kj": [float(v) for v in energy_kj],
         "frames_nm": [[[float(c) for c in atom] for atom in frame] for frame in frames_nm],
         "frames_sha256": hash_array(frames_nm),
+        "warnings": _current_warnings(),
         "provenance": {
             "xtb_version": _xtb_version(binaries),
             "charge": charge,
@@ -1657,6 +1683,7 @@ def _defaults_record(defaults: Defaults | None) -> dict | None:
     }
 
 
+@_collects_warnings
 def cmd_mmscan(args: argparse.Namespace) -> int:
     """Compute MM single points with and without the target torsion.
 
@@ -1767,6 +1794,7 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
         "torsion_parameters": [_torsion_record(t) for t in resolved.terms],
         "defaults": _defaults_record(resolved.defaults),
         "preprocessed_topology_sha256": resolved.pp_sha256,
+        "warnings": _current_warnings(),
     }
     (workdir / "energies.json").write_text(json.dumps(payload, indent=2) + "\n")
     write_manifest(args.outdir, "mm_scan", digest, {"quad": list(quad)})
@@ -1774,6 +1802,7 @@ def cmd_mmscan(args: argparse.Namespace) -> int:
     return 0
 
 
+@_collects_warnings
 def cmd_fit(args: argparse.Namespace) -> int:
     """Fit the dihedral series from the QM scan and the MM-zeroed energies.
 
@@ -1951,9 +1980,16 @@ def cmd_fit(args: argparse.Namespace) -> int:
         ],
         "selected_multiplicities": [int(m) for m in chosen.mults],
     }
-    (outdir / "fit.json").write_text(
-        json.dumps(fit_summary(result, phi, target, provenance, qm_kj=qm), indent=2) + "\n"
-    )
+    if not args.distribute:
+        _warn(
+            "fitted without --distribute: the series is written onto the target "
+            "quadruplet alone and every other torsion about that bond is zeroed. That is "
+            "exact for this molecule but is not a transferable dihedral type, and the "
+            "CHARMM .prm block carries a matching warning."
+        )
+    summary = fit_summary(result, phi, target, provenance, qm_kj=qm)
+    summary["warnings"] = _current_warnings()
+    (outdir / "fit.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_refit_topology(
         topology,
         quad,
@@ -1973,13 +2009,6 @@ def cmd_fit(args: argparse.Namespace) -> int:
         outdir / "dihedral.prm",
         args.distribute,
     )
-    if not args.distribute:
-        _warn(
-            "fitted without --distribute: the series is written onto the target "
-            "quadruplet alone and every other torsion about that bond is zeroed. That is "
-            "exact for this molecule but is not a transferable dihedral type, and the "
-            "CHARMM .prm block carries a matching warning."
-        )
 
     plots = outdir / "plots"
     plot_qm_profile(phi, qm, plots / "qm_profile.png")
@@ -2003,6 +2032,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
     return 0
 
 
+@_collects_warnings
 def cmd_validate(args: argparse.Namespace) -> int:
     """Rebuild with the fitted parameters and compare MM to QM (spec 4.9).
 
@@ -2155,6 +2185,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "charges_refined": charges_json is not None,
                 "charges_json": None if charges_json is None else str(charges_json),
                 "input_topology": str(Path(_input_topology(args)).resolve()),
+                "warnings": _current_warnings(),
             },
             indent=2,
         )

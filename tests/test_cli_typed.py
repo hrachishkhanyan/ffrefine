@@ -345,3 +345,34 @@ def test_run_on_pfoa_end_to_end_gives_a_drop_in_topology(tmp_path, gmx_bin, xtb_
         "dropin",
     )
     assert np.isfinite(energies.potential()).all()
+
+
+def test_energies_json_keeps_the_warnings_mmscan_raised(
+    tmp_path, butane_pdb, butane_itp, monkeypatch
+):
+    """No scan.json: mmscan warns that it covers one geometry, and keeps the warning."""
+    out = tmp_path / "out"
+    monkeypatch.setattr(cli, "check_torsion_removal", _fake_check([]))
+    monkeypatch.setattr(cli, "resolve_torsion_set", _fake_resolve("a" * 64))
+    argv = ["mmscan", "-s", str(butane_pdb), "-p", str(butane_itp), "--dihedral", "1,5,8,11"]
+    assert main(argv + ["--outdir", str(out)]) == 0
+    energies = json.loads((out / "02_mm_scan" / "energies.json").read_text())
+    assert any("no QM scan" in w for w in energies["warnings"])
+
+
+def test_validation_json_keeps_the_did_not_improve_warning(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    _write_pfoa_stage_inputs(out)
+    assert main(["fit"] + _pfoa_args(out)) == 0
+
+    def worse(*args, **kwargs):
+        import dataclasses
+
+        result = _fake_validate_refit(*args, **kwargs)
+        return dataclasses.replace(result, rmse_after=2.0, improved=False)
+
+    _stub_validate(monkeypatch)
+    monkeypatch.setattr(cli, "validate_refit", worse)
+    assert main(["validate"] + _pfoa_args(out)) == 0
+    validation = json.loads((out / "final" / "validation.json").read_text())
+    assert any("did not improve" in w for w in validation["warnings"])

@@ -1237,3 +1237,13 @@ def test_input_stage_omits_the_torsion_set_when_there_is_no_torsion(
     assert model["natoms"] == 14
     assert "target_quad_1_based" not in model
     assert "torsion_set_1_based" not in model
+
+
+def test_fit_json_keeps_the_warnings_the_fit_raised(tmp_path, butane_pdb, butane_itp):
+    """Fitting without --distribute always warns; the warning is in fit.json."""
+    out = tmp_path / "out"
+    phi = _grid()
+    _write_stage_inputs(out, phi, 5.0 * (1.0 + np.cos(np.radians(3.0 * phi))))
+    assert main(["fit"] + _base_args(butane_pdb, butane_itp, out)) == 0
+    fit = json.loads((out / "03_fit" / "fit.json").read_text())
+    assert any("without --distribute" in w for w in fit["warnings"])
