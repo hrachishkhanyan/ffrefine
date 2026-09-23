@@ -414,38 +414,35 @@ def _preprocess(
         ) from exc
 
 
-_CONDITIONAL_RE = re.compile(r"^\s*#\s*(ifdef|ifndef|else)\b")
-
-
 def _dihedrals_have_conditionals(path: str | Path) -> bool:
-    """Whether a ``[ dihedrals ]`` section of ``path`` holds an ``#ifdef``/``#ifndef``/``#else``.
+    """Whether a ``[ dihedrals ]`` data line sits inside an ``#ifdef``/``#ifndef`` branch.
 
-    ffrefine's parser resolves such branches with no defines; grompp may take
-    a different branch when an included force-field file defines something.
-    Only counts conditionals that appear before or amid dihedral data lines,
-    not those appearing after all data has ended.
+    ``#else`` branches count too. ffrefine's parser resolves such branches with no
+    defines; grompp may take another when an included force-field file defines
+    something, so ffrefine and grompp could disagree about which dihedral lines
+    exist. A conditional guarding only an ``#include`` or another section's data
+    (CGenFF's ``#ifdef POSRES`` / ``POSRES_WATER`` blocks) does not count.
     """
     section = ""
-    seen_content = False
-    empty_run = 0
+    depth = 0
     for raw in Path(path).read_text().splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            words = stripped[1:].split()
+            directive = words[0] if words else ""
+            if directive in ("ifdef", "ifndef"):
+                depth += 1
+            elif directive == "endif":
+                depth = max(0, depth - 1)
+            continue
         body = raw.split(";", 1)[0].strip()
+        if not body:
+            continue
         if body.startswith("[") and body.endswith("]"):
             section = body[1:-1].strip().lower()
-            seen_content = False
-            empty_run = 0
-        elif section == "dihedrals":
-            if not body:
-                empty_run += 1
-            else:
-                # If we've seen content, then empty lines, then a conditional,
-                # the conditional is likely after the data (not inside it).
-                if seen_content and empty_run > 0 and _CONDITIONAL_RE.match(raw):
-                    return False
-                empty_run = 0
-                if _CONDITIONAL_RE.match(raw):
-                    return True
-                seen_content = True
+            continue
+        if section == "dihedrals" and depth > 0:
+            return True
     return False
 
 

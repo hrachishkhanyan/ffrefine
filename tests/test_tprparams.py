@@ -319,6 +319,52 @@ def test_conditionals_are_detected_only_inside_dihedrals(tmp_path):
     assert not _dihedrals_have_conditionals(CAPECITABINE / "capecitabine_gmx.top")
 
 
+def test_blank_line_inside_dihedrals_then_ifdef(tmp_path):
+    """A blank line inside [ dihedrals ], then #ifdef wrapping a dihedral line."""
+    f = tmp_path / "test.itp"
+    f.write_text("[ dihedrals ]\n\n#ifdef FOO\n   5   6   7   8   9\n#endif\n")
+    assert _dihedrals_have_conditionals(f)
+
+
+def test_two_dihedrals_sections_with_ifdef_in_second(tmp_path):
+    """Two [ dihedrals ] sections: first has include-only #ifdef, second wraps a line."""
+    f = tmp_path / "test.itp"
+    f.write_text(
+        "[ dihedrals ]\n"
+        "   1   2   3   4   9\n"
+        "; comment\n"
+        "#ifdef POSRES\n"
+        '#include "posre.itp"\n'
+        "#endif\n"
+        "\n"
+        "[ dihedrals ]\n"
+        "#ifdef FOO\n"
+        "   5   6   7   8   9\n"
+        "#endif\n"
+    )
+    assert _dihedrals_have_conditionals(f)
+
+
+def test_dihedral_line_only_in_else_branch(tmp_path):
+    """A dihedral line only inside an #else branch."""
+    f = tmp_path / "test.itp"
+    f.write_text("[ dihedrals ]\n#ifdef FOO\n#else\n   5   6   7   8   9\n#endif\n")
+    assert _dihedrals_have_conditionals(f)
+
+
+def test_include_only_ifdef_directly_after_last_line(tmp_path):
+    """An include-only #ifdef POSRES directly after the last dihedral line with no blank."""
+    f = tmp_path / "test.itp"
+    f.write_text(
+        "[ dihedrals ]\n"
+        "   1   2   3   4   9\n"
+        "#ifdef POSRES\n"
+        '#include "posre.itp"\n'
+        "#endif\n"
+    )
+    assert not _dihedrals_have_conditionals(f)
+
+
 @contextlib.contextmanager
 def _ffrefine_warnings():
     """Every WARNING record on the ``ffrefine`` logger while the block runs.
