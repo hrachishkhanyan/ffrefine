@@ -14,9 +14,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..errors import ValidationError
-from ..io.topology import Topology
+from ..io.topology import CHARGE_TOLERANCE, Topology
 from ..io.validate import element_of
-from ..qm.xtb import CHARGE_TOLERANCE
 
 CHARGE_DECIMALS = 4
 """The fewest decimal places a changed charge is written with.
@@ -81,7 +80,7 @@ def check_selection(topology: Topology, selected: list[int] | None, target_total
 
     * a selected atom number that does not exist in the topology; and
     * a target total that disagrees with the topology's own charge sum by
-      more than :data:`~ffrefine.qm.xtb.CHARGE_TOLERANCE` (ruling R21,
+      more than :data:`~ffrefine.io.topology.CHARGE_TOLERANCE` (ruling R21,
       amending R10/R11).  ``selected`` mode replaces only the named atoms,
       so the whole disagreement would have to be absorbed by the two or
       three atoms sharing their charge groups: ``--charge -1`` on neutral
@@ -158,7 +157,7 @@ def apply_charges(
     in that same group, falling back to bonded heavy atoms if no in-group
     recipients exist. After all per-group redistributions, any remaining
     global offset (an explicit ``--charge`` differing from the topology's sum
-    by no more than :data:`~ffrefine.qm.xtb.CHARGE_TOLERANCE`) is spread over
+    by no more than :data:`~ffrefine.io.topology.CHARGE_TOLERANCE`) is spread over
     the pooled recipients; a larger offset is refused before anything is
     changed (see :func:`check_selection`).
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..errors import ParseError
+from ..errors import ParseError, ValidationError
 from .includes import find_marker, resolve_include_base
 
 PROPER_FUNCTS = (1, 9)
@@ -303,3 +303,56 @@ def read_topology(path: str | Path, defines: set[str] | None = None) -> Topology
         source=path,
         include_marker=find_marker(all_lines, path),
     )
+
+
+CHARGE_TOLERANCE = 0.05
+"""How far the topology's charge sum may sit from an integer before it is refused."""
+
+
+def derive_charge(
+    topology: Topology, override: int | None = None, tol: float = CHARGE_TOLERANCE
+) -> int:
+    """Determine the total molecular charge for xtb's ``--chrg``.
+
+    Spec 4.3 requires the flag but does not say where the value comes from.
+    The topology knows: ``[ atoms ]`` charges sum to the molecular charge by
+    construction.  Deriving it beats asking, because a user who forgets
+    ``--charge`` on an ionic molecule gets a silently wrong electronic
+    structure and therefore a silently wrong torsion profile -- there is no
+    error, just a bad answer.
+
+    Force field charges print to three or four decimals, so the sum is rarely
+    exact; it is rounded.  A sum far from any integer means the topology is
+    incomplete or corrupt, and guessing a charge for it would be worse than
+    stopping.
+
+    Multiplicity is deliberately NOT derived.  Electron-count parity cannot
+    distinguish a triplet from a singlet diradical, so ``--uhf`` stays explicit
+    and defaults to 0.
+
+    Args:
+        topology: the parsed molecule.
+        override: an explicit ``--charge`` from the user; wins outright, and is
+            not re-checked against the sum -- it is the escape hatch the
+            refusal below advertises, so it has to work on the topology that
+            triggered the refusal.
+        tol: largest allowed departure from an integer.
+
+    Returns:
+        The integer charge.
+
+    Raises:
+        ValidationError: the charge sum is not within ``tol`` of an integer.
+    """
+    if override is not None:
+        return int(override)
+    total = sum(atom.charge for atom in topology.atoms)
+    nearest = round(total)
+    if abs(total - nearest) > tol:
+        raise ValidationError(
+            f"the topology's [ atoms ] charges sum to {total:.4f}, which is "
+            f"{abs(total - nearest):.4f} from the nearest integer ({nearest}) and outside "
+            f"the {tol} tolerance. That usually means the topology is incomplete. Pass "
+            "--charge to state the molecular charge explicitly."
+        )
+    return int(nearest)

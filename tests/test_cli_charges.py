@@ -1061,3 +1061,23 @@ def test_validation_json_names_the_users_topology_when_no_charges_ran(
     assert validation["before_topology"] == str(butane_itp.resolve())
     assert validation["charges_refined"] is False
     assert validation["input_topology"] == str(butane_itp.resolve())
+
+
+def test_a_failed_rrms_read_leaves_no_charged_topology(
+    butane_pdb, butane_itp, tmp_path, fake_esp, monkeypatch, capsys
+):
+    """Milestone 5 ruling R27: the topology is written only once everything it
+    is reported with exists, so a failure cannot leave an orphan behind."""
+    import ffrefine.cli as cli
+    from ffrefine.errors import ExternalToolError
+
+    def unreadable(*args, **kwargs):
+        raise ExternalToolError("esp.vpot could not be read")
+
+    monkeypatch.setattr(cli, "_rrms_on_orca_grid", unreadable)
+    outdir = tmp_path / "out"
+    argv = _args(butane_pdb, butane_itp, outdir, "--charge-atoms", "1,11", "--charge-geom", "input")
+    assert main(argv) == 1
+    assert "esp.vpot could not be read" in capsys.readouterr().err
+    assert not (outdir / "04_charges" / "molecule_charged.itp").exists()
+    assert not (outdir / "04_charges" / "charges.json").exists()

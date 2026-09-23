@@ -1549,7 +1549,6 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
                 a.after,
             )
     charged_itp = workdir / "molecule_charged.itp"
-    write_charged_topology(args.topology, assignments, charged_itp, decimals=decimals)
 
     # Ruling R20: in selected mode the written topology carries only a few
     # fitted charges, so the fitted set's RRMS describes charges that were
@@ -1574,6 +1573,10 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
             "topology do not fit this potential, which --charge-mode selected cannot "
             "change. Treat the result with suspicion rather than assuming a bug."
         )
+
+    # Milestone 5 ruling R27: written only once everything reported with it
+    # exists, so a failure above cannot leave an orphaned charged topology.
+    write_charged_topology(args.topology, assignments, charged_itp, decimals=decimals)
 
     payload = {
         "molecule": topology.name,
