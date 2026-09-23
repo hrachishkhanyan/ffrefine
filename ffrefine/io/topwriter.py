@@ -50,6 +50,23 @@ _WRAPPER_SECTIONS = frozenset({"system", "molecules"})
 not also carry them."""
 
 
+CHARGES_PROVENANCE_PREFIX = "; ffrefine charges: "
+"""The comment line a charge-refined topology carries, naming its charges.json.
+
+Written by :func:`write_charged_topology` and copied verbatim by every later
+writer, so any topology in a chain -- a bond subfolder's input, the final
+refined topology -- says which charges its torsions were fitted against
+(milestone 5 ruling R28)."""
+
+
+def charges_provenance(path: str | Path) -> Path | None:
+    """The ``charges.json`` a topology's charges came from, or ``None``."""
+    for line in Path(path).read_text().splitlines():
+        if line.startswith(CHARGES_PROVENANCE_PREFIX):
+            return Path(line[len(CHARGES_PROVENANCE_PREFIX) :].strip())
+    return None
+
+
 def strip_system_sections(lines: list[str]) -> tuple[list[str], list[str]]:
     """Drop ``[ system ]`` and ``[ molecules ]`` blocks from a topology's lines.
 
@@ -350,6 +367,7 @@ def write_charged_topology(
     assignments: list["ChargeAssignment"],
     out_path: str | Path,
     decimals: int = 4,
+    charges_json: str | Path | None = None,
 ) -> list[int]:
     """Copy a topology, rewriting only the charge column of changed atoms.
 
@@ -365,6 +383,10 @@ def write_charged_topology(
     mass are left exactly as written, including their spacing, so a diff
     against the input shows the charges and nothing else.
 
+    Like the other writers it drops ``[ system ]`` and ``[ molecules ]``
+    (milestone 5 finding M7): every topology ffrefine writes is a molecule
+    include file.
+
     Args:
         source: the user's topology; never modified.
         assignments: from :func:`ffrefine.charges.apply.apply_charges`.  Entries
@@ -378,6 +400,9 @@ def write_charged_topology(
             ``cmd_charges`` does.  The default of 4 is
             :data:`ffrefine.charges.apply.CHARGE_DECIMALS`, the floor, and is
             too coarse for a topology whose own charges carry more.
+        charges_json: the stage's charges.json; recorded in a
+            CHARGES_PROVENANCE_PREFIX comment line, replacing any earlier
+            one. None writes no such line.
 
     Returns:
         The 1-based atom numbers whose lines were rewritten, in file order.
@@ -415,6 +440,14 @@ def write_charged_topology(
             f"{source}: no [ atoms ] line for atom(s) {missing}, so their new charges "
             "could not be written. The topology and the fitted charges disagree about "
             "how many atoms this molecule has."
+        )
+    out = [line for line in out if not line.startswith(CHARGES_PROVENANCE_PREFIX)]
+    if charges_json is not None:
+        out.insert(0, f"{CHARGES_PROVENANCE_PREFIX}{Path(charges_json).resolve()}")
+    out, dropped = strip_system_sections(out)
+    if dropped:
+        log.info(
+            "%s: dropped [ %s ] from the charged copy", Path(source).name, " ] [ ".join(dropped)
         )
     out = mark_include_base(out, include_base(source))
     Path(out_path).write_text("\n".join(out) + "\n", newline="\n")

@@ -714,8 +714,12 @@ def test_a_six_decimal_topology_keeps_every_untouched_line(
     With C1 selected, only C1's charge group may change. Every other
     ``[ atoms ]`` line must be byte-identical to the input, every untouched
     atom labelled ``unchanged``, and the changed charges written at the
-    input's own 6 decimals rather than 4.
+    input's own 6 decimals rather than 4. The charges stage also writes one
+    provenance comment line (milestone 5 ruling R28), which the comparison
+    sets aside and checks separately.
     """
+    from ffrefine.io.topwriter import CHARGES_PROVENANCE_PREFIX
+
     itp = _six_decimal_itp(butane_itp, tmp_path / "butane6.itp")
     outdir = tmp_path / "out"
     rc = main(_args(butane_pdb, itp, outdir, "--charge-atoms", "1", "--charge-geom", "input"))
@@ -727,6 +731,12 @@ def test_a_six_decimal_topology_keeps_every_untouched_line(
     assert sum(a["charge_after"] for a in payload["atoms"]) == pytest.approx(0.0, abs=1e-9)
 
     written = (outdir / "04_charges" / "molecule_charged.itp").read_text().splitlines()
+    provenance = [line for line in written if line.startswith(CHARGES_PROVENANCE_PREFIX)]
+    written = [line for line in written if not line.startswith(CHARGES_PROVENANCE_PREFIX)]
+    assert provenance == [
+        f"{CHARGES_PROVENANCE_PREFIX}{(outdir / '04_charges' / 'charges.json').resolve()}"
+    ]
+
     original = itp.read_text().splitlines()
     differing = [w for w, o in zip(written, original) if w != o]
     assert len(written) == len(original)
@@ -925,10 +935,14 @@ def _fake_charges_stage(butane_itp):
     import ffrefine.cli as cli
 
     def fake(a):
+        from ffrefine.io.topwriter import CHARGES_PROVENANCE_PREFIX
+
         cli._prepare(a, need_quad=False)
         charged = cli.stage_dir(a.outdir, "charges") / "molecule_charged.itp"
+        charges_json = (charged.parent / "charges.json").resolve()
         charged.write_text(
-            butane_itp.read_text().replace("-0.270", "-0.300", 1).replace("0.090", "0.100", 1)
+            f"{CHARGES_PROVENANCE_PREFIX}{charges_json}\n"
+            + butane_itp.read_text().replace("-0.270", "-0.300", 1).replace("0.090", "0.100", 1)
         )
         return 0
 
@@ -1029,6 +1043,7 @@ def test_validation_json_names_the_charge_refined_topology_it_measured_before_ag
     assert validation["before_topology"] == str(charged.resolve())
     assert validation["charges_refined"] is True
     assert validation["input_topology"] == str(butane_itp.resolve())
+    assert validation["charges_json"] == str((outdir / "04_charges" / "charges.json").resolve())
 
 
 def test_validation_json_names_the_users_topology_when_no_charges_ran(
@@ -1061,6 +1076,7 @@ def test_validation_json_names_the_users_topology_when_no_charges_ran(
     assert validation["before_topology"] == str(butane_itp.resolve())
     assert validation["charges_refined"] is False
     assert validation["input_topology"] == str(butane_itp.resolve())
+    assert validation["charges_json"] is None
 
 
 def test_a_failed_rrms_read_leaves_no_charged_topology(
@@ -1081,3 +1097,30 @@ def test_a_failed_rrms_read_leaves_no_charged_topology(
     assert "esp.vpot could not be read" in capsys.readouterr().err
     assert not (outdir / "04_charges" / "molecule_charged.itp").exists()
     assert not (outdir / "04_charges" / "charges.json").exists()
+
+
+def test_charges_refined_holds_for_a_charged_topology_from_another_outdir(
+    butane_pdb, butane_itp, tmp_path, monkeypatch
+):
+    """Milestone 5 ruling R28: the flag used to compare paths inside one outdir only."""
+    import ffrefine.cli as cli
+    from ffrefine.io.topwriter import write_charged_topology
+
+    elsewhere = tmp_path / "earlier_run" / "04_charges"
+    elsewhere.mkdir(parents=True)
+    charged = elsewhere / "molecule_charged.itp"
+    write_charged_topology(butane_itp, [], charged, charges_json=elsewhere / "charges.json")
+
+    outdir = tmp_path / "out"
+    _fake_validation_inputs(outdir, butane_pdb)
+    monkeypatch.setattr(cli, "validate_refit", _fake_validate_refit([]))
+    monkeypatch.setattr(cli, "plot_validation", lambda *a, **k: None)
+    args = cli.build_parser().parse_args(
+        ["validate", "-s", str(butane_pdb), "-p", str(charged), "--dihedral", "1,5,8,11"]
+        + ["--outdir", str(outdir)]
+    )
+    cli._apply_config(args)
+    assert cli.cmd_validate(args) == 0
+    validation = json.loads((outdir / "final" / "validation.json").read_text())
+    assert validation["charges_refined"] is True
+    assert validation["charges_json"] == str((elsewhere / "charges.json").resolve())

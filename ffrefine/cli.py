@@ -107,7 +107,7 @@ from .io.includes import has_includes
 from .io.prm import write_prm_block
 from .io.structure import Structure, read_structure, write_multimodel_pdb
 from .io.topology import Defaults, Topology, read_topology
-from .io.topwriter import write_charged_topology, write_refit_topology
+from .io.topwriter import charges_provenance, write_charged_topology, write_refit_topology
 from .io.validate import adopt_topology_naming, element_of, validate_structure_topology
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
@@ -1576,7 +1576,9 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
 
     # Milestone 5 ruling R27: written only once everything reported with it
     # exists, so a failure above cannot leave an orphaned charged topology.
-    write_charged_topology(args.topology, assignments, charged_itp, decimals=decimals)
+    write_charged_topology(
+        args.topology, assignments, charged_itp, decimals=decimals, charges_json=_charges_path(args)
+    )
 
     payload = {
         "molecule": topology.name,
@@ -2015,9 +2017,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
     repointed at ``04_charges/molecule_charged.itp``, so "before" is that
     charge-refined topology: the force field's torsion terms with the new
     charges.  ``validation.json`` records the file actually used
-    (``before_topology``), whether it is this outdir's charges-stage output
-    (``charges_refined``) and the user's own ``-p`` (``input_topology``)
-    (ruling R24).
+    (``before_topology``), whether its charges were refined by ffrefine
+    (``charges_refined``, read from the provenance line the charges stage
+    writes) and which ``charges.json`` they came from (``charges_json``), and
+    the user's own ``-p`` (``input_topology``) (ruling R24).
     """
     if args.dry_run:
         _, topology, quad = _load_inputs(args)
@@ -2122,8 +2125,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         includes="verbatim",
     )
     before_topology = Path(args.topology).resolve()
-    charged_output = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
-    charges_refined = before_topology == charged_output.resolve()
+    # Milestone 5 ruling R28: read from the topology itself, so the answer is
+    # right for a charged topology from another outdir and for every bond of a
+    # chained run, not only for this outdir's own 04_charges/.
+    charges_json = charges_provenance(before_topology)
     plot_validation(
         result.phi_deg,
         result.qm_kj,
@@ -2146,7 +2151,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "mm_before_kj_per_mol": [float(v) for v in result.mm_before_kj],
                 "mm_after_kj_per_mol": [float(v) for v in result.mm_after_kj],
                 "before_topology": str(before_topology),
-                "charges_refined": bool(charges_refined),
+                "charges_refined": charges_json is not None,
+                "charges_json": None if charges_json is None else str(charges_json),
                 "input_topology": str(Path(_input_topology(args)).resolve()),
             },
             indent=2,

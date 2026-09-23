@@ -6,6 +6,8 @@ import pytest
 from ffrefine.io.includes import MARKER_NOTE, MARKER_PREFIX
 from ffrefine.io.topology import read_topology
 from ffrefine.io.topwriter import (
+    CHARGES_PROVENANCE_PREFIX,
+    charges_provenance,
     make_system_top,
     strip_system_sections,
     write_charged_topology,
@@ -471,3 +473,45 @@ def test_write_refit_topology_requires_an_include_mode(tmp_path, butane_itp):
     t = read_topology(butane_itp)
     with pytest.raises(TypeError, match="includes"):
         write_refit_topology(*_refit_args(t, (1, 5, 8, 11)), tmp_path / "x.itp")
+
+
+def test_charged_topology_records_where_its_charges_came_from(tmp_path, butane_itp):
+    charges_json = tmp_path / "04_charges" / "charges.json"
+    out = tmp_path / "charged.itp"
+    write_charged_topology(butane_itp, [], out, charges_json=charges_json)
+    assert charges_provenance(out) == charges_json.resolve()
+    assert out.read_text().count(CHARGES_PROVENANCE_PREFIX) == 1
+
+
+def test_charged_topology_replaces_an_earlier_provenance_line(tmp_path, butane_itp):
+    first = tmp_path / "a.itp"
+    write_charged_topology(butane_itp, [], first, charges_json=tmp_path / "old" / "charges.json")
+    second = tmp_path / "b.itp"
+    write_charged_topology(first, [], second, charges_json=tmp_path / "new" / "charges.json")
+    assert charges_provenance(second) == (tmp_path / "new" / "charges.json").resolve()
+    assert second.read_text().count(CHARGES_PROVENANCE_PREFIX) == 1
+
+
+def test_provenance_survives_the_refit_writer(tmp_path, butane_itp):
+    """Every later topology in a chain inherits it, bond after bond."""
+    charges_json = tmp_path / "charges.json"
+    charged = tmp_path / "charged.itp"
+    write_charged_topology(butane_itp, [], charged, charges_json=charges_json)
+    t = read_topology(charged)
+    refined = tmp_path / "refined.itp"
+    args = (t, (1, 5, 8, 11), np.array([1.0]), np.array([0.0]), np.array([3]))
+    write_refit_topology(*args, refined, includes="verbatim")
+    assert charges_provenance(refined) == charges_json.resolve()
+
+
+def test_a_topology_without_the_line_has_no_provenance(butane_itp):
+    assert charges_provenance(butane_itp) is None
+
+
+def test_charged_topology_is_a_molecule_include(tmp_path):
+    """Milestone 5 finding M7: a charged .top kept [ system ] and [ molecules ]."""
+    out = tmp_path / "molecule_charged.itp"
+    write_charged_topology(PFOA / "pfoa_gmx.top", [], out)
+    text = out.read_text()
+    assert "[ system ]" not in text and "[ molecules ]" not in text
+    assert "[ moleculetype ]" in text
