@@ -414,6 +414,41 @@ def _preprocess(
         ) from exc
 
 
+_CONDITIONAL_RE = re.compile(r"^\s*#\s*(ifdef|ifndef|else)\b")
+
+
+def _dihedrals_have_conditionals(path: str | Path) -> bool:
+    """Whether a ``[ dihedrals ]`` section of ``path`` holds an ``#ifdef``/``#ifndef``/``#else``.
+
+    ffrefine's parser resolves such branches with no defines; grompp may take
+    a different branch when an included force-field file defines something.
+    Only counts conditionals that appear before or amid dihedral data lines,
+    not those appearing after all data has ended.
+    """
+    section = ""
+    seen_content = False
+    empty_run = 0
+    for raw in Path(path).read_text().splitlines():
+        body = raw.split(";", 1)[0].strip()
+        if body.startswith("[") and body.endswith("]"):
+            section = body[1:-1].strip().lower()
+            seen_content = False
+            empty_run = 0
+        elif section == "dihedrals":
+            if not body:
+                empty_run += 1
+            else:
+                # If we've seen content, then empty lines, then a conditional,
+                # the conditional is likely after the data (not inside it).
+                if seen_content and empty_run > 0 and _CONDITIONAL_RE.match(raw):
+                    return False
+                empty_run = 0
+                if _CONDITIONAL_RE.match(raw):
+                    return True
+                seen_content = True
+    return False
+
+
 def write_full_system(
     topology: Topology, workdir: str | Path, stem: str, ff_includes: list[str] | None = None
 ) -> Path:
@@ -466,6 +501,21 @@ def resolve_torsion_set(
     except ValidationError as exc:
         raise ValidationError(f"{exc} (GROMACS {dump.gromacs_version})") from exc
     terms = cross_check(collect_torsion_set(topology, quad), dumped, dump.path)
+    resolved_quads = {(t.dihedral.ai, t.dihedral.aj, t.dihedral.ak, t.dihedral.al) for t in terms}
+    empty = [
+        (d.ai, d.aj, d.ak, d.al)
+        for d in collect_torsion_set(topology, quad)
+        if not d.params and (d.ai, d.aj, d.ak, d.al) not in resolved_quads
+    ]
+    if empty and _dihedrals_have_conditionals(topology.source):
+        for q in dict.fromkeys(empty):
+            log.warning(
+                "torsion %s resolved to no terms, and %s has an #ifdef in [ dihedrals ]: "
+                "grompp may have read a different branch than ffrefine, in which case a "
+                "refit written onto this line would have no effect (milestone 6a ruling R9).",
+                " ".join(map(str, q)),
+                Path(topology.source).name,
+            )
     n_typed = sum(t.source == SOURCE_DIHEDRALTYPES for t in terms)
     log.info(
         "torsion set about bond (%d, %d): %d term(s), %d of them from [ dihedraltypes ] "

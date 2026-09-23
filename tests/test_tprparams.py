@@ -7,6 +7,8 @@ copies of it for every refusal.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -22,6 +24,7 @@ from ffrefine.mm.tprparams import (
     SOURCE_TOPOLOGY,
     DumpedTerm,
     ResolvedTerm,
+    _dihedrals_have_conditionals,
     cross_check,
     parse_defaults,
     parse_dump_torsions,
@@ -304,3 +307,59 @@ def test_a_missing_include_names_the_base_it_was_resolved_against(tmp_path, gmx_
     msg = str(excinfo.value)
     assert 'Topology include file "./charmm36.ff/forcefield.itp" not found' in msg
     assert f"against {lonely.resolve()} (the directory of" in msg
+
+
+def test_conditionals_are_detected_only_inside_dihedrals(tmp_path):
+    inside = tmp_path / "inside.itp"
+    inside.write_text("[ dihedrals ]\n#ifdef FOO\n1 2 3 4 9\n#endif\n")
+    elsewhere = tmp_path / "elsewhere.itp"
+    elsewhere.write_text("[ atoms ]\n#ifdef FOO\n#endif\n[ dihedrals ]\n1 2 3 4 9\n")
+    assert _dihedrals_have_conditionals(inside)
+    assert not _dihedrals_have_conditionals(elsewhere)
+    assert not _dihedrals_have_conditionals(CAPECITABINE / "capecitabine_gmx.top")
+
+
+@contextlib.contextmanager
+def _ffrefine_warnings():
+    """Every WARNING record on the ``ffrefine`` logger while the block runs.
+
+    Attached to that logger directly: ``setup_logging`` turns propagation off,
+    so pytest's ``caplog`` would miss these records after any CLI test ran.
+    """
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(level=logging.WARNING)
+    handler.emit = records.append
+    logger = logging.getLogger("ffrefine")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+
+
+@pytest.mark.needs_gmx
+def test_an_empty_typed_line_under_ifdef_is_a_warning(tmp_path, gmx_bin):
+    """Capecitabine's 6 7 9 37 resolves to no terms. With an #ifdef in
+    [ dihedrals ] that is no longer provably the all-k=0 case, so it warns."""
+    work = tmp_path / "cap"
+    shutil.copytree(CAPECITABINE, work)
+    top = work / "capecitabine_gmx.top"
+    text = top.read_text()
+    marker = "    6     7     9    37     9\n"
+    assert marker in text, "fixture layout changed"
+    top.write_text(text.replace(marker, f"#ifndef NEVER_DEFINED\n{marker}#endif\n", 1))
+    t = read_topology(top)
+    s = read_pdb(work / "capecitabine_gmx.pdb")
+    with _ffrefine_warnings() as records:
+        resolve_torsion_set(Binaries(gmx=gmx_bin), t, (6, 7, 9, 10), s, tmp_path / "wd")
+    messages = [r.getMessage() for r in records]
+    assert any("6 7 9 37" in m and "#ifdef" in m for m in messages), messages
+
+
+@pytest.mark.needs_gmx
+def test_an_empty_typed_line_without_ifdef_stays_info(tmp_path, gmx_bin):
+    t = read_topology(CAPECITABINE / "capecitabine_gmx.top")
+    s = read_pdb(CAPECITABINE / "capecitabine_gmx.pdb")
+    with _ffrefine_warnings() as records:
+        resolve_torsion_set(Binaries(gmx=gmx_bin), t, (6, 7, 9, 10), s, tmp_path)
+    assert not [r.getMessage() for r in records if "resolved to no terms" in r.getMessage()]
