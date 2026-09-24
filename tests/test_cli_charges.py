@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pytest
 
+from conftest import BOHR_IN_NM, _inverse_distances_bohr, _shell_points_bohr, _write_chelpg_vpot
 from ffrefine.cli import build_parser, main
 from ffrefine.io.topology import read_topology
 from ffrefine.io.validate import element_of
@@ -417,33 +418,6 @@ def test_resp_shrinks_heavy_atom_charges_relative_to_chelpg(
         assert 0.25 <= ratio <= 0.6, f"atom {i + 1}: |RESP|/|CHELPG| = {ratio:.3f}"
 
 
-# CODATA 2018, written out so this file's arithmetic does not lean on
-# ffrefine.units, which is part of what the RRMS tests below check.
-BOHR_IN_NM = 0.0529177210903
-
-
-def _write_chelpg_vpot(path, atoms_bohr, grid_bohr, v):
-    """Write a ``.vpot`` in the layout a CHELPG run leaves: ``V x y z``, bohr."""
-    lines = [f"{len(atoms_bohr):6d} {len(grid_bohr):6d}"]
-    lines += [f"   {x: .10E} {y: .10E} {z: .10E}" for x, y, z in atoms_bohr]
-    lines += [f"   {p: .10E} {x: .10E} {y: .10E} {z: .10E}" for p, (x, y, z) in zip(v, grid_bohr)]
-    path.write_text("\n".join(lines) + "\n")
-
-
-def _shell_points_bohr(atoms_bohr, n=400, seed=0):
-    """Points on shells well outside the molecule, so none sits on an atom."""
-    rng = np.random.default_rng(seed)
-    directions = rng.normal(size=(n, 3))
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
-    centre = atoms_bohr.mean(axis=0)
-    radius = np.linalg.norm(atoms_bohr - centre, axis=1).max() + 4.0
-    return centre + directions * radius * rng.uniform(1.0, 1.5, size=(n, 1))
-
-
-def _inverse_distances_bohr(atoms_bohr, grid_bohr):
-    return 1.0 / np.linalg.norm(grid_bohr[:, None, :] - atoms_bohr[None, :, :], axis=-1)
-
-
 def test_the_rrms_helper_scores_charges_against_a_potential_in_atomic_units(tmp_path, butane_pdb):
     """The helper ``cmd_charges`` uses for every RRMS it reports.
 
@@ -524,64 +498,6 @@ def test_the_rrms_helper_agrees_with_an_independent_fit_on_orcas_own_grid(
 # ---------------------------------------------------------------------------
 # cmd_charges end to end without ORCA
 # ---------------------------------------------------------------------------
-
-BUTANE_ESP = np.array(
-    [-0.40, 0.09, 0.09, 0.09, 0.20, -0.035, -0.035, 0.20, -0.035, -0.035, -0.40, 0.09, 0.09, 0.09]
-)
-"""Stand-in "ORCA" charges for butane: sum to zero, equal within each
-equivalence group (so averaging leaves them alone), and unlike the fixture's
-own charges, so a selected-mode result mixes two genuinely different sets."""
-
-
-class FakeEsp:
-    """What the fake ESP job wrote, and an independent RRMS against it."""
-
-    def __init__(self) -> None:
-        self.chelpg = BUTANE_ESP.copy()
-        self.calls = 0
-        self.atoms_bohr: np.ndarray | None = None
-        self.grid_bohr: np.ndarray | None = None
-        self.v: np.ndarray | None = None
-
-    def rrms(self, charges) -> float:
-        """RRMS from the arrays the fake wrote, in bohr, with no ffrefine code."""
-        inv_r = _inverse_distances_bohr(self.atoms_bohr, self.grid_bohr)
-        fit = inv_r @ np.asarray(charges, float)
-        return float(np.sqrt(((self.v - fit) ** 2).sum() / (self.v**2).sum()))
-
-
-@pytest.fixture
-def fake_esp(monkeypatch):
-    """Stand in for the ORCA ESP job, so cmd_charges runs end to end without ORCA.
-
-    Writes an ``esp.chelpg.xyz`` carrying ``FakeEsp.chelpg`` and an
-    ``esp.vpot`` whose potential those same charges produce exactly, in the
-    layouts ORCA uses. Tests pass ``--charge-geom input`` so xtb is not
-    needed either.
-    """
-    import ffrefine.cli as cli
-
-    fake = FakeEsp()
-
-    def fake_run_esp_job(binaries, structure, coords_nm, workdir, keywords, **kwargs):
-        from pathlib import Path
-
-        workdir = Path(workdir)
-        workdir.mkdir(parents=True, exist_ok=True)
-        fake.calls += 1
-        fake.atoms_bohr = np.asarray(coords_nm, float) / BOHR_IN_NM
-        fake.grid_bohr = _shell_points_bohr(fake.atoms_bohr)
-        fake.v = _inverse_distances_bohr(fake.atoms_bohr, fake.grid_bohr) @ fake.chelpg
-        _write_chelpg_vpot(workdir / "esp.vpot", fake.atoms_bohr, fake.grid_bohr, fake.v)
-        lines = [str(len(fake.chelpg)), "# ORCA CHELPG point charges xyz file"]
-        for element, (x, y, z), q in zip(structure.elements, coords_nm * 10.0, fake.chelpg):
-            lines.append(f"{element:<2s} {x:12.6f} {y:12.6f} {z:12.6f} {q:12.8f}")
-        (workdir / "esp.chelpg.xyz").write_text("\n".join(lines) + "\n")
-        return workdir / "esp"
-
-    monkeypatch.setattr(cli, "run_esp_job", fake_run_esp_job)
-    monkeypatch.setattr(cli, "_orca_version", lambda binaries: "fake ORCA")
-    return fake
 
 
 def _charges_json(outdir):
@@ -902,6 +818,37 @@ def test_a_dry_run_warns_about_a_partial_equivalence_group(
     err = capsys.readouterr().err
     assert "[6, 7]" in err
     assert "[7] are not selected" in err
+
+
+def test_charge_atoms_naming_every_atom_still_succeeds(butane_pdb, butane_itp, tmp_path, fake_esp):
+    """Ruling R6: selecting literally every atom degenerates to --charge-mode all.
+
+    Naming every atom under --charge-mode selected (the default) used to
+    leave apply_charges's per-charge-group residual redistribution with no
+    possible recipient anywhere in the topology (every group's every atom is
+    selected, so no in-group and no bonded-heavy-atom recipient exists), and
+    it refused with "nothing left to redistribute ... onto". _charges_stage
+    now passes None to apply_charges when selected_atoms covers every atom,
+    which is the already-tested --charge-mode all code path.
+    """
+    outdir = tmp_path / "out"
+    rc = main(
+        _args(
+            butane_pdb,
+            butane_itp,
+            outdir,
+            "--charge-atoms",
+            "1,2,3,4,5,6,7,8,9,10,11,12,13,14",
+            "--charge-geom",
+            "input",
+        )
+    )
+    assert rc == 0
+
+    payload = _charges_json(outdir)
+    assert len(payload["provenance"]["selected_atoms"]) == 14
+    written_total = sum(a["charge_after"] for a in payload["atoms"])
+    assert written_total == pytest.approx(payload["target_total"], abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

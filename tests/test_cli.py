@@ -306,7 +306,7 @@ def test_multiple_dihedrals_is_a_clean_error(tmp_path, butane_pdb, butane_itp, c
         + ["--outdir", str(tmp_path / "o"), "--dry-run"]
     )
     assert code == 1
-    assert "one --dihedral" in capsys.readouterr().err
+    assert "a single stage fits one torsion per outdir" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------

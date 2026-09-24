@@ -104,6 +104,7 @@ from .fit.selection import (
     select_model,
 )
 from .fit.weights import DEFAULT_EMAX, DEFAULT_TEMPERATURE, boltzmann_weights, uniform_weights
+from .io.cgenff import read_str
 from .io.includes import has_includes
 from .io.prm import write_prm_block
 from .io.structure import Structure, read_structure, write_multimodel_pdb
@@ -134,6 +135,7 @@ from .qm.orca import (
     run_vpot,
 )
 from .qm.xtb import derive_charge, optimize_geometry, run_scan, scan_grid
+from .selection import Selection, Thresholds, select, selection_to_json
 from .stages import (
     STAGE_DIRS,
     WarningCollector,
@@ -397,6 +399,59 @@ def _atom_list_arg(text: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+PENALTY_KINDS = ("charge", "dihedral")
+
+
+def _penalty_threshold(text: str) -> tuple[str, float]:
+    """Parse ``KIND=VALUE`` for ``--penalty-threshold``.
+
+    Raises:
+        ValidationError: not ``charge=`` or ``dihedral=`` followed by a
+            non-negative number.
+    """
+    kind, sep, value = text.partition("=")
+    kind = kind.strip().lower()
+    if not sep or kind not in PENALTY_KINDS:
+        raise ValidationError(
+            f"{text!r} is not KIND=VALUE with KIND one of {', '.join(PENALTY_KINDS)} "
+            "(e.g. dihedral=40)"
+        )
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise ValidationError(f"{value.strip()!r} in {text!r} is not a number") from exc
+    if number < 0:
+        raise ValidationError(f"a penalty threshold cannot be negative ({text!r})")
+    return kind, number
+
+
+def _penalty_threshold_arg(text: str) -> tuple[str, float]:
+    """argparse ``type=`` adapter for :func:`_penalty_threshold` (see :func:`_dihedral_arg`)."""
+    try:
+        return _penalty_threshold(text)
+    except ValidationError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _add_str_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the CGenFF stream-file flags (milestone 6b)."""
+    parser.add_argument(
+        "--str",
+        default=None,
+        metavar="PATH",
+        help="CGenFF .str file: choose the charges and torsions to refine from its penalties",
+    )
+    parser.add_argument(
+        "--penalty-threshold",
+        action="append",
+        type=_penalty_threshold_arg,
+        default=None,
+        metavar="KIND=VALUE",
+        help="flag penalties >= VALUE; KIND is charge (default 10) or dihedral (default 50); "
+        "repeatable",
+    )
+
+
 def _add_charge_flags(parser: argparse.ArgumentParser) -> None:
     """Add the charge-refinement flags (also needed by ``run``, which chains them)."""
     parser.add_argument(
@@ -477,24 +532,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_torsion(scan)
     _add_qm_flags(scan)
     _add_scan_flags(scan)
+    _add_str_flags(scan)
 
     mmscan = sub.add_parser("mmscan", help="GROMACS single points with and without the torsion")
     _add_common(mmscan)
     _add_torsion(mmscan)
+    _add_str_flags(mmscan)
 
     fit = sub.add_parser("fit", help="fit the dihedral series and write new parameters")
     _add_common(fit)
     _add_torsion(fit)
     _add_fit_flags(fit)
+    _add_str_flags(fit)
 
     charges = sub.add_parser("charges", help="ESP/RESP charges via ORCA")
     _add_common(charges)
     _add_qm_flags(charges)
     _add_charge_flags(charges)
+    _add_str_flags(charges)
 
     validate = sub.add_parser("validate", help="rebuild with fitted parameters and compare to QM")
     _add_common(validate)
     _add_torsion(validate)
+    _add_str_flags(validate)
 
     run = sub.add_parser("run", help="run every implemented stage in order")
     _add_common(run)
@@ -503,6 +563,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_scan_flags(run)
     _add_fit_flags(run)
     _add_charge_flags(run)
+    _add_str_flags(run)
+    run.add_argument(
+        "--no-charges",
+        action="store_true",
+        help="with --str, skip refining the flagged charges and refit torsions only",
+    )
 
     return parser
 
@@ -711,24 +777,44 @@ def _load_structure_and_topology(args: argparse.Namespace) -> tuple[Structure, T
 
 
 def _resolve_quad(args: argparse.Namespace, topology: Topology) -> Quad:
-    """Resolve the single target torsion from ``--dihedral``.
+    """Resolve the single target torsion from ``--dihedral`` or ``--str``.
 
     Raises:
-        ValidationError: no ``--dihedral`` was given, more than one was given,
-            or the quadruplet is unusable with this topology.
+        ValidationError: no ``--dihedral`` and no usable ``--str`` selection,
+            more than one torsion, or the quadruplet is unusable with this
+            topology.
     """
-    quads = getattr(args, "dihedral", None) or []
+    quads = list(getattr(args, "dihedral", None) or [])
+    if not quads and getattr(args, "str", None):
+        selection = _selection(args, topology)
+        if not selection.bonds:
+            raise ValidationError(
+                f"no torsion in {args.str} has a dihedral penalty >= "
+                f"{selection.thresholds.dihedral:g}; the highest dihedral penalty is "
+                f"{selection.highest_dihedral_penalty:g}. Pass --dihedral i,j,k,l, or a lower "
+                "--penalty-threshold dihedral=VALUE."
+            )
+        if len(selection.bonds) > 1:
+            listed = ", ".join(
+                f"{','.join(map(str, b.quad))} (penalty {b.penalty:g})" for b in selection.bonds
+            )
+            raise ValidationError(
+                f"{len(selection.bonds)} bonds are flagged in {args.str}: {listed}. A single "
+                "stage fits one torsion per outdir, and a later bond must be fitted against "
+                "the earlier ones' refits; 'ffrefine run' does that in sequence, one subfolder "
+                "per bond. Or pass --dihedral to pick one here."
+            )
+        quads = [selection.bonds[0].quad]
     if not quads:
         raise ValidationError(
-            "no torsion selected. Pass --dihedral i,j,k,l using 1-based atom "
-            "indices. Automatic selection from a CGenFF .str file arrives in "
-            "milestone 6b and is not available in this build."
+            "no torsion selected. Pass --dihedral i,j,k,l using 1-based atom indices, or "
+            "--str mol.str to choose it from CGenFF's penalties."
         )
     if len(quads) > 1:
         raise ValidationError(
-            f"{len(quads)} torsions requested, but this build fits one torsion per run: "
-            "spec section 6's output layout holds a single QM scan and a single fit per "
-            "outdir. Re-run with one --dihedral and its own --outdir for each torsion."
+            f"{len(quads)} torsions requested, but a single stage fits one torsion per "
+            "outdir, and a later torsion must be fitted against the earlier ones' refits. "
+            "'ffrefine run' fits several in sequence, one subfolder per bond."
         )
     quad = quads[0]
     validate_quad(topology, quad)
@@ -811,6 +897,44 @@ def _input_topology(args: argparse.Namespace) -> str:
     user's own path as ``args.input_topology`` before doing so.
     """
     return getattr(args, "input_topology", None) or args.topology
+
+
+def _thresholds(args: argparse.Namespace) -> Thresholds:
+    """The penalty thresholds, defaults overridden by ``--penalty-threshold``."""
+    values = {"charge": Thresholds.charge, "dihedral": Thresholds.dihedral}
+    for kind, value in getattr(args, "penalty_threshold", None) or []:
+        values[kind] = value
+    return Thresholds(**values)
+
+
+def _selection(args: argparse.Namespace, topology: Topology) -> Selection:
+    """What ``--str`` selects for this topology; computed and recorded once.
+
+    The first call parses the ``.str``, selects, emits the selection's
+    warnings and -- unless ``--dry-run`` -- writes ``00_input/selection.json``
+    and a copy of the ``.str`` beside it. The result is cached on ``args`` so
+    ``run`` and the stages it calls agree without recomputing.
+
+    Raises:
+        ParseError: the ``.str`` could not be read or parsed.
+        ValidationError: it does not describe this topology.
+    """
+    cached = getattr(args, "selection", None)
+    if cached is not None:
+        return cached
+    strfile = read_str(args.str)
+    selection = select(topology, strfile, _thresholds(args))
+    for warning in selection.warnings:
+        _warn(warning)
+    if not args.dry_run:
+        target = stage_dir(args.outdir, "input")
+        (target / "selection.json").write_text(
+            json.dumps(selection_to_json(selection, strfile), indent=2) + "\n", newline="\n"
+        )
+        if (target / strfile.source.name).resolve() != strfile.source.resolve():
+            shutil.copyfile(strfile.source, target / strfile.source.name)
+    args.selection = selection
+    return selection
 
 
 def _prepare(
@@ -1452,16 +1576,20 @@ def cmd_charges(args: argparse.Namespace) -> int:
 def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
     """The body of :func:`cmd_charges`; ``emitted`` collects its warnings."""
     selected_atoms = None
+    from_str = False
     if args.charge_mode == "selected":
-        if not args.charge_atoms:
+        if args.charge_atoms:
+            selected_atoms = sorted({nr for group in args.charge_atoms for nr in group})
+        elif getattr(args, "str", None):
+            from_str = True
+        else:
             raise ValidationError(
                 "--charge-mode selected replaces only the atoms you name, and none were "
-                "named. Pass --charge-atoms i,j,k (1-based), or --charge-mode all to "
-                "replace every charge -- which on a CGenFF topology changes the derivation "
-                "scheme, so read the warning it prints. Choosing atoms automatically from "
-                "a CGenFF .str file arrives in milestone 6b."
+                "named. Pass --charge-atoms i,j,k (1-based), --str mol.str to take them from "
+                "CGenFF's charge penalties, or --charge-mode all to replace every charge -- "
+                "which on a CGenFF topology changes the derivation scheme, so read the "
+                "warning it prints."
             )
-        selected_atoms = sorted({nr for group in args.charge_atoms for nr in group})
     elif args.charge_atoms:
         raise ValidationError(
             "--charge-atoms names the atoms to replace under --charge-mode selected, but "
@@ -1472,9 +1600,31 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
 
     if args.dry_run:
         structure, topology = _load_structure_and_topology(args)
+        if from_str:
+            selection = _selection(args, topology)
+            selected_atoms = selection.flagged_atoms
+            if not selected_atoms:
+                print(
+                    f"charges: no atom in {args.str} has a charge penalty >= "
+                    f"{selection.thresholds.charge:g}; nothing to refine"
+                )
+                return 0
         # The same refusals the real run makes, so a dry run never promises a
         # run that would be refused.
         check_selection(topology, selected_atoms, derive_charge(topology, args.charge))
+        if selected_atoms is not None and len(selected_atoms) > topology.natoms / 2:
+            _warn(
+                f"--charge-mode selected replaces {len(selected_atoms)} of the "
+                f"{topology.natoms} atoms here, so this is close to replacing every charge "
+                "with gas-phase ESP charges."
+                + (
+                    " CGenFF charges are fitted to water interaction energies and dipoles, "
+                    "not to the gas-phase ESP, so this is a change of derivation scheme and "
+                    "can degrade condensed-phase behaviour."
+                    if _looks_like_cgenff(topology)
+                    else ""
+                )
+            )
         for warning in _partial_group_warnings(
             equivalent_hydrogen_groups(topology), selected_atoms
         ):
@@ -1488,10 +1638,32 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
         return 0
 
     structure, topology, _ = _prepare(args, need_quad=False)
+    if from_str:
+        selection = _selection(args, topology)
+        selected_atoms = selection.flagged_atoms
+        if not selected_atoms:
+            print(
+                f"charges: no atom in {args.str} has a charge penalty >= "
+                f"{selection.thresholds.charge:g}; nothing to refine"
+            )
+            return 0
     target_total = derive_charge(topology, args.charge)
     # Needs only the topology, so it runs before any xtb or ORCA job rather
     # than after them inside apply_charges (which checks again regardless).
     check_selection(topology, selected_atoms, target_total)
+    if selected_atoms is not None and len(selected_atoms) > topology.natoms / 2:
+        _warn(
+            f"--charge-mode selected replaces {len(selected_atoms)} of the {topology.natoms} "
+            "atoms here, so this is close to replacing every charge with gas-phase ESP "
+            "charges."
+            + (
+                " CGenFF charges are fitted to water interaction energies and dipoles, not "
+                "to the gas-phase ESP, so this is a change of derivation scheme and can "
+                "degrade condensed-phase behaviour."
+                if _looks_like_cgenff(topology)
+                else ""
+            )
+        )
     groups = equivalent_hydrogen_groups(topology)
     for warning in _partial_group_warnings(groups, selected_atoms):
         _warn(warning)
@@ -1564,7 +1736,23 @@ def _charges_stage(args: argparse.Namespace, emitted: list[str]) -> int:
     # One precision for the arithmetic and the file: never coarser than the
     # input's own, so untouched atoms keep their exact values (ruling R22).
     decimals = charge_decimals(topology)
-    assignments = apply_charges(topology, raw, selected_atoms, target_total, decimals=decimals)
+    # A --str selection (or an explicit --charge-atoms list) can cover every
+    # atom in the topology. apply_charges's per-charge-group residual
+    # redistribution exists to protect atoms *left unselected* in a group;
+    # with none left unselected there is nothing to protect, and no bonded
+    # recipient can exist either, so it would refuse with "nothing left to
+    # redistribute onto". Passing None here is 'selected mode' degenerating
+    # to 'all mode' only for this call: every atom gets its fitted value
+    # directly and the trailing drift correction (which already runs for any
+    # mode) closes the total, exactly as ``--charge-mode all`` does. The
+    # reported mode, selected_atoms and warnings above still reflect what the
+    # user actually asked for.
+    apply_selected = (
+        None
+        if selected_atoms is not None and len(selected_atoms) == topology.natoms
+        else selected_atoms
+    )
+    assignments = apply_charges(topology, raw, apply_selected, target_total, decimals=decimals)
     for a in assignments:
         if a.source == "redistributed":
             log.info(
