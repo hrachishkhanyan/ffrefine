@@ -183,3 +183,22 @@ def test_refit_reproduces_the_original_profile(
         r.phi_deg, r.qm_kj, r.mm_before_kj, r.mm_after_kj, r.rmse_before, r.rmse_after, plot_path
     )
     assert plot_path.exists()
+
+
+@pytest.mark.needs_gmx
+def test_compare_topologies_of_one_topology_with_itself_agrees(
+    tmp_path, butane_pdb, butane_itp, gmx_bin, rotated_frames
+):
+    from ffrefine.config import Binaries
+    from ffrefine.io.structure import read_pdb
+    from ffrefine.io.topology import read_topology
+    from ffrefine.mm.validate_fit import compare_topologies
+
+    s = read_pdb(butane_pdb)
+    t = read_topology(butane_itp)
+    frames = rotated_frames(s, 6)
+    qm = np.linspace(0.0, 5.0, 6)
+    r = compare_topologies(Binaries(gmx=gmx_bin), t, t, s, frames, qm, (1, 5, 8, 11), tmp_path)
+    assert np.array_equal(r.mm_before_kj, r.mm_after_kj)
+    assert r.rmse_before == r.rmse_after
+    assert r.phi_deg.shape == (6,)

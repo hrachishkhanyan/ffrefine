@@ -114,7 +114,7 @@ from .io.validate import adopt_topology_naming, element_of, validate_structure_t
 from .mm.selfcheck import check_torsion_removal
 from .mm.torsionset import collect_torsion_set, validate_quad
 from .mm.tprparams import ResolvedTerm, preprocessed_sha256, resolve_torsion_set
-from .mm.validate_fit import validate_refit
+from .mm.validate_fit import compare_topologies, validate_refit
 from .plots import plot_fit, plot_mm_zeroed, plot_qm_profile, plot_residuals, plot_validation
 from .qm.scan import (
     ScanLeg,
@@ -897,6 +897,11 @@ def _input_topology(args: argparse.Namespace) -> str:
     user's own path as ``args.input_topology`` before doing so.
     """
     return getattr(args, "input_topology", None) or args.topology
+
+
+def _bond_dirname(quad: Quad) -> str:
+    """The subfolder a bond's stages run in when a run refits several: ``torsion_i-j-k-l``."""
+    return "torsion_" + "-".join(str(n) for n in quad)
 
 
 def _thresholds(args: argparse.Namespace) -> Thresholds:
@@ -2387,6 +2392,111 @@ def cmd_validate(args: argparse.Namespace) -> int:
     )
     print(f"validate: wrote {final / 'molecule_refined.itp'}")
     return 0
+
+
+def _combined_check(
+    args: argparse.Namespace, bonds: list[tuple[Quad, Path]], original: Path, final: Path
+) -> None:
+    """Re-run every bond's scan with the original and the final topology (design section 5).
+
+    Each bond was fitted against the topology as it stood before the later
+    bonds were refit, so their refits can shift its profile. This measures
+    that: per bond, RMSE against QM with the user's original topology and
+    with the final one, beside the bond's own before/after from its
+    ``validation.json``. Written to ``final/combined.json`` and one plot per
+    bond; resumable under the ``final`` stage manifest.
+    """
+    with _collect_warnings():
+        setup_logging(args.outdir, args.verbose)
+        before = read_topology(original)
+        after = read_topology(final)
+        structure = adopt_topology_naming(read_structure(args.structure), before)
+        binaries = _binaries(args)
+        final_dir = stage_dir(args.outdir, "final")
+        work = final_dir / "combined"
+        ff_includes = _ff_includes(args)
+        scan_paths = [bond_dir / STAGE_DIRS["qm_scan"] / "scan.json" for _, bond_dir in bonds]
+        settings = {
+            "quads": [list(q) for q, _ in bonds],
+            "ff_includes": ff_includes,
+            "original_preprocessed_sha256": preprocessed_sha256(
+                binaries, before, structure, work, "original", ff_includes
+            ),
+            "final_preprocessed_sha256": preprocessed_sha256(
+                binaries, after, structure, work, "final", ff_includes
+            ),
+        }
+        digest = hash_inputs([original, final, *scan_paths], settings)
+        combined_json = final_dir / "combined.json"
+        if args.resume and stage_is_current(args.outdir, "final", digest, [combined_json]):
+            print(f"combined check: skipping, {combined_json} is current (--resume)")
+            return
+
+        rows = []
+        for (quad, bond_dir), scan_path in zip(bonds, scan_paths):
+            scan = _read_json(scan_path, "QM scan (scan.json)", _SCAN_REMEDY)
+            frames = _require_array(scan, "frames_nm", scan_path)
+            qm = _require_array(scan, "energy_kj", scan_path)
+            own_path = bond_dir / STAGE_DIRS["final"] / "validation.json"
+            own = _read_json(
+                own_path, "that bond's validation.json", "Its validate stage did not finish."
+            )
+            result = compare_topologies(
+                binaries,
+                before,
+                after,
+                structure,
+                frames,
+                qm,
+                quad,
+                work / bond_dir.name,
+                nthreads=args.nthreads,
+                strict_names=not args.no_strict_names,
+                ff_includes=ff_includes,
+            )
+            plot_validation(
+                result.phi_deg,
+                result.qm_kj,
+                result.mm_before_kj,
+                result.mm_after_kj,
+                result.rmse_before,
+                result.rmse_after,
+                final_dir / "plots" / f"combined_{bond_dir.name}.png",
+                title=f"Combined check, torsion {'-'.join(map(str, quad))}: original against final",
+                labels=("original topology", "final topology"),
+            )
+            if not result.improved:
+                _warn(
+                    f"torsion {'-'.join(map(str, quad))}: with every refit applied, the final "
+                    f"topology agrees with QM no better than the original (RMSE "
+                    f"{result.rmse_before:.3f} -> {result.rmse_after:.3f} kJ/mol). A later "
+                    "bond's refit may have undone this one's; see "
+                    f"final/plots/combined_{bond_dir.name}.png."
+                )
+            rows.append(
+                {
+                    "quad_1_based": list(quad),
+                    "dir": bond_dir.name,
+                    "rmse_original": float(result.rmse_before),
+                    "rmse_final": float(result.rmse_after),
+                    "rmse_own_before": own.get("rmse_before_kj_per_mol"),
+                    "rmse_own_after": own.get("rmse_after_kj_per_mol"),
+                    "improved": bool(result.improved),
+                    "phi_deg": [float(v) for v in result.phi_deg],
+                    "qm_kj_per_mol": [float(v) for v in result.qm_kj],
+                    "mm_original_kj_per_mol": [float(v) for v in result.mm_before_kj],
+                    "mm_final_kj_per_mol": [float(v) for v in result.mm_after_kj],
+                }
+            )
+        payload = {
+            "original_topology": str(Path(original).resolve()),
+            "final_topology": str(Path(final).resolve()),
+            "bonds": rows,
+            "warnings": _current_warnings(),
+        }
+        combined_json.write_text(json.dumps(payload, indent=2) + "\n", newline="\n")
+        write_manifest(args.outdir, "final", digest, {"bonds": len(rows)})
+        print(f"combined check: wrote {combined_json}")
 
 
 def cmd_run(args: argparse.Namespace) -> int:

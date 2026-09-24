@@ -89,6 +89,44 @@ def _is_improved(rmse_before: float, rmse_after: float) -> bool:
     return rmse_after < rmse_before
 
 
+def _energy_comparison(
+    binaries: Binaries,
+    before_top: Path,
+    after_top: Path,
+    structure: Structure,
+    frames: np.ndarray,
+    qm_kj: np.ndarray,
+    quad: Quad,
+    workdir: Path,
+    nthreads: int,
+) -> ValidationResult:
+    """MM single points for two wrapper ``.top`` files on the same frames, scored against QM."""
+    e_before = single_point_energies(
+        binaries, before_top, structure, frames, workdir / "before", "before", nthreads
+    )
+    e_after = single_point_energies(
+        binaries, after_top, structure, frames, workdir / "after", "after", nthreads
+    )
+    mm_before = e_before.potential()
+    mm_after = e_after.potential()
+    qm = np.asarray(qm_kj, dtype=float)
+    rmse_before = profile_rmse(qm, mm_before)
+    rmse_after = profile_rmse(qm, mm_after)
+    # quad is 1-based (user-facing, topology-file convention); frames is
+    # indexed 0-based, so convert here at the boundary.
+    idx = (quad[0] - 1, quad[1] - 1, quad[2] - 1, quad[3] - 1)
+    phi = dihedral_deg_frames(np.asarray(frames, dtype=float), idx)
+    return ValidationResult(
+        rmse_before=rmse_before,
+        rmse_after=rmse_after,
+        mm_before_kj=mm_before,
+        mm_after_kj=mm_after,
+        qm_kj=qm,
+        phi_deg=phi,
+        improved=_is_improved(rmse_before, rmse_after),
+    )
+
+
 def validate_refit(
     binaries: Binaries,
     topology: Topology,
@@ -199,44 +237,66 @@ def validate_refit(
     after_top = workdir / "after.top"
     make_system_top(after_itp, after_top, topology.name, ff_includes)
 
-    e_before = single_point_energies(
-        binaries, before_top, structure, frames, workdir / "before", "before", nthreads
+    result = _energy_comparison(
+        binaries, before_top, after_top, structure, frames, qm_kj, quad, workdir, nthreads
     )
-    e_after = single_point_energies(
-        binaries, after_top, structure, frames, workdir / "after", "after", nthreads
-    )
-
-    mm_before = e_before.potential()
-    mm_after = e_after.potential()
-    qm = np.asarray(qm_kj, dtype=float)
-    rmse_before = profile_rmse(qm, mm_before)
-    rmse_after = profile_rmse(qm, mm_after)
-
-    # quad is 1-based (user-facing, topology-file convention); frames is
-    # indexed 0-based, so convert here at the boundary.
-    idx = (quad[0] - 1, quad[1] - 1, quad[2] - 1, quad[3] - 1)
-    phi = dihedral_deg_frames(np.asarray(frames, dtype=float), idx)
 
     log.info(
         "validation: MM against QM RMSE %.3f kJ/mol before, %.3f kJ/mol after refitting",
-        rmse_before,
-        rmse_after,
+        result.rmse_before,
+        result.rmse_after,
     )
-    improved = _is_improved(rmse_before, rmse_after)
-    if not improved:
+    if not result.improved:
         log.warning(
             "refitting did not improve agreement (%.3f -> %.3f kJ/mol). Check the scan "
             "for conformational hops and the self-consistency diagnostics.",
-            rmse_before,
-            rmse_after,
+            result.rmse_before,
+            result.rmse_after,
         )
+    return result
 
-    return ValidationResult(
-        rmse_before=rmse_before,
-        rmse_after=rmse_after,
-        mm_before_kj=mm_before,
-        mm_after_kj=mm_after,
-        qm_kj=qm,
-        phi_deg=phi,
-        improved=improved,
+
+def compare_topologies(
+    binaries: Binaries,
+    before: Topology,
+    after: Topology,
+    structure: Structure,
+    frames: np.ndarray,
+    qm_kj: np.ndarray,
+    quad: Quad,
+    workdir: str | Path,
+    nthreads: int = 1,
+    strict_names: bool = True,
+    ff_includes: list[str] | None = None,
+) -> ValidationResult:
+    """MM against QM on one scan's frames, for two whole topologies.
+
+    The milestone 6b combined check: ``before`` is the user's original
+    topology, ``after`` the final one carrying every refit (and any refined
+    charges). Neither is modified; both are copied (absolute includes) and
+    re-run through the same single-point engine as :func:`validate_refit`.
+
+    Args:
+        quad: 1-based; used only to measure the scan angle for plotting.
+        Others: as for :func:`validate_refit`.
+
+    Raises:
+        ValidationError: ``quad`` is unusable with either topology, or the
+            structure and a topology disagree.
+    """
+    for topology in (before, after):
+        validate_quad(topology, quad)
+        for warning in validate_structure_topology(structure, topology, strict_names=strict_names):
+            log.warning("structure/topology validation: %s", warning)
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    tops = []
+    for stem, topology in (("original", before), ("final", after)):
+        itp = workdir / f"{stem}.itp"
+        write_molecule_copy(topology.source, itp)
+        top = workdir / f"{stem}.top"
+        make_system_top(itp, top, topology.name, ff_includes)
+        tops.append(top)
+    return _energy_comparison(
+        binaries, tops[0], tops[1], structure, frames, qm_kj, quad, workdir, nthreads
     )

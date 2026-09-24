@@ -119,6 +119,8 @@ def plot_validation(
     rmse_before: float,
     rmse_after: float,
     path: str | Path,
+    title: str = "Validation: MM against QM before and after refitting",
+    labels: tuple[str, str] = ("MM before", "MM after"),
 ) -> None:
     """Total MM energy against QM, before and after refitting (spec section 4.9)."""
     phi, qm, before, after = _sorted(phi_deg, qm_kj, mm_before_kj, mm_after_kj)
@@ -129,13 +131,13 @@ def plot_validation(
         before - before.min(),
         "s--",
         color="#d62728",
-        label=f"MM before (RMSE {rmse_before:.2f})",
+        label=f"{labels[0]} (RMSE {rmse_before:.2f})",
     )
     ax.plot(
         phi,
         after - after.min(),
         "^-",
         color="#2ca02c",
-        label=f"MM after (RMSE {rmse_after:.2f})",
+        label=f"{labels[1]} (RMSE {rmse_after:.2f})",
     )
-    _finish(ax, path, "Validation: MM against QM before and after refitting")
+    _finish(ax, path, title)
