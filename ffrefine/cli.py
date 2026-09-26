@@ -2700,9 +2700,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         except FFRefineError:
             status.set("combined", "failed")
             raise
-        status.set("combined", "complete")
         final_topology = Path(args.outdir) / STAGE_DIRS["final"] / "molecule_refined.itp"
         shutil.copyfile(topology_in, final_topology)
+        status.set("combined", "complete")
         print(f"run: {final_topology} carries every refit")
     return 0
 
