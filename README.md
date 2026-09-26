@@ -394,8 +394,9 @@ C3-C4 (penalty 69, fitted as `1,3,4,5`) and C1-C3 (67, fitted as `25,1,3,4`).
   `torsion_1-3-4-5/` then `torsion_25-1-3-4/`, highest penalty first. Each is
   fitted against the topology the previous one left, so the second bond's fit
   already sees the first bond's refit.
-- A combined check re-runs every bond's scan with your original topology and
-  with the final one, and records both RMSEs in `final/combined.json`.
+- A combined check recomputes the MM energies of every bond's scan frames with
+  your original topology and with the final one (no new QM), and records both
+  RMSEs against QM in `final/combined.json`.
 - `final/molecule_refined.itp` carries every refit; `final/report.md` says what
   changed, how well it fits, every warning raised, the QM levels used, and the
   1-4 conventions the parameters depend on.
@@ -580,10 +581,11 @@ chase -- with the restraint disabled, the two schemes agree to within about
 Exit codes: `0` success, `1` a reported ffrefine error (printed as
 `error: ...`, never a traceback), `2` a usage error.
 
-One torsion per run. `--dihedral` is repeatable in the parser to match the spec's
-CLI surface, but the stage layout holds a single scan and a single fit per output
-directory, so passing more than one is rejected with a message rather than
-silently fitting only the first. Use a separate `--outdir` per torsion.
+One torsion per stage. A single stage (`scan`, `mmscan`, `fit`, `validate`) holds
+one scan and one fit per output directory, so passing `--dihedral` more than once
+to it is rejected with a message rather than silently fitting only the first.
+`run` takes a repeated `--dihedral` and fits the torsions in the order given, one
+subfolder each, exactly as it does for the bonds `--str` selects.
 
 ### CGenFF flags
 
