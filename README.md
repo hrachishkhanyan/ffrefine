@@ -13,7 +13,7 @@ mandatory self-consistency check (spec section 4.5) verifies the edit against
 an independent analytic evaluation before any fitting happens, and aborts if it
 disagrees by more than 1e-3 kJ/mol.
 
-## Status: milestones 1-5 and 6a of 6
+## Status: milestones 1-6 of 6
 
 | Subcommand | State |
 |---|---|
@@ -22,11 +22,9 @@ disagrees by more than 1e-3 kJ/mol.
 | `ffrefine fit` | works -- weighted linear cosine fit, BIC model selection, `.itp`/`.prm`/`fit.json`/plots |
 | `ffrefine charges` | works -- ESP-derived partial charges via ORCA, CHELPG or two-stage restrained RESP, equivalent hydrogens constrained equal, `selected` mode by default |
 | `ffrefine validate` | works -- rebuild with the fitted series, re-run MM, report RMSE before and after |
-| `ffrefine run` | works -- chains all five stages, charges first when asked, and says which stage it skipped |
+| `ffrefine run` | works -- chains charges and every torsion, charges first when asked for or flagged by `--str`; several torsions run in sequence, one subfolder each, then a combined check; writes `final/report.md` |
 
-Also not implemented: CGenFF `.str` penalty parsing and the automatic torsion
-and charge-atom selection it would drive (`--str`), and the `final/report.md`
-summary document -- both milestone 6b -- and `--mm-relax` (spec 4.6).
+Not implemented: `--mm-relax` (spec 4.6).
 
 ### What the scan and charges do not do
 
@@ -96,6 +94,11 @@ point on every frame of the grid. It is opt-in for that reason.
   the topology's `[ atoms ]` numbering. This is the only index convention the
   user ever sees; the conversion to 0-based array indices happens internally at
   the geometry boundary.
+- `--str mol.str` (optional): the CGenFF stream file for the molecule. ffrefine
+  reads its penalties and chooses the charges and torsions to refine; see
+  "Letting CGenFF's penalties choose" below. Atoms are matched to the topology
+  by position and checked by atom type, because the CGenFF GROMACS export
+  renames them.
 
 Input files are never modified. Everything is written under `--outdir`, and
 normalized copies of the inputs land in `00_input/`.
@@ -370,8 +373,38 @@ of your own -- wrapped with your own `[ system ]`/`[ molecules ]`, the way the
 end-to-end test's `make_system_top` wraps it -- not a drop-in replacement for
 `pfoa_gmx.top` itself.
 
-Choosing the torsion from `pfoa.str`'s penalties automatically, and the
-`report.md` that summarises a run, are milestone 6b.
+### Letting CGenFF's penalties choose
+
+    ffrefine run \
+        -s fixtures/pfoa_gromacs/pfoa_gmx.pdb \
+        -p fixtures/pfoa_gromacs/pfoa_gmx.top \
+        --str fixtures/pfoa_gromacs/pfoa.str \
+        --outdir pfoa_out
+
+With `--str` and no `--dihedral`, ffrefine flags every atom whose CGenFF charge
+penalty is at least 10 and every torsion whose dihedral penalty is at least 50
+(`--penalty-threshold charge=VALUE` / `dihedral=VALUE` change either; a penalty
+equal to the threshold counts). For PFOA that is 23 of 26 atoms and two bonds:
+C3-C4 (penalty 69, fitted as `1,3,4,5`) and C1-C3 (67, fitted as `25,1,3,4`).
+
+- The flagged charges are refined first (`--no-charges` skips them). When they
+  are most of the molecule, as here, the run warns that this is close to
+  replacing CGenFF's charges wholesale.
+- Each bond then runs `scan -> mmscan -> fit -> validate` in its own subfolder,
+  `torsion_1-3-4-5/` then `torsion_25-1-3-4/`, highest penalty first. Each is
+  fitted against the topology the previous one left, so the second bond's fit
+  already sees the first bond's refit.
+- A combined check re-runs every bond's scan with your original topology and
+  with the final one, and records both RMSEs in `final/combined.json`.
+- `final/molecule_refined.itp` carries every refit; `final/report.md` says what
+  changed, how well it fits, every warning raised, the QM levels used, and the
+  1-4 conventions the parameters depend on.
+
+A ring bond is never refit, because a relaxed scan cannot rotate it; the report
+lists it. Capecitabine's `.str` flags one torsion at exactly 50 and no charges,
+so `ffrefine run ... --str capecitabine.str` refits `6,7,9,10` alone, in the
+usual single-torsion layout. A single stage (`scan`, `mmscan`, `fit`,
+`validate`) also accepts `--str` when exactly one bond is flagged.
 
 ## Output layout
 
@@ -402,8 +435,25 @@ Choosing the torsion from `pfoa.str`'s penalties automatically, and the
                     and GROMACS logs
       run.log       every external command with its full command line
 
-`final/report.md` is part of the layout but belongs to milestone 6b and is not
-produced.
+A run that refits several torsions puts each in its own subfolder, with the
+layout above inside it, and keeps the shared pieces at the top:
+
+    pfoa_out/
+      00_input/          input copies, model.json, selection.json, the .str copy
+      04_charges/        when charges run
+      torsion_1-3-4-5/   00_input/ 01_qm_scan/ 02_mm_scan/ 03_fit/ final/ run.log
+      torsion_25-1-3-4/  ...
+      final/             molecule_refined.itp (every refit), combined.json,
+                         plots/combined_*.png, run_status.json, report.md
+      run.log            selection, charges and the combined check
+
+Each bond subfolder's own `final/report.md`, written by `validate`, summarises
+that single bond's refit; the top-level `final/report.md` is the combined
+account of the whole run.
+
+`final/report.md` is written by `run` and by `validate`; every stage's JSON
+also keeps its own `warnings`, which is where the report's warning list comes
+from.
 
 Plots: `03_fit/plots/` holds the QM profile, the MM-zeroed profile, the target
 difference with the fitted series overlaid, and the residuals.
@@ -431,8 +481,10 @@ Every subcommand accepts `--config file.json`, `--outdir`, `--nthreads`,
   grompp reads -- an `#include`d `.itp`, or the force field named by
   `--ff-include` -- makes them rerun. `scan`, `fit` and `charges` never run
   grompp; they hash the top-level topology file and their own inputs only, so
-  editing an included file leaves their hash unchanged. Re-run those three
-  without `--resume` after changing an included file.
+  editing an included file leaves their hash unchanged. None of them reads an
+  included file -- `scan` and `charges` use only the molecule's own atoms and
+  charges, and `fit` reruns by itself once `mmscan`'s energies change -- so
+  nothing more is needed.
 - `--dry-run` validates the inputs, reports what would run, and creates nothing
   at all -- not even the output directory.
 - `--no-strict-names` downgrades an atom-name mismatch between structure and
@@ -485,8 +537,9 @@ needs the same molecular charge and spin state the scan does.
   **`selected` refuses to run without `--charge-atoms`**: replacing every
   charge on a CGenFF topology changes the derivation scheme entirely, so
   defaulting silently to `all` would be the wrong kind of convenient.
-  Automatic atom selection from CGenFF penalties arrives in milestone 6b; until
-  then, you name the atoms yourself.
+  Automatic atom selection from CGenFF penalties is `--str` (see "Letting
+  CGenFF's penalties choose" above and the CGenFF flags below); without it,
+  you name the atoms yourself with `--charge-atoms`.
 - `--charge-atoms i,j,k` (default: none) -- 1-based atom numbers to replace
   under `--charge-mode selected`. Repeatable; every atom named across every
   occurrence is pooled into one set. Checked against the topology's atom count
@@ -532,6 +585,18 @@ CLI surface, but the stage layout holds a single scan and a single fit per outpu
 directory, so passing more than one is rejected with a message rather than
 silently fitting only the first. Use a separate `--outdir` per torsion.
 
+### CGenFF flags
+
+- `--str PATH`: the CGenFF stream file; its penalties choose the charges
+  (`charges`, `run`) and the torsions (every torsion stage) to refine when
+  `--charge-atoms` / `--dihedral` are not given. `00_input/selection.json`
+  records every penalty and every decision; a copy of the `.str` sits beside it.
+- `--penalty-threshold KIND=VALUE`: `KIND` is `charge` (default 10) or
+  `dihedral` (default 50); repeatable. A penalty at or above the threshold is
+  flagged.
+- `--no-charges` (`run` only): refit torsions against the topology's own
+  charges even when `--str` flags some.
+
 ## Physical assumptions and their limits
 
 **The fitted torsion is convention-bound. This is the big one.** The refit
@@ -544,24 +609,29 @@ assumed, and recorded in `00_input/model.json`. CHARMM and Amber/GAFF differ
 here. Moving a fitted dihedral between force fields is not meaningful, and
 nothing in the output file will stop you from doing it.
 
-**Milestone 6b is not implemented yet.** There is no CGenFF `.str` parser, so there
-is no automatic torsion or charge-atom selection: `--dihedral` and
-`--charge-atoms` are the only way to point ffrefine at anything, and there is
-no `final/report.md` summary document. `--mm-relax` (spec 4.6) is also
-unimplemented.
+**`--mm-relax` (spec 4.6) is also unimplemented.**
 
-**A charge-group's net charge is preserved, and the molecular total is exact.**
-`--charge-mode selected` redistributes the fit's residual per charge group, not
-across the whole molecule: each group containing a selected atom absorbs the
-charge its own atoms gained or lost, spread over that group's unselected atoms
-(falling back to unselected heavy atoms bonded to a selected one in that group
-when the group has none). Only a small leftover global offset -- an explicit
-`--charge` that differs from the topology's own sum by no more than 0.05 e,
-the same tolerance used to derive the charge -- is pooled across groups. A
-larger disagreement is refused before any QM runs: `--charge -1` on a neutral
-topology would otherwise push a whole electron onto the two or three atoms
-sharing the selected atoms' charge groups. Use `--charge-mode all`, which
-refits every charge at the declared charge, or correct the topology.
+**A charge-group's net charge is preserved when it can be, and the molecular
+total is exact.** `--charge-mode selected` redistributes the fit's residual per
+charge group, not across the whole molecule: each group containing a selected
+atom absorbs the charge its own atoms gained or lost, spread over that group's
+unselected atoms (falling back to unselected heavy atoms bonded to a selected
+one in that group when the group has none). A group with no local recipient at
+all -- every atom in it selected, and no unselected heavy atom bonded to any of
+them -- no longer refuses the run: its residual is pooled into the global step
+instead, together with a warning naming the atoms and the charge moved. The
+global step spreads that pooled residual, plus any small leftover offset from
+an explicit `--charge` (differing from the topology's own sum by no more than
+0.05 e, the same tolerance used to derive the charge), over whichever
+recipients the other groups found, or over every currently unselected atom,
+hydrogens included, when no group found any. This matters most on CGenFF
+topologies converted for GROMACS, which often put every atom in its own charge
+group, so `--str` can flag most of the molecule and leave few or no atoms per
+group to absorb its own residual: on PFOA, 23 of 26 atoms are flagged and
+-0.0143 e ends up pooled onto F13/F14. Only a selection covering every atom in
+the topology is refused -- there is then no atom left, local or not, to place
+a residual or offset on -- and `charges` instead treats that as
+`--charge-mode all`.
 Only the atoms this stage actually changes -- the fitted ones and the ones
 absorbing a residual -- are rounded; every other atom keeps its exact input
 value, and is recorded as `unchanged`. Changed charges are written to four
@@ -572,8 +642,7 @@ fitted atom's own value whenever an unselected atom exists to take it
 instead. Under
 `--charge-mode all`, where every atom is fitted and none is left to redistribute
 onto, the residue lands on the largest-magnitude atom regardless. A drift
-bigger than rounding can explain, or an offset with nowhere to go, is refused
-rather than folded in quietly.
+bigger than rounding can explain is refused rather than folded in quietly.
 
 **Molecule-specific by default.** Without `--distribute` the fitted series is
 written onto one quadruplet and the other torsions about that bond are set to
@@ -629,8 +698,8 @@ available before trusting the result.
 
     pytest -m "needs_gmx or needs_xtb or needs_orca"   # and check nothing skipped
 
-As of this milestone the suite holds 619 tests: 29 marked `needs_gmx`, 5
-`needs_xtb` and 11 `needs_orca`. The rest need nothing external and always run.
+As of this milestone the suite holds 714 tests: 34 marked `needs_gmx`, 7
+`needs_xtb` and 13 `needs_orca`. The rest need nothing external and always run.
 
 The load-bearing one is spec section 7.1's round trip, which covers the whole
 pipeline except xtb and ORCA: take the MM energies with the original
