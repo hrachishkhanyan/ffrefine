@@ -72,6 +72,7 @@ round trip) stays legal.
 from __future__ import annotations
 
 import argparse
+import copy
 import functools
 import json
 import subprocess
@@ -2499,55 +2500,210 @@ def _combined_check(
         print(f"combined check: wrote {combined_json}")
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    """Run every implemented stage in order, naming the ones it cannot run.
+def _bond_args(args: argparse.Namespace, quad: Quad, topology: str) -> argparse.Namespace:
+    """The arguments one bond's stages run with in a multi-bond run.
 
-    Charges lead, when they were asked for: the fitted torsion absorbs whatever
-    the 1-4 electrostatics do not account for, so refining charges afterwards
-    would leave a torsion fitted against charges the topology no longer has.
+    Its own outdir, one ``--dihedral``, and the topology the previous bond
+    left (the charge-refined or user's topology for the first). ``--str`` is
+    dropped: the bond is already chosen, and its input topology's charges may
+    legitimately differ from the ``.str``'s. ``model.json`` still names the
+    user's original input (``input_topology``).
     """
-    wants_charges = bool(args.charge_atoms) or args.charge_mode == "all"
-    if wants_charges:
-        print(
-            "ffrefine run: chaining charges -> scan -> mmscan -> fit -> validate. The "
-            "remaining stages use the charge-refined topology, because a torsion fitted "
-            "against different charges than it ships with is not transferable."
-        )
-    else:
-        print(
-            "ffrefine run: chaining scan -> mmscan -> fit -> validate and SKIPPING "
-            "charges, which needs --charge-atoms or --charge-mode all. The topology keeps "
-            "the charges it came with."
-        )
+    sub = copy.copy(args)
+    sub.outdir = str(Path(args.outdir) / _bond_dirname(quad))
+    sub.dihedral = [quad]
+    sub.topology = topology
+    sub.input_topology = _input_topology(args)
+    sub.str = None
+    sub.selection = None
+    return sub
 
-    stages: list[tuple[str, object]] = []
-    if wants_charges:
-        stages.append(("charges", cmd_charges))
-    stages += [
+
+class _RunStatus:
+    """``final/run_status.json``, rewritten after every change (plan refinement 5).
+
+    ``report.md`` reads it to say which bond failed at which stage even when
+    that stage wrote no payload.
+    """
+
+    def __init__(self, args: argparse.Namespace, quads: list[Quad], multi: bool) -> None:
+        self.path = Path(args.outdir) / STAGE_DIRS["final"] / "run_status.json"
+        self.data: dict = {
+            "charges": "not run",
+            "torsions": [
+                {
+                    "quad_1_based": list(q),
+                    "dir": _bond_dirname(q) if multi else ".",
+                    "status": "not reached",
+                    "failed_stage": None,
+                }
+                for q in quads
+            ],
+            "combined": "not run" if multi else "not applicable",
+        }
+        self.write()
+
+    def write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, indent=2) + "\n", newline="\n")
+
+    def torsion(self, index: int, status: str, failed_stage: str | None = None) -> None:
+        self.data["torsions"][index].update(status=status, failed_stage=failed_stage)
+        self.write()
+
+    def set(self, key: str, value: str) -> None:
+        self.data[key] = value
+        self.write()
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Run every stage in order: selection, charges, then each torsion (design section 5).
+
+    Charges lead, when they are asked for or ``--str`` flags any: the fitted
+    torsion absorbs whatever the 1-4 electrostatics do not account for, so
+    refining charges afterwards would leave a torsion fitted against charges
+    the topology no longer has. Several torsions run in sequence, one
+    subfolder each, every bond fitted against the topology the previous bond
+    left; a combined check then re-runs every bond's scan with the final
+    topology.
+    """
+    if args.no_charges and (args.charge_atoms or args.charge_mode == "all"):
+        raise ValidationError(
+            "--no-charges skips the charge refit, but --charge-atoms / --charge-mode all asks "
+            "for one. Drop one of them."
+        )
+    selection = None
+    if args.str:
+        if not args.dry_run:
+            setup_logging(args.outdir, args.verbose)
+        _, topology = _load_structure_and_topology(args)
+        selection = _selection(args, topology)
+    flagged = selection.flagged_atoms if selection else []
+    wants_charges = not args.no_charges and bool(
+        args.charge_atoms or args.charge_mode == "all" or flagged
+    )
+    quads = list(args.dihedral or []) or (selection.quads if selection else [])
+    if not quads and selection is None:
+        raise ValidationError(
+            "no torsion selected. Pass --dihedral i,j,k,l (repeatable), or --str mol.str to "
+            "choose from CGenFF's penalties."
+        )
+    multi = len(quads) > 1
+    torsion_stages = [
         ("scan", cmd_scan),
         ("mmscan", cmd_mmscan),
         ("fit", cmd_fit),
         ("validate", cmd_validate),
     ]
 
-    for name, handler in stages:
-        print(f"\n=== {name} ===")
-        code = handler(args)
+    # Two existing tests (test_cli.py::test_run_says_which_stages_it_skipped and
+    # test_cli_scan.py) pin "SKIPPING charges"; keep the announcement.
+    if wants_charges:
+        print(
+            "ffrefine run: chaining charges -> scan -> mmscan -> fit -> validate. The torsion "
+            "stages use the charge-refined topology, because a torsion fitted against "
+            "different charges than it ships with is not transferable."
+        )
+    else:
+        print(
+            "ffrefine run: chaining scan -> mmscan -> fit -> validate and SKIPPING charges, "
+            "which needs --charge-atoms, --charge-mode all, or a --str that flags atoms. The "
+            "topology keeps the charges it came with."
+        )
+
+    if args.dry_run:
+        if selection is not None:
+            print(
+                f"--str: {len(flagged)} flagged atom(s) at charge penalty >= "
+                f"{selection.thresholds.charge:g}, {len(selection.bonds)} flagged bond(s) at "
+                f"dihedral penalty >= {selection.thresholds.dihedral:g}"
+            )
+        if multi:
+            for n, quad in enumerate(quads, start=1):
+                print(f"torsion {n}: {','.join(map(str, quad))} in {_bond_dirname(quad)}/")
+            print("then a combined check of every bond against the final topology")
+            return 0
+        if not quads:
+            return 0
+        args.dihedral = [quads[0]]
+        for name, handler in ([("charges", cmd_charges)] if wants_charges else []) + torsion_stages:
+            print(f"\n=== {name} ===")
+            code = handler(args)
+            if code != 0:
+                return code
+        return 0
+
+    status = _RunStatus(args, quads, multi)
+    if wants_charges:
+        print("\n=== charges ===")
+        try:
+            code = cmd_charges(args)
+        except FFRefineError:
+            status.set("charges", "failed")
+            raise
         if code != 0:
-            print(f"ffrefine run: stopping, stage {name} failed", file=sys.stderr)
+            status.set("charges", "failed")
+            print("ffrefine run: stopping, stage charges failed", file=sys.stderr)
             return code
-        if name == "charges" and not args.dry_run:
-            charged = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
-            if not charged.exists():
-                raise ValidationError(
-                    f"the charges stage reported success but wrote no {charged}, so the "
-                    "remaining stages have no refined topology to use."
-                )
-            # 00_input/ and validation.json must still be able to name the
-            # user's own input once -p points at a stage output (ruling R24).
-            args.input_topology = _input_topology(args)
-            args.topology = str(charged)
-            print(f"run: remaining stages will use {charged}")
+        charged = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
+        if not charged.exists():
+            status.set("charges", "failed")
+            raise ValidationError(
+                f"the charges stage reported success but wrote no {charged}, so the remaining "
+                "stages have no refined topology to use."
+            )
+        status.set("charges", "complete")
+        args.input_topology = _input_topology(args)
+        args.topology = str(charged)
+        print(f"run: the torsion stages will use {charged}")
+    else:
+        status.set("charges", "skipped")
+
+    if not quads:
+        print(
+            f"run: no torsion in {args.str} has a dihedral penalty >= "
+            f"{selection.thresholds.dihedral:g}; the highest dihedral penalty is "
+            f"{selection.highest_dihedral_penalty:g}. Pass --dihedral, or a lower "
+            "--penalty-threshold dihedral=VALUE, to refit one."
+        )
+        return 0
+
+    original = Path(_input_topology(args))
+    topology_in = args.topology
+    bonds: list[tuple[Quad, Path]] = []
+    for index, quad in enumerate(quads):
+        stage_args = _bond_args(args, quad, topology_in) if multi else args
+        if not multi:
+            args.dihedral = [quad]
+        status.torsion(index, "running")
+        where = f" ({_bond_dirname(quad)})" if multi else ""
+        for name, handler in torsion_stages:
+            print(f"\n=== {name}{where} ===")
+            try:
+                code = handler(stage_args)
+            except FFRefineError:
+                status.torsion(index, "failed", name)
+                raise
+            if code != 0:
+                status.torsion(index, "failed", name)
+                print(f"ffrefine run: stopping, stage {name} failed", file=sys.stderr)
+                return code
+        status.torsion(index, "complete")
+        bond_dir = Path(stage_args.outdir)
+        bonds.append((quad, bond_dir))
+        topology_in = str(bond_dir / STAGE_DIRS["final"] / "molecule_refined.itp")
+
+    if multi:
+        print("\n=== combined check ===")
+        try:
+            _combined_check(args, bonds, original, Path(topology_in))
+        except FFRefineError:
+            status.set("combined", "failed")
+            raise
+        status.set("combined", "complete")
+        final_topology = Path(args.outdir) / STAGE_DIRS["final"] / "molecule_refined.itp"
+        shutil.copyfile(topology_in, final_topology)
+        print(f"run: {final_topology} carries every refit")
     return 0
 
 
