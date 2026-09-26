@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pytest
 
@@ -79,6 +81,58 @@ def test_no_recipient_anywhere_is_refused(butane_itp):
 
     with pytest.raises(ValidationError, match="nothing left to redistribute"):
         apply_charges(top, _fitted(), selected=list(range(1, 15)), target_total=0)
+
+
+def test_a_residual_with_no_local_home_pools_into_the_global_offset(butane_itp, caplog):
+    """Ruling R7: a homeless per-group residual no longer refuses outright.
+
+    Every atom is in its own charge group (cgnr = nr). C1, C3 and C4 (atoms 1,
+    8, 11) are selected; C1 and C3 each have an unselected heavy neighbour
+    (C2, atom 5) and redistribute there as usual. C4's only heavy neighbour,
+    C3, is itself selected, so C4's residual has no local recipient -- it is
+    pooled into the global offset instead of refusing, and lands on the
+    existing recipient (C2), the same atom that already absorbed C1's and
+    C3's residuals. Every other unselected atom (the plain hydrogens) is
+    untouched, and a warning names what happened.
+    """
+    top = read_topology(butane_itp)
+    for atom in top.atoms:  # every atom in its own charge group
+        atom.cgnr = atom.nr
+
+    before = np.array([a.charge for a in top.atoms], dtype=float)
+    fitted = before.copy()
+    fitted[0] = -0.30  # C1 (atom 1): residual +0.03, recipient C2
+    fitted[7] = -0.20  # C3 (atom 8): residual +0.02, recipient C2
+    fitted[10] = -0.25  # C4 (atom 11): residual -0.02, no local recipient
+
+    logger = logging.getLogger("ffrefine")
+    previous = logger.propagate
+    logger.propagate = True
+    try:
+        with caplog.at_level("WARNING", logger="ffrefine"):
+            out = apply_charges(top, fitted, selected=[1, 8, 11], target_total=0)
+    finally:
+        logger.propagate = previous
+
+    assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)
+
+    # C2 (atom 5) is the sole recipient: C1's and C3's own residuals plus
+    # C4's pooled, homeless one, all folded onto it by the global-offset step.
+    c2 = out[4]
+    assert c2.nr == 5 and c2.source == "redistributed"
+    assert c2.after == pytest.approx(-0.15)
+
+    # Every other unselected atom (the plain hydrogens) is untouched.
+    untouched_nrs = {2, 3, 4, 6, 7, 9, 10, 12, 13, 14}
+    for a in out:
+        if a.nr in untouched_nrs:
+            assert a.source == "unchanged"
+            assert a.after == a.before
+
+    assert "11" in caplog.text and "C4" in caplog.text
+    assert "-0.0200" in caplog.text
+    assert "5" in caplog.text
+    assert "not bonded to each other" in caplog.text
 
 
 def test_the_total_is_exact_after_rounding(butane_itp):

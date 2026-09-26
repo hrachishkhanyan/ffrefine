@@ -9,6 +9,7 @@ Nothing here runs a subprocess.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +17,8 @@ import numpy as np
 from ..errors import ValidationError
 from ..io.topology import CHARGE_TOLERANCE, Topology
 from ..io.validate import element_of
+
+log = logging.getLogger("ffrefine")
 
 CHARGE_DECIMALS = 4
 """The fewest decimal places a changed charge is written with.
@@ -155,11 +158,21 @@ def apply_charges(
     for each group containing a selected atom, that group's residual (the
     charge change the fit made within it) is redistributed to unselected atoms
     in that same group, falling back to bonded heavy atoms if no in-group
-    recipients exist. After all per-group redistributions, any remaining
-    global offset (an explicit ``--charge`` differing from the topology's sum
-    by no more than :data:`~ffrefine.io.topology.CHARGE_TOLERANCE`) is spread over
-    the pooled recipients; a larger offset is refused before anything is
-    changed (see :func:`check_selection`).
+    recipients exist. A group whose residual has no such local recipient --
+    every atom in its charge group selected, and no unselected heavy atom
+    bonded to any of them -- is no longer refused (ruling R7): its selected
+    atoms and residual are recorded instead, and the global step below picks
+    the residual back up, together with a warning, because placing it
+    elsewhere moves charge between parts of the molecule that are not bonded
+    to each other. After all per-group redistributions, any remaining global
+    offset (an explicit ``--charge`` differing from the topology's sum by no
+    more than :data:`~ffrefine.io.topology.CHARGE_TOLERANCE`, plus any
+    per-group residual left unplaced above) is spread over the pooled
+    recipients; when no per-group recipient exists anywhere, it is instead
+    spread over every currently unselected atom, hydrogens included. Only when
+    every atom in the topology is selected -- so a nonzero residual or offset
+    truly has nowhere to go -- is the request refused (see
+    :func:`check_selection` for the simpler, cheaper pre-check).
 
     Only the atoms this stage changes -- the fitted atoms and the
     redistribution recipients -- are rounded, to ``decimals``; every other
@@ -200,8 +213,9 @@ def apply_charges(
     Raises:
         ValidationError: a selected atom number is out of range, the target
             total disagrees with the topology by more than
-            ``CHARGE_TOLERANCE`` in ``selected`` mode, the residual has
-            nowhere to go, or ``decimals`` is coarser than the input.
+            ``CHARGE_TOLERANCE`` in ``selected`` mode, every atom in the
+            topology is selected so a nonzero residual or offset has nowhere
+            at all to go, or ``decimals`` is coarser than the input.
     """
     natoms = topology.natoms
     fitted = np.asarray(fitted_e, float)
@@ -230,6 +244,10 @@ def apply_charges(
     touched[index] = True
 
     recipients = []
+    # Groups whose nonzero residual had no local recipient (ruling R7): each
+    # entry is (1-based selected atom numbers in that group, residual_g). Left
+    # unplaced here, picked back up by the global offset below.
+    unplaced: list[tuple[list[int], float]] = []
     if selected is not None:
         # Per-group redistribution: each charge group absorbs its own residual
         groups_with_selected = {topology.atoms[nr - 1].cgnr for nr in chosen}
@@ -257,13 +275,13 @@ def apply_charges(
                     if n not in chosen and element_of(topology, n) != "H"
                 }
                 if not bonded:
-                    # Only refuse if this group has a nonzero residual
+                    # No local recipient for this group (ruling R7): leave the
+                    # residual unplaced instead of refusing; the global offset
+                    # step below pools it, with a warning, rather than this
+                    # being a hard error.
                     if abs(residual_g) > 1e-12:
-                        raise ValidationError(
-                            f"nothing left to redistribute the {residual_g:+.6f} e residual onto: every "
-                            "atom in the selected atoms' charge groups was itself selected, and no "
-                            "unselected heavy atom is bonded to one. Select fewer atoms, or use "
-                            "--charge-mode all."
+                        unplaced.append(
+                            ([topology.atoms[i].nr for i in selected_in_group], residual_g)
                         )
                     continue  # Skip this group if no recipients and no residual
                 group_recipients = [nr - 1 for nr in sorted(bonded)]
@@ -276,18 +294,51 @@ def apply_charges(
                 after[group_recipients] += residual_g / len(group_recipients)
                 touched[group_recipients] = True
 
-        # After per-group redistribution, handle any remaining global offset
+        # After per-group redistribution, handle any remaining global offset.
+        # This already includes any per-group residual left unplaced above:
+        # not adding it to a recipient left after.sum() short by exactly that
+        # amount, so the offset computed here picks it back up automatically.
         global_offset = float(target_total) - float(after.sum())
+        if not recipients:
+            # No per-group recipient existed anywhere (either nothing was
+            # ever collected, or every homeless residual above found no local
+            # home). Widen the pool to every currently unselected atom,
+            # hydrogens included (ruling R7).
+            fallback = sorted(i for i in range(natoms) if (i + 1) not in chosen)
+            if unplaced and not fallback:
+                # A residual truly has nowhere to go: every atom in the
+                # topology is selected, so there is no atom left, local or
+                # not, to place it on. True regardless of whether the
+                # molecule-wide total happens to balance out overall.
+                raise ValidationError(
+                    f"nothing left to redistribute the {sum(r for _, r in unplaced):+.6f} e "
+                    "residual onto: every atom in the topology is selected. Select fewer "
+                    "atoms, or use --charge-mode all."
+                )
+            recipients = fallback
         if abs(global_offset) > 1e-12:
             if not recipients:
                 raise ValidationError(
-                    f"nothing left to redistribute the {global_offset:+.6f} e global offset onto: "
-                    "all selected atoms have residuals of zero and no charge groups have recipients. "
-                    "Select fewer atoms, or use --charge-mode all."
+                    f"nothing left to redistribute the {global_offset:+.6f} e global offset "
+                    "onto: all selected atoms have residuals of zero and no charge groups "
+                    "have recipients. Select fewer atoms, or use --charge-mode all."
                 )
             recipients_set = sorted(set(recipients))
             after[recipients_set] += global_offset / len(recipients_set)
             touched[recipients_set] = True
+
+        if unplaced:
+            moved = sum(residual for _, residual in unplaced)
+            homeless = sorted({nr for nrs, _ in unplaced for nr in nrs})
+            names = ", ".join(f"{nr} ({topology.atoms[nr - 1].name})" for nr in homeless)
+            onto = ", ".join(str(i + 1) for i in sorted(set(recipients)))
+            log.warning(
+                f"atom(s) {names} had a charge-fit residual with no local recipient -- every "
+                "atom in their own charge group was selected, and no unselected heavy atom is "
+                f"bonded to any of them; {moved:+.4f} e was pooled into the global offset and "
+                f"spread onto atom(s) {onto} instead, moving charge between parts of the "
+                "molecule that are not bonded to each other."
+            )
 
     # Round only what this stage changed; untouched atoms keep their exact
     # input values, which are already multiples of 10**-decimals.
