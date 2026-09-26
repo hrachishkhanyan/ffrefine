@@ -299,46 +299,52 @@ def apply_charges(
         # not adding it to a recipient left after.sum() short by exactly that
         # amount, so the offset computed here picks it back up automatically.
         global_offset = float(target_total) - float(after.sum())
-        if not recipients:
-            # No per-group recipient existed anywhere (either nothing was
-            # ever collected, or every homeless residual above found no local
-            # home). Widen the pool to every currently unselected atom,
-            # hydrogens included (ruling R7).
-            fallback = sorted(i for i in range(natoms) if (i + 1) not in chosen)
-            if unplaced and not fallback:
-                # A residual truly has nowhere to go: every atom in the
-                # topology is selected, so there is no atom left, local or
-                # not, to place it on. True regardless of whether the
-                # molecule-wide total happens to balance out overall.
-                raise ValidationError(
-                    f"nothing left to redistribute the {sum(r for _, r in unplaced):+.6f} e "
-                    "residual onto: every atom in the topology is selected. Select fewer "
-                    "atoms, or use --charge-mode all."
-                )
-            recipients = fallback
+        if unplaced and not recipients and not any((i + 1) not in chosen for i in range(natoms)):
+            # A residual truly has nowhere to go: every atom in the topology
+            # is selected, so there is no atom left, local or not, to place
+            # it on. True regardless of whether the molecule-wide total
+            # happens to balance out overall -- checked before the offset
+            # magnitude below, which a coincidental cancellation could hide.
+            raise ValidationError(
+                f"nothing left to redistribute the {sum(r for _, r in unplaced):+.6f} e "
+                "residual onto: every atom in the topology is selected. Select fewer "
+                "atoms, or use --charge-mode all."
+            )
         if abs(global_offset) > 1e-12:
             if not recipients:
-                raise ValidationError(
-                    f"nothing left to redistribute the {global_offset:+.6f} e global offset "
-                    "onto: all selected atoms have residuals of zero and no charge groups "
-                    "have recipients. Select fewer atoms, or use --charge-mode all."
-                )
+                # No per-group recipient existed anywhere. Widen the pool to
+                # every currently unselected atom instead, hydrogens
+                # included (ruling R7); the "everyone selected" impossible
+                # case was already refused above, regardless of this
+                # offset's size, so an unselected atom is guaranteed here.
+                recipients = sorted(i for i in range(natoms) if (i + 1) not in chosen)
+                if not recipients:
+                    raise ValidationError(
+                        f"nothing left to redistribute the {global_offset:+.6f} e global offset "
+                        "onto: all selected atoms have residuals of zero and no charge groups "
+                        "have recipients. Select fewer atoms, or use --charge-mode all."
+                    )
             recipients_set = sorted(set(recipients))
             after[recipients_set] += global_offset / len(recipients_set)
             touched[recipients_set] = True
 
         if unplaced:
             moved = sum(residual for _, residual in unplaced)
-            homeless = sorted({nr for nrs, _ in unplaced for nr in nrs})
-            names = ", ".join(f"{nr} ({topology.atoms[nr - 1].name})" for nr in homeless)
-            onto = ", ".join(str(i + 1) for i in sorted(set(recipients)))
-            log.warning(
-                f"atom(s) {names} had a charge-fit residual with no local recipient -- every "
-                "atom in their own charge group was selected, and no unselected heavy atom is "
-                f"bonded to any of them; {moved:+.4f} e was pooled into the global offset and "
-                f"spread onto atom(s) {onto} instead, moving charge between parts of the "
-                "molecule that are not bonded to each other."
-            )
+            # Only warn when something actually moved: if the homeless
+            # residuals happened to cancel out overall, the pool above was
+            # never widened and nothing was in fact redistributed, so a
+            # warning claiming an ~0 e move would be misleading.
+            if abs(moved) > 1e-12:
+                homeless = sorted({nr for nrs, _ in unplaced for nr in nrs})
+                names = ", ".join(f"{nr} ({topology.atoms[nr - 1].name})" for nr in homeless)
+                onto = ", ".join(str(i + 1) for i in sorted(set(recipients)))
+                log.warning(
+                    f"atom(s) {names} had a charge-fit residual with no local recipient -- "
+                    "every atom in their own charge group was selected, and no unselected "
+                    f"heavy atom is bonded to any of them; {moved:+.4f} e was pooled into the "
+                    f"global offset and spread onto atom(s) {onto} instead, moving charge "
+                    "between parts of the molecule that are not bonded to each other."
+                )
 
     # Round only what this stage changed; untouched atoms keep their exact
     # input values, which are already multiples of 10**-decimals.

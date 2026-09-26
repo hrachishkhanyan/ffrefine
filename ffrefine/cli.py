@@ -2559,11 +2559,18 @@ class _RunStatus:
 
 
 def _write_report_quietly(outdir: str | Path) -> None:
-    """Write ``final/report.md``; a failure here warns but never masks the run's own outcome."""
+    """Write ``final/report.md``; a failure here warns but never masks the run's own outcome.
+
+    Runs inside ``cmd_run``'s ``finally``, so a bug in ``report.py`` itself --
+    not just the documented ``FFRefineError`` for a malformed payload -- must
+    not replace a stage's own in-flight exception, or turn an otherwise
+    successful run into an unhandled traceback. The report is a by-product of
+    a run, never part of its outcome, so every exception is caught here.
+    """
     try:
         path = write_report(outdir)
-    except FFRefineError as exc:
-        _warn(f"report.md could not be written: {exc}")
+    except Exception as exc:
+        _warn(f"report.md was not written ({type(exc).__name__}: {exc})")
         return
     print(f"report: wrote {path}")
 

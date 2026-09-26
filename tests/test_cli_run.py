@@ -224,3 +224,29 @@ def test_run_with_nothing_flagged_still_writes_a_report(tmp_path, stages):
     out = tmp_path / "out"
     assert main(_cap(out, "--penalty-threshold", "dihedral=51")) == 0
     assert "No torsion was refit" in (out / "final" / "report.md").read_text(encoding="utf-8")
+
+
+def _boom(outdir):
+    raise RuntimeError("report.py has a bug")
+
+
+def test_a_report_bug_does_not_change_a_successful_runs_outcome(tmp_path, stages, monkeypatch):
+    """The report is a by-product; a bug writing it must not fail the run itself."""
+    monkeypatch.setattr(cli, "write_report", _boom)
+    out = tmp_path / "out"
+    assert main(_cap(out)) == 0
+    assert not (out / "final" / "report.md").exists()
+
+
+def test_a_report_bug_does_not_mask_a_failing_stages_error(tmp_path, stages, monkeypatch, capsys):
+    """A RuntimeError from report.py must not replace the stage's own FFRefineError."""
+    calls, _ = stages
+
+    def failing(a):
+        raise ValidationError("scan fell over")
+
+    monkeypatch.setattr(cli, "cmd_scan", failing)
+    monkeypatch.setattr(cli, "write_report", _boom)
+    out = tmp_path / "out"
+    assert main(_pfoa(out, "--no-charges")) == 1
+    assert "scan fell over" in capsys.readouterr().err

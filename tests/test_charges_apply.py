@@ -135,6 +135,53 @@ def test_a_residual_with_no_local_home_pools_into_the_global_offset(butane_itp, 
     assert "not bonded to each other" in caplog.text
 
 
+def test_a_residual_with_no_recipient_anywhere_widens_to_every_unselected_atom(butane_itp, caplog):
+    """Ruling R7's widened pool, actually exercised (not just via an already-nonempty one).
+
+    Every atom is in its own charge group (cgnr = nr), and all four carbons
+    (atoms 1, 5, 8, 11) are selected. Butane's backbone is linear (C1-C2-C3-C4),
+    so every carbon's only heavy neighbours are other carbons, all of them also
+    selected -- no group finds an in-group or bonded-heavy recipient, so
+    `recipients` is still completely empty when the global-offset step runs.
+    The only atoms left unselected are the ten hydrogens, so the widened pool
+    spreads the pooled residual evenly over all ten of them.
+    """
+    top = read_topology(butane_itp)
+    for atom in top.atoms:  # every atom in its own charge group
+        atom.cgnr = atom.nr
+
+    before = np.array([a.charge for a in top.atoms], dtype=float)
+    fitted = before.copy()
+    fitted[0] = -0.30  # C1
+    fitted[4] = -0.20  # C2
+    fitted[7] = -0.20  # C3
+    fitted[10] = -0.25  # C4
+    # Net change across the four carbons: -0.05 e, so a +0.05 e global offset
+    # must be placed somewhere -- well above the 1e-12 threshold, and there is
+    # no coincidental cancellation to hide the widening this test targets.
+
+    logger = logging.getLogger("ffrefine")
+    previous = logger.propagate
+    logger.propagate = True
+    try:
+        with caplog.at_level("WARNING", logger="ffrefine"):
+            out = apply_charges(top, fitted, selected=[1, 5, 8, 11], target_total=0)
+    finally:
+        logger.propagate = previous
+
+    assert sum(a.after for a in out) == pytest.approx(0.0, abs=1e-6)
+
+    hydrogen_nrs = {2, 3, 4, 6, 7, 9, 10, 12, 13, 14}
+    for a in out:
+        if a.nr in hydrogen_nrs:
+            assert a.source == "redistributed"
+            assert a.after - a.before == pytest.approx(0.005, abs=1e-9)
+
+    assert "not bonded to each other" in caplog.text
+    for nr in sorted(hydrogen_nrs):
+        assert str(nr) in caplog.text
+
+
 def test_the_total_is_exact_after_rounding(butane_itp):
     """Rounding 14 charges to 4 decimals leaves a residual; it must be absorbed."""
     rng = np.random.default_rng(0)
