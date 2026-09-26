@@ -124,8 +124,10 @@ def _admitted_payloads(root: Path, state: str, failed_stage: str | None) -> dict
 
 def _bonds(outdir: Path, status: dict | None) -> list[_Bond]:
     rows: list[tuple] = []
-    if status and status.get("torsions"):
-        for t in status["torsions"]:
+    if status is not None:
+        # The run's own list, even when empty: a run that refit nothing must
+        # not fall back to an earlier run's payloads on disk.
+        for t in status.get("torsions") or []:
             label = t.get("dir") or "."
             root = outdir if label == "." else outdir / label
             rows.append(
@@ -504,7 +506,7 @@ def _warnings_section(selection, charges, bonds, combined) -> list[str]:
 
 
 def _validity(bonds, model) -> list[str]:
-    if not bonds:
+    if not any(b.payloads["fit"] for b in bonds):
         # Nothing fitted; the 1-4-convention caveat is about a fitted torsion
         # (final review M1), so there is nothing for it to be about.
         return []
@@ -562,7 +564,8 @@ def _run_completed(bonds, status: dict | None) -> bool:
     own validation payload exists (final review I1.3).
     """
     if status is not None:
-        torsions_ok = all(t.get("status") == "complete" for t in status.get("torsions", []))
+        torsions = status.get("torsions") or []
+        torsions_ok = bool(torsions) and all(t.get("status") == "complete" for t in torsions)
         return torsions_ok and status.get("combined") in ("complete", "not applicable")
     return len(bonds) == 1 and bonds[0].payloads.get("validate") is not None
 

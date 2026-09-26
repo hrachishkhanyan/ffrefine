@@ -2599,6 +2599,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             "--no-charges skips the charge refit, but --charge-atoms / --charge-mode all asks "
             "for one. Drop one of them."
         )
+    # Refused before logging is set up or a stale selection.json is removed:
+    # a command that is refused must leave the outdir as it found it.
+    if not args.dihedral and not args.str:
+        raise ValidationError(
+            "no torsion selected. Pass --dihedral i,j,k,l (repeatable), or --str mol.str to "
+            "choose from CGenFF's penalties."
+        )
     # One fit per central bond (final review I2): two quads that share a
     # central bond would have the second fit zero -- or, with --distribute,
     # overwrite -- the first bond's own refit, while the report would still
@@ -2649,11 +2656,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         args.charge_atoms or args.charge_mode == "all" or flagged
     )
     quads = list(args.dihedral or []) or (selection.quads if selection else [])
-    if not quads and selection is None:
-        raise ValidationError(
-            "no torsion selected. Pass --dihedral i,j,k,l (repeatable), or --str mol.str to "
-            "choose from CGenFF's penalties."
-        )
     multi = len(quads) > 1
     torsion_stages = [
         ("scan", cmd_scan),

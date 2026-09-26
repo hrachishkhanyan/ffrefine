@@ -521,6 +521,38 @@ def test_validity_is_left_out_when_no_bond_was_fitted(tmp_path):
     assert "## Validity" not in text
 
 
+def test_a_run_with_no_torsion_ignores_every_stale_bond(tmp_path):
+    """Re-review of the fix wave: an empty torsion list is still the run's word.
+
+    A nothing-flagged run (capecitabine at dihedral=51) into an outdir that
+    an earlier run filled must not fall back to the payloads on disk, nor
+    call the stale final topology the run's result.
+    """
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10))
+    _bond(tmp_path / "torsion_1-3-4-5", (1, 3, 4, 5))
+    (tmp_path / "final" / "molecule_refined.itp").write_text("; stale\n")
+    _write(tmp_path / "final" / "run_status.json", _status([]))
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "## Torsion" not in text
+    assert "1.2500" not in text
+    assert "| 3.000 | 1.500 |" not in text
+    assert "Refined topology" not in text
+    assert "## Validity" not in text
+
+
+def test_validity_is_left_out_when_every_bond_stopped_before_its_fit(tmp_path):
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10))
+    _write(
+        tmp_path / "final" / "run_status.json",
+        _status([_torsion_row((6, 7, 9, 10), "failed", failed_stage="scan")]),
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "failed (scan)" in text
+    assert "## Validity" not in text
+
+
 def test_summary_marks_a_complete_bond_that_did_not_improve(tmp_path):
     _model(tmp_path)
     _bond(tmp_path, (6, 7, 9, 10), rmse=(109.0, 126.4))

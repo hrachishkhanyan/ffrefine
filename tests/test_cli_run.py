@@ -279,6 +279,23 @@ def test_run_without_str_removes_a_stale_selection_json(tmp_path, stages):
     assert not str_copy.exists()
 
 
+def test_a_run_refused_for_lack_of_a_torsion_leaves_the_outdir_alone(tmp_path, stages, capsys):
+    """Re-review of the fix wave: forgetting --str must not cost the last run's selection."""
+    out = tmp_path / "out"
+    assert main(_pfoa(out, "--no-charges")) == 0
+    selection_path = out / "00_input" / "selection.json"
+    assert selection_path.exists()
+
+    argv = ["run", "-s", str(PFOA / "pfoa_gmx.pdb"), "-p", str(PFOA / "pfoa_gmx.top")]
+    assert main(argv + ["--outdir", str(out)]) == 1
+    assert "no torsion selected" in capsys.readouterr().err
+    assert selection_path.exists()
+
+    fresh = tmp_path / "fresh"
+    assert main(argv + ["--outdir", str(fresh)]) == 1
+    assert not fresh.exists()
+
+
 # --- final review I2: one fit per central bond -----------------------------
 
 
