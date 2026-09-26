@@ -2701,6 +2701,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     status = _RunStatus(args, quads, multi)
     try:
+        # 00_input/model.json at the top level, even when charges never run
+        # and even when nothing was flagged (final review I3): spec 6.1
+        # requires it, and a single-bond run's own scan rewrites it with the
+        # quad afterwards, the same way it does today after charges.
+        if structure is None or topology is None:
+            structure, topology = _load_structure_and_topology(args)
+        _write_input_stage(args, structure, topology, None)
+
         if wants_charges:
             print("\n=== charges ===")
             try:

@@ -343,3 +343,25 @@ def test_run_refuses_shared_central_bond_even_on_a_dry_run(tmp_path, stages, cap
     ]
     assert main(argv) == 1
     assert calls == [] and not out.exists()
+
+
+# --- final review I3: 00_input/model.json exists even without a charge refit
+
+
+def test_multi_bond_no_charges_writes_the_top_level_model_json(tmp_path, stages):
+    calls, combined = stages
+    out = tmp_path / "out"
+    assert main(_pfoa(out, "--no-charges")) == 0
+    model = json.loads((out / "00_input" / "model.json").read_text())
+    assert model["molecule"]
+    report = (out / "final" / "report.md").read_text(encoding="utf-8")
+    assert f"# ffrefine report: {model['molecule']}" in report
+
+
+def test_nothing_flagged_run_writes_the_top_level_model_json(tmp_path, stages):
+    out = tmp_path / "out"
+    assert main(_cap(out, "--penalty-threshold", "dihedral=51")) == 0
+    model = json.loads((out / "00_input" / "model.json").read_text())
+    assert model["molecule"]
+    report = (out / "final" / "report.md").read_text(encoding="utf-8")
+    assert f"# ffrefine report: {model['molecule']}" in report
