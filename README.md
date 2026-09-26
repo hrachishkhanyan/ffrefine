@@ -401,6 +401,13 @@ C3-C4 (penalty 69, fitted as `1,3,4,5`) and C1-C3 (67, fitted as `25,1,3,4`).
   changed, how well it fits, every warning raised, the QM levels used, and the
   1-4 conventions the parameters depend on.
 
+On this committed example, the C3-C4 refit does not actually improve agreement
+with QM: the xtb scan has conformational hops and forward/reverse hysteresis.
+`final/report.md`'s summary says so (`complete, not improved`), and a bond like
+that should be rescanned before its parameters are used -- for example with
+`--sp-refine`, or `--bidirectional` (the default) to compare the two
+directions -- rather than trusted as-is.
+
 A ring bond is never refit, because a relaxed scan cannot rotate it; the report
 lists it. Capecitabine's `.str` flags one torsion at exactly 50 and no charges,
 so `ffrefine run ... --str capecitabine.str` refits `6,7,9,10` alone, in the
@@ -629,8 +636,9 @@ recipients the other groups found, or over every currently unselected atom,
 hydrogens included, when no group found any. This matters most on CGenFF
 topologies converted for GROMACS, which often put every atom in its own charge
 group, so `--str` can flag most of the molecule and leave few or no atoms per
-group to absorb its own residual: on PFOA, 23 of 26 atoms are flagged and
--0.0143 e ends up pooled onto F13/F14. Only a selection covering every atom in
+group to absorb its own residual: on PFOA, 23 of 26 atoms are flagged and a few
+hundredths of an e ends up pooled onto F13/F14, and the warning says exactly
+how much. Only a selection covering every atom in
 the topology is refused -- there is then no atom left, local or not, to place
 a residual or offset on -- and `charges` instead treats that as
 `--charge-mode all`.

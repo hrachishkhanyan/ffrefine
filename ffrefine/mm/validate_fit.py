@@ -247,7 +247,11 @@ def validate_refit(
         result.rmse_after,
     )
     if not result.improved:
-        log.warning(
+        # cli.cmd_validate's own _warn already tells the user this, pointing at
+        # the 02_mm_scan diagnostics; a second WARNING record here duplicated
+        # it once the logging-layer collector started catching every module's
+        # own warnings, not only cli._warn's (final review M3).
+        log.info(
             "refitting did not improve agreement (%.3f -> %.3f kJ/mol). Check the scan "
             "for conformational hops and the self-consistency diagnostics.",
             result.rmse_before,

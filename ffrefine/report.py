@@ -184,6 +184,20 @@ def _status_text(bond: _Bond) -> str:
     return bond.status + (f" ({bond.failed_stage})" if bond.failed_stage else "")
 
 
+def _summary_status_text(bond: _Bond) -> str:
+    """Status text for the Summary table: a "complete" bond that made things worse says so.
+
+    ``_bond_section``'s own verdict line already spells out "NOT improved";
+    this is the one line a reader scanning only the Summary table sees
+    (final review M5).
+    """
+    text = _status_text(bond)
+    validation = bond.payloads["validate"]
+    if bond.status == "complete" and validation is not None and validation.get("improved") is False:
+        text += ", not improved"
+    return text
+
+
 def _rel(path: Path, start: Path) -> str:
     return Path(os.path.relpath(path, start)).as_posix()
 
@@ -240,7 +254,8 @@ def _summary(bonds, labels, selection, combined) -> list[str]:
             f"{_penalty(quad, selection)} | "
             f"{_num(validation.get('rmse_before_kj_per_mol'))} | "
             f"{_num(validation.get('rmse_after_kj_per_mol'))} | "
-            f"{_num(final_rmse.get(tuple(quad)) if quad else None)} | {_status_text(bond)} |"
+            f"{_num(final_rmse.get(tuple(quad)) if quad else None)} | "
+            f"{_summary_status_text(bond)} |"
         )
     lines += [
         "",
@@ -269,6 +284,15 @@ def _charges_section(charges, selection, status) -> list[str]:
                 "## Charges",
                 "",
                 f"Not refined (`--no-charges`), although CGenFF flags {len(flagged)} atom(s).",
+                "",
+            ]
+        if selection is not None and not flagged:
+            threshold = (selection.get("thresholds") or {}).get("charge", 10.0)
+            return [
+                "## Charges",
+                "",
+                f"No atom's CGenFF charge penalty reached {threshold:g}; charges were not "
+                "refined.",
                 "",
             ]
         return []
@@ -480,6 +504,10 @@ def _warnings_section(selection, charges, bonds, combined) -> list[str]:
 
 
 def _validity(bonds, model) -> list[str]:
+    if not bonds:
+        # Nothing fitted; the 1-4-convention caveat is about a fitted torsion
+        # (final review M1), so there is nothing for it to be about.
+        return []
     defaults = next(
         (
             b.payloads["mmscan"]["defaults"]

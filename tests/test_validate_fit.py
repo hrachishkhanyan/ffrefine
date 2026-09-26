@@ -186,6 +186,59 @@ def test_refit_reproduces_the_original_profile(
 
 
 @pytest.mark.needs_gmx
+def test_a_worse_refit_logs_info_not_a_second_warning(
+    tmp_path, butane_pdb, butane_itp, gmx_bin, rotated_frames, caplog
+):
+    """Final review M3: cli.cmd_validate's own ``_warn`` already tells the user a refit did
+    not improve agreement, pointing at the 02_mm_scan diagnostics; validate_fit's own
+    log.warning duplicated it as a second WARNING record once the logging-layer collector
+    started catching every module's own warnings, not only cli._warn's. Downgraded to
+    log.info here, so only one warning per not-improved bond reaches validation.json/report.md.
+    """
+    import logging
+
+    from ffrefine.config import Binaries
+    from ffrefine.io.structure import read_pdb
+    from ffrefine.io.topology import read_topology
+    from ffrefine.io.topwriter import make_system_top
+    from ffrefine.mm import gromacs
+
+    s = read_pdb(butane_pdb)
+    t_full = read_topology(butane_itp)
+    frames = rotated_frames(s, 24)
+    b = Binaries(gmx=gmx_bin)
+
+    full_itp = tmp_path / "full.itp"
+    full_itp.write_text(butane_itp.read_text())
+    full_top = tmp_path / "full.top"
+    make_system_top(full_itp, full_top, "BUT")
+    e_full = gromacs.single_point_energies(b, full_top, s, frames, tmp_path / "q", "q")
+    qm = e_full.potential()
+
+    caplog.set_level(logging.INFO, logger="ffrefine")
+    # "before" is the true, already-correct topology (rmse_before ~ 0); zeroing
+    # the central bond's torsion for "after" can only make agreement worse.
+    r = validate_refit(
+        b,
+        t_full,
+        (1, 5, 8, 11),
+        s,
+        frames,
+        qm,
+        np.array([0.0]),
+        np.array([0.0]),
+        np.array([3]),
+        tmp_path / "val",
+        distribute=True,
+    )
+    assert r.improved is False
+
+    messages = [(rec.levelname, rec.getMessage()) for rec in caplog.records]
+    assert any(level == "INFO" and "did not improve" in msg for level, msg in messages)
+    assert not any(level == "WARNING" and "did not improve" in msg for level, msg in messages)
+
+
+@pytest.mark.needs_gmx
 def test_compare_topologies_of_one_topology_with_itself_agrees(
     tmp_path, butane_pdb, butane_itp, gmx_bin, rotated_frames
 ):

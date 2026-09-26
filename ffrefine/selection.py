@@ -8,6 +8,7 @@ All atom numbers are 1-based, matching the topology's ``[ atoms ]``.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from .charges.equivalence import equivalent_hydrogen_groups
@@ -15,6 +16,8 @@ from .errors import ValidationError
 from .io.cgenff import StrFile, StrParameter
 from .io.topology import Topology
 from .io.validate import element_of
+
+log = logging.getLogger("ffrefine")
 
 Quad = tuple[int, int, int, int]
 Bond = tuple[int, int]
@@ -202,11 +205,21 @@ def select(topology: Topology, strfile: StrFile, thresholds: Thresholds) -> Sele
     ]
     flagged = {a.nr for a in atoms if a.flagged}
     for group in equivalent_hydrogen_groups(topology):
-        if flagged & set(group) and not set(group) <= flagged:
-            for nr in group:
-                if nr not in flagged:
-                    atoms[nr - 1].flagged = True
-                    atoms[nr - 1].by_equivalence = True
+        already_flagged = flagged & set(group)
+        if already_flagged and not set(group) <= flagged:
+            added = [nr for nr in group if nr not in flagged]
+            # Spec section 4: each extension is "logged and recorded", not
+            # just recorded on the atom (final review M4).
+            log.info(
+                "equivalence: atom %d is flagged, so its equivalent-hydrogen group %s is "
+                "extended to include %s",
+                min(already_flagged),
+                group,
+                added,
+            )
+            for nr in added:
+                atoms[nr - 1].flagged = True
+                atoms[nr - 1].by_equivalence = True
             flagged |= set(group)
 
     types_of = {a.nr: a.atype for a in topology.atoms}

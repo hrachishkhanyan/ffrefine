@@ -491,3 +491,43 @@ def test_validity_omits_the_charges_line_when_no_bond_used_refined_charges(tmp_p
     _bond(tmp_path, (6, 7, 9, 10))  # charges_refined defaults to False
     text = write_report(tmp_path).read_text(encoding="utf-8")
     assert "fitted against the refined charges" not in text
+
+
+# --- minors: nothing-flagged charges, validity needs a fitted bond, ------
+# --- a "complete" bond that did not improve ------------------------------
+
+
+def test_charges_section_says_so_when_nothing_is_flagged(tmp_path):
+    _model(tmp_path)
+    _write(
+        tmp_path / "00_input" / "selection.json",
+        {
+            "str": "/data/mol.str",
+            "thresholds": {"charge": 10.0, "dihedral": 50.0},
+            "atoms": [
+                {"nr": 1, "top_name": "C1", "type": "CG2O2", "penalty": 2.0, "flagged": False},
+            ],
+            "bonds": [],
+        },
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "## Charges" in text
+    assert "No atom's CGenFF charge penalty reached 10; charges were not refined." in text
+
+
+def test_validity_is_left_out_when_no_bond_was_fitted(tmp_path):
+    _model(tmp_path)
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "## Validity" not in text
+
+
+def test_summary_marks_a_complete_bond_that_did_not_improve(tmp_path):
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10), rmse=(109.0, 126.4))
+    _write(
+        tmp_path / "final" / "run_status.json",
+        _status([_torsion_row((6, 7, 9, 10), "complete")]),
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "| complete, not improved |" in text
+    assert "RMSE against QM 109.000 -> 126.400 kJ/mol (NOT improved)" in text

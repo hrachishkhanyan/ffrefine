@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -103,6 +104,21 @@ def test_flagged_hydrogens_extend_to_their_equivalence_group(butane_itp):
     methyl = [a for a in sel.atoms if a.flagged]
     assert len(methyl) == 3 and all(a.atype == "HGA3" for a in methyl)
     assert [a.by_equivalence for a in methyl] == [False, True, True]
+
+
+def test_the_equivalence_extension_is_logged(butane_itp, caplog):
+    """Spec section 4: each extension is 'logged and recorded'; selection.py only
+    recorded it (final review M4)."""
+    from ffrefine.charges.equivalence import equivalent_hydrogen_groups
+
+    t = read_topology(butane_itp)
+    first_h = next(a.nr for a in t.atoms if a.atype == "HGA3")
+    group = next(g for g in equivalent_hydrogen_groups(t) if first_h in g)
+    added = [nr for nr in group if nr != first_h]
+    with caplog.at_level(logging.INFO, logger="ffrefine"):
+        select(t, _str_for(t, {first_h: 20.0}), Thresholds())
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.INFO]
+    assert any(str(first_h) in m and all(str(nr) in m for nr in added) for m in messages), messages
 
 
 def test_types_match_in_either_direction():
