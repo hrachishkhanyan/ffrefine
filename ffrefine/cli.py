@@ -2599,6 +2599,25 @@ def cmd_run(args: argparse.Namespace) -> int:
             "--no-charges skips the charge refit, but --charge-atoms / --charge-mode all asks "
             "for one. Drop one of them."
         )
+    # One fit per central bond (final review I2): two quads that share a
+    # central bond would have the second fit zero -- or, with --distribute,
+    # overwrite -- the first bond's own refit, while the report would still
+    # call the first bond complete. Checked before any work (nothing is
+    # created yet) and on dry runs too. Only --dihedral can repeat a central
+    # bond; a --str selection's own bonds are already unique per bond.
+    seen_bonds: dict[tuple[int, int], Quad] = {}
+    for quad in args.dihedral or []:
+        bond = tuple(sorted((quad[1], quad[2])))
+        if bond in seen_bonds:
+            first = seen_bonds[bond]
+            raise ValidationError(
+                f"--dihedral {','.join(map(str, first))} and --dihedral "
+                f"{','.join(map(str, quad))} share the central bond {bond[0]}-{bond[1]}: a run "
+                "fits one torsion per central bond. Pick one of the two quads, or use "
+                "--distribute to spread one fit over every torsion about the bond."
+            )
+        seen_bonds[bond] = quad
+
     selection = None
     structure = topology = None
     if not args.dry_run:

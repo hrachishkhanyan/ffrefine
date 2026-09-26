@@ -277,3 +277,69 @@ def test_run_without_str_removes_a_stale_selection_json(tmp_path, stages):
     assert main(argv) == 0
     assert not selection_path.exists()
     assert not str_copy.exists()
+
+
+# --- final review I2: one fit per central bond -----------------------------
+
+
+def test_run_refuses_two_quads_sharing_a_central_bond(tmp_path, stages, capsys):
+    calls, _ = stages
+    out = tmp_path / "out"
+    argv = [
+        "run",
+        "-s",
+        str(PFOA / "pfoa_gmx.pdb"),
+        "-p",
+        str(PFOA / "pfoa_gmx.top"),
+        "--dihedral",
+        "1,3,4,5",
+        "--dihedral",
+        "1,3,4,21",
+        "--outdir",
+        str(out),
+    ]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "1,3,4,5" in err and "1,3,4,21" in err
+    assert calls == [] and not out.exists()
+
+
+def test_run_refuses_a_reversed_duplicate_quad(tmp_path, stages, capsys):
+    calls, _ = stages
+    out = tmp_path / "out"
+    argv = [
+        "run",
+        "-s",
+        str(PFOA / "pfoa_gmx.pdb"),
+        "-p",
+        str(PFOA / "pfoa_gmx.top"),
+        "--dihedral",
+        "1,3,4,5",
+        "--dihedral",
+        "5,4,3,1",
+        "--outdir",
+        str(out),
+    ]
+    assert main(argv) == 1
+    assert calls == [] and not out.exists()
+
+
+def test_run_refuses_shared_central_bond_even_on_a_dry_run(tmp_path, stages, capsys):
+    calls, _ = stages
+    out = tmp_path / "out"
+    argv = [
+        "run",
+        "-s",
+        str(PFOA / "pfoa_gmx.pdb"),
+        "-p",
+        str(PFOA / "pfoa_gmx.top"),
+        "--dihedral",
+        "1,3,4,5",
+        "--dihedral",
+        "1,3,4,21",
+        "--dry-run",
+        "--outdir",
+        str(out),
+    ]
+    assert main(argv) == 1
+    assert calls == [] and not out.exists()
