@@ -136,6 +136,7 @@ from .qm.orca import (
     run_vpot,
 )
 from .qm.xtb import derive_charge, optimize_geometry, run_scan, scan_grid
+from .report import write_report
 from .selection import Selection, Thresholds, select, selection_to_json
 from .stages import (
     STAGE_DIRS,
@@ -2391,6 +2392,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         digest,
         {"rmse_before": float(result.rmse_before), "rmse_after": float(result.rmse_after)},
     )
+    _write_report_quietly(args.outdir)
     print(f"validate: wrote {final / 'molecule_refined.itp'}")
     return 0
 
@@ -2556,6 +2558,16 @@ class _RunStatus:
         self.write()
 
 
+def _write_report_quietly(outdir: str | Path) -> None:
+    """Write ``final/report.md``; a failure here warns but never masks the run's own outcome."""
+    try:
+        path = write_report(outdir)
+    except FFRefineError as exc:
+        _warn(f"report.md could not be written: {exc}")
+        return
+    print(f"report: wrote {path}")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run every stage in order: selection, charges, then each torsion (design section 5).
 
@@ -2634,77 +2646,80 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     status = _RunStatus(args, quads, multi)
-    if wants_charges:
-        print("\n=== charges ===")
-        try:
-            code = cmd_charges(args)
-        except FFRefineError:
-            status.set("charges", "failed")
-            raise
-        if code != 0:
-            status.set("charges", "failed")
-            print("ffrefine run: stopping, stage charges failed", file=sys.stderr)
-            return code
-        charged = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
-        if not charged.exists():
-            status.set("charges", "failed")
-            raise ValidationError(
-                f"the charges stage reported success but wrote no {charged}, so the remaining "
-                "stages have no refined topology to use."
-            )
-        status.set("charges", "complete")
-        args.input_topology = _input_topology(args)
-        args.topology = str(charged)
-        print(f"run: the torsion stages will use {charged}")
-    else:
-        status.set("charges", "skipped")
-
-    if not quads:
-        print(
-            f"run: no torsion in {args.str} has a dihedral penalty >= "
-            f"{selection.thresholds.dihedral:g}; the highest dihedral penalty is "
-            f"{selection.highest_dihedral_penalty:g}. Pass --dihedral, or a lower "
-            "--penalty-threshold dihedral=VALUE, to refit one."
-        )
-        return 0
-
-    original = Path(_input_topology(args))
-    topology_in = args.topology
-    bonds: list[tuple[Quad, Path]] = []
-    for index, quad in enumerate(quads):
-        stage_args = _bond_args(args, quad, topology_in) if multi else args
-        if not multi:
-            args.dihedral = [quad]
-        status.torsion(index, "running")
-        where = f" ({_bond_dirname(quad)})" if multi else ""
-        for name, handler in torsion_stages:
-            print(f"\n=== {name}{where} ===")
+    try:
+        if wants_charges:
+            print("\n=== charges ===")
             try:
-                code = handler(stage_args)
+                code = cmd_charges(args)
             except FFRefineError:
-                status.torsion(index, "failed", name)
+                status.set("charges", "failed")
                 raise
             if code != 0:
-                status.torsion(index, "failed", name)
-                print(f"ffrefine run: stopping, stage {name} failed", file=sys.stderr)
+                status.set("charges", "failed")
+                print("ffrefine run: stopping, stage charges failed", file=sys.stderr)
                 return code
-        status.torsion(index, "complete")
-        bond_dir = Path(stage_args.outdir)
-        bonds.append((quad, bond_dir))
-        topology_in = str(bond_dir / STAGE_DIRS["final"] / "molecule_refined.itp")
+            charged = Path(args.outdir) / STAGE_DIRS["charges"] / "molecule_charged.itp"
+            if not charged.exists():
+                status.set("charges", "failed")
+                raise ValidationError(
+                    f"the charges stage reported success but wrote no {charged}, so the "
+                    "remaining stages have no refined topology to use."
+                )
+            status.set("charges", "complete")
+            args.input_topology = _input_topology(args)
+            args.topology = str(charged)
+            print(f"run: the torsion stages will use {charged}")
+        else:
+            status.set("charges", "skipped")
 
-    if multi:
-        print("\n=== combined check ===")
-        try:
-            _combined_check(args, bonds, original, Path(topology_in))
-        except FFRefineError:
-            status.set("combined", "failed")
-            raise
-        final_topology = Path(args.outdir) / STAGE_DIRS["final"] / "molecule_refined.itp"
-        shutil.copyfile(topology_in, final_topology)
-        status.set("combined", "complete")
-        print(f"run: {final_topology} carries every refit")
-    return 0
+        if not quads:
+            print(
+                f"run: no torsion in {args.str} has a dihedral penalty >= "
+                f"{selection.thresholds.dihedral:g}; the highest dihedral penalty is "
+                f"{selection.highest_dihedral_penalty:g}. Pass --dihedral, or a lower "
+                "--penalty-threshold dihedral=VALUE, to refit one."
+            )
+            return 0
+
+        original = Path(_input_topology(args))
+        topology_in = args.topology
+        bonds: list[tuple[Quad, Path]] = []
+        for index, quad in enumerate(quads):
+            stage_args = _bond_args(args, quad, topology_in) if multi else args
+            if not multi:
+                args.dihedral = [quad]
+            status.torsion(index, "running")
+            where = f" ({_bond_dirname(quad)})" if multi else ""
+            for name, handler in torsion_stages:
+                print(f"\n=== {name}{where} ===")
+                try:
+                    code = handler(stage_args)
+                except FFRefineError:
+                    status.torsion(index, "failed", name)
+                    raise
+                if code != 0:
+                    status.torsion(index, "failed", name)
+                    print(f"ffrefine run: stopping, stage {name} failed", file=sys.stderr)
+                    return code
+            status.torsion(index, "complete")
+            bond_dir = Path(stage_args.outdir)
+            bonds.append((quad, bond_dir))
+            topology_in = str(bond_dir / STAGE_DIRS["final"] / "molecule_refined.itp")
+
+        if multi:
+            print("\n=== combined check ===")
+            try:
+                _combined_check(args, bonds, original, Path(topology_in))
+            except FFRefineError:
+                status.set("combined", "failed")
+                raise
+            final_topology = Path(args.outdir) / STAGE_DIRS["final"] / "molecule_refined.itp"
+            shutil.copyfile(topology_in, final_topology)
+            status.set("combined", "complete")
+            print(f"run: {final_topology} carries every refit")
+        return 0
+    finally:
+        _write_report_quietly(args.outdir)
 
 
 def main(argv: list[str] | None = None) -> int:

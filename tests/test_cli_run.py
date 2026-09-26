@@ -205,3 +205,22 @@ def test_repeated_dihedrals_run_in_the_order_given(tmp_path, stages):
     assert main(argv) == 0
     scans = [c for c in calls if c[0] == "scan"]
     assert [c[1].name for c in scans] == ["torsion_25-1-3-4", "torsion_1-3-4-5"]
+
+
+def test_run_writes_the_report_even_when_a_bond_fails(tmp_path, stages, monkeypatch):
+    calls, _ = stages
+
+    def failing(a):
+        raise ValidationError("scan fell over")
+
+    monkeypatch.setattr(cli, "cmd_scan", failing)
+    out = tmp_path / "out"
+    assert main(_pfoa(out, "--no-charges")) == 1
+    report = (out / "final" / "report.md").read_text(encoding="utf-8")
+    assert "failed (scan)" in report and "not reached" in report
+
+
+def test_run_with_nothing_flagged_still_writes_a_report(tmp_path, stages):
+    out = tmp_path / "out"
+    assert main(_cap(out, "--penalty-threshold", "dihedral=51")) == 0
+    assert "No torsion was refit" in (out / "final" / "report.md").read_text(encoding="utf-8")
