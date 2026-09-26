@@ -102,6 +102,26 @@ def _infer_status(payloads: dict) -> tuple[str, str | None]:
     return ("not run", None) if not done else (f"stopped after {done[-1]}", None)
 
 
+def _admitted_payloads(root: Path, state: str, failed_stage: str | None) -> dict[str, dict | None]:
+    """Which stage payloads a status row permits ``_bonds`` to load (final review I1).
+
+    A stage payload can survive on disk from an earlier run even though this
+    run's own status says the bond stopped earlier or failed; the report must
+    not show it. ``"complete"`` admits every payload. ``"failed"`` admits only
+    the stages strictly before ``failed_stage`` (in :data:`STAGES` order, so a
+    ``failed_stage`` this build does not recognise admits none). Anything else
+    (``"not reached"``, ``"running"``, ...) admits none.
+    """
+    names = [stage for stage, _ in STAGES]
+    if state == "complete":
+        allowed = set(names)
+    elif state == "failed" and failed_stage in names:
+        allowed = set(names[: names.index(failed_stage)])
+    else:
+        allowed = set()
+    return {stage: (_load(root / rel) if stage in allowed else None) for stage, rel in STAGES}
+
+
 def _bonds(outdir: Path, status: dict | None) -> list[_Bond]:
     rows: list[tuple] = []
     if status and status.get("torsions"):
@@ -119,9 +139,11 @@ def _bonds(outdir: Path, status: dict | None) -> list[_Bond]:
             rows = [(".", outdir, None, None, None)]
     bonds = []
     for label, root, quad, state, failed in rows:
-        payloads = {stage: _load(root / rel) for stage, rel in STAGES}
         if state is None:
+            payloads = {stage: _load(root / rel) for stage, rel in STAGES}
             state, failed = _infer_status(payloads)
+        else:
+            payloads = _admitted_payloads(root, state, failed)
         bonds.append(
             _Bond(label, root, list(quad) if quad else _quad_of(payloads), payloads, state, failed)
         )
@@ -457,7 +479,7 @@ def _warnings_section(selection, charges, bonds, combined) -> list[str]:
     return lines
 
 
-def _validity(bonds, model, charges) -> list[str]:
+def _validity(bonds, model) -> list[str]:
     defaults = next(
         (
             b.payloads["mmscan"]["defaults"]
@@ -482,29 +504,45 @@ def _validity(bonds, model, charges) -> list[str]:
             "reusing these parameters"
         )
     lines = ["## Validity", "", VALIDITY.format(conventions=conventions)]
-    charges_json = next(
+    # Driven by the admitted bonds' own validation.json, not by whether a
+    # 04_charges/charges.json happens to sit on disk (final review I1): a
+    # stale charges.json from an earlier, unrelated run must not make this
+    # run claim its torsions depend on charges they were never fitted against.
+    refined_charges_json = next(
         (
             b.payloads["validate"]["charges_json"]
             for b in bonds
-            if b.payloads["validate"] and b.payloads["validate"].get("charges_json")
+            if b.payloads["validate"] and b.payloads["validate"].get("charges_refined")
         ),
         None,
     )
-    if charges_json or charges is not None:
-        source = charges_json or "04_charges/charges.json"
+    if refined_charges_json:
         lines += [
             "",
-            f"The torsions were fitted against the refined charges recorded in `{source}`; ship "
-            "them together.",
+            f"The torsions were fitted against the refined charges recorded in "
+            f"`{refined_charges_json}`; ship them together.",
         ]
     lines.append("")
     return lines
 
 
-def _files(outdir: Path, bonds, report_dir: Path) -> list[str]:
+def _run_completed(bonds, status: dict | None) -> bool:
+    """Whether ``final/molecule_refined.itp`` is the finished topology, not a partial one.
+
+    With ``run_status.json``: every torsion is ``"complete"`` and ``combined``
+    is ``"complete"`` or ``"not applicable"``. Without it: the single bond's
+    own validation payload exists (final review I1.3).
+    """
+    if status is not None:
+        torsions_ok = all(t.get("status") == "complete" for t in status.get("torsions", []))
+        return torsions_ok and status.get("combined") in ("complete", "not applicable")
+    return len(bonds) == 1 and bonds[0].payloads.get("validate") is not None
+
+
+def _files(outdir: Path, bonds, report_dir: Path, status: dict | None) -> list[str]:
     lines = ["## Files", ""]
     final_topology = outdir / "final" / "molecule_refined.itp"
-    if final_topology.exists():
+    if _run_completed(bonds, status) and final_topology.exists():
         lines.append(
             f"- Refined topology: `{_rel(final_topology, report_dir)}` -- a molecule include file; "
             "`#include` it from your own `.top` beside the force field it names."
@@ -540,6 +578,15 @@ def write_report(outdir: str | Path) -> Path:
     charges = _load(outdir / "04_charges" / "charges.json")
     combined = _load(outdir / "final" / "combined.json")
     status = _load(outdir / "final" / "run_status.json")
+    if status is not None:
+        # A run_status.json makes its own claim about what actually completed;
+        # a charges.json or combined.json left over from an earlier, different
+        # run in the same outdir must not be admitted just because it exists
+        # on disk (final review I1.1).
+        if status.get("charges") != "complete":
+            charges = None
+        if status.get("combined") != "complete":
+            combined = None
     bonds = _bonds(outdir, status)
     labels = _atom_labels(model, selection)
     report_dir = outdir / "final"
@@ -552,8 +599,8 @@ def write_report(outdir: str | Path) -> Path:
         lines += _bond_section(bond, labels, report_dir)
     lines += _not_refit(selection)
     lines += _warnings_section(selection, charges, bonds, combined)
-    lines += _validity(bonds, model, charges)
-    lines += _files(outdir, bonds, report_dir)
+    lines += _validity(bonds, model)
+    lines += _files(outdir, bonds, report_dir, status)
 
     report_dir.mkdir(parents=True, exist_ok=True)
     path = report_dir / "report.md"

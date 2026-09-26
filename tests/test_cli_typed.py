@@ -139,6 +139,37 @@ def test_validate_writes_molecule_refined_as_a_drop_in(tmp_path, monkeypatch):
     assert f'#include "{PFOA_FF / "forcefield.itp"}"' in _include_lines(final / "after.itp")
 
 
+def test_standalone_validate_removes_a_stale_run_status_json(tmp_path, monkeypatch):
+    """A run_status.json left by an earlier ``run`` in this outdir must not leak into a
+    standalone ``validate``'s report (final review I1.6): the standalone stage did not
+    produce it and cannot vouch for what it claims."""
+    out = tmp_path / "out"
+    _write_pfoa_stage_inputs(out)
+    assert main(["fit"] + _pfoa_args(out)) == 0
+    (out / "final").mkdir(parents=True, exist_ok=True)
+    (out / "final" / "run_status.json").write_text(
+        json.dumps(
+            {
+                "charges": "complete",
+                "torsions": [
+                    {
+                        "quad_1_based": list(PFOA_QUAD),
+                        "dir": ".",
+                        "status": "failed",
+                        "failed_stage": "fit",
+                    }
+                ],
+                "combined": "not applicable",
+            }
+        )
+    )
+    _stub_validate(monkeypatch)
+    assert main(["validate"] + _pfoa_args(out)) == 0
+    assert not (out / "final" / "run_status.json").exists()
+    report = (out / "final" / "report.md").read_text(encoding="utf-8")
+    assert "failed (fit)" not in report
+
+
 NO_DEFAULTS_WARNING = "has no [ defaults ] directive"
 
 

@@ -53,7 +53,16 @@ def _selection(bonds):
     }
 
 
-def _bond(root: Path, quad, rmse=(3.0, 1.5), warnings=None, defaults=True, stages=4):
+def _bond(
+    root: Path,
+    quad,
+    rmse=(3.0, 1.5),
+    warnings=None,
+    defaults=True,
+    stages=4,
+    charges_refined=False,
+    charges_json=None,
+):
     warnings = warnings or {}
     _write(
         root / "01_qm_scan" / "scan.json",
@@ -126,8 +135,8 @@ def _bond(root: Path, quad, rmse=(3.0, 1.5), warnings=None, defaults=True, stage
             "rmse_before_kj_per_mol": rmse[0],
             "rmse_after_kj_per_mol": rmse[1],
             "improved": rmse[1] < rmse[0],
-            "charges_refined": False,
-            "charges_json": None,
+            "charges_refined": charges_refined,
+            "charges_json": charges_json,
             "warnings": warnings.get("validate", []),
         },
     )
@@ -330,7 +339,12 @@ def test_the_charges_section_names_changed_atoms_penalties_and_provenance(tmp_pa
             "warnings": [],
         },
     )
-    _bond(tmp_path, (6, 7, 9, 10))
+    _bond(
+        tmp_path,
+        (6, 7, 9, 10),
+        charges_refined=True,
+        charges_json="04_charges/charges.json",
+    )
     text = write_report(tmp_path).read_text(encoding="utf-8")
     assert "## Charges" in text
     assert "| 1 | C1 | +0.7890 | +0.7010 | fitted | 25.000 |" in text
@@ -348,3 +362,132 @@ def test_penalised_but_not_refit_lists_rings_and_other_parameters(tmp_path):
     assert "## Penalised by CGenFF but not refit" in text
     assert "Ring bond 10-16 (penalty 60)" in text
     assert "angle CG312 CG312 CG312: penalty 55" in text
+
+
+# --- final review I1: admit only the payloads this run produced -----------
+
+
+def _status(torsions, charges="not run", combined="not applicable"):
+    return {"charges": charges, "torsions": torsions, "combined": combined}
+
+
+def _torsion_row(quad, status, failed_stage=None, dirname="."):
+    return {
+        "quad_1_based": list(quad),
+        "dir": dirname,
+        "status": status,
+        "failed_stage": failed_stage,
+    }
+
+
+def test_charges_json_is_ignored_when_status_says_skipped(tmp_path):
+    _model(tmp_path)
+    _write(tmp_path / "00_input" / "selection.json", _selection([((6, 7, 9, 10), 50.0)]))
+    _write(
+        tmp_path / "04_charges" / "charges.json",
+        {
+            "natoms": 26,
+            "target_total": 0,
+            "rrms_written": 0.21,
+            "rrms_fitted": 0.18,
+            "rrms_before": 0.35,
+            "atoms": [
+                {
+                    "nr": 1,
+                    "name": "C1",
+                    "charge_before": 0.789,
+                    "charge_after": 0.701,
+                    "source": "fitted",
+                }
+            ],
+            "provenance": {"scheme": "chelpg", "geometry": "xtb", "mode": "selected"},
+            "warnings": [],
+        },
+    )
+    _bond(tmp_path, (6, 7, 9, 10))
+    _write(
+        tmp_path / "final" / "run_status.json",
+        _status([_torsion_row((6, 7, 9, 10), "complete")], charges="skipped"),
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "Not refined (`--no-charges`), although CGenFF flags" in text
+    assert "RRMS" not in text
+    assert "+0.7890" not in text
+
+
+def test_a_failed_bonds_stale_later_payloads_are_not_admitted(tmp_path):
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10))  # writes all four stages
+    _write(
+        tmp_path / "final" / "run_status.json",
+        _status([_torsion_row((6, 7, 9, 10), "failed", failed_stage="fit")]),
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "failed (fit)" in text
+    assert "- Fit: not run" in text
+    assert "- Validation: not run" in text
+    assert "1.2500" not in text  # the stale fit.json's k must not leak
+    assert "| 3.000 | 1.500 |" not in text  # the stale validation.json's RMSEs
+
+
+def test_a_not_reached_bonds_stale_payloads_are_not_admitted(tmp_path):
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10))  # every stage's payload physically present
+    _write(
+        tmp_path / "final" / "run_status.json",
+        _status([_torsion_row((6, 7, 9, 10), "not reached")]),
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "- QM scan: not run" in text
+    assert "- MM energies: not run" in text
+    assert "1.2500" not in text
+    assert "| 3.000 | 1.500 |" not in text
+
+
+def test_combined_json_is_ignored_when_status_says_not_applicable(tmp_path):
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10))
+    _write(
+        tmp_path / "final" / "combined.json",
+        {"bonds": [{"quad_1_based": [6, 7, 9, 10], "rmse_final": 0.01}], "warnings": []},
+    )
+    _write(
+        tmp_path / "final" / "run_status.json",
+        _status([_torsion_row((6, 7, 9, 10), "complete")]),
+    )
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "0.010" not in text
+    assert "| 3.000 | 1.500 | n/a | complete |" in text
+
+
+def test_validity_names_the_charges_json_a_bond_actually_used(tmp_path):
+    _model(tmp_path)
+    _bond(tmp_path, (6, 7, 9, 10), charges_refined=True, charges_json="/elsewhere/charges.json")
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "fitted against the refined charges recorded in `/elsewhere/charges.json`" in text
+
+
+def test_validity_omits_the_charges_line_when_no_bond_used_refined_charges(tmp_path):
+    _model(tmp_path)
+    _write(tmp_path / "00_input" / "selection.json", _selection([((6, 7, 9, 10), 50.0)]))
+    _write(
+        tmp_path / "04_charges" / "charges.json",
+        {
+            "natoms": 26,
+            "target_total": 0,
+            "rrms_written": 0.1,
+            "rrms_fitted": 0.1,
+            "rrms_before": 0.1,
+            "atoms": [],
+            "provenance": {
+                "scheme": "chelpg",
+                "geometry": "xtb",
+                "mode": "selected",
+                "selected_atoms": [1],
+            },
+            "warnings": [],
+        },
+    )
+    _bond(tmp_path, (6, 7, 9, 10))  # charges_refined defaults to False
+    text = write_report(tmp_path).read_text(encoding="utf-8")
+    assert "fitted against the refined charges" not in text

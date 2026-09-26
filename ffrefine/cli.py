@@ -2392,6 +2392,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
         digest,
         {"rmse_before": float(result.rmse_before), "rmse_after": float(result.rmse_after)},
     )
+    if not getattr(args, "within_run", False):
+        # A standalone validate did not produce final/run_status.json and
+        # cannot vouch for what it claims; a stale one left by an earlier
+        # `run` in this outdir must not leak into this report (final review
+        # I1.6).
+        stale_status = Path(args.outdir) / STAGE_DIRS["final"] / "run_status.json"
+        if stale_status.exists():
+            stale_status.unlink()
     _write_report_quietly(args.outdir)
     print(f"validate: wrote {final / 'molecule_refined.itp'}")
     return 0
@@ -2592,10 +2600,30 @@ def cmd_run(args: argparse.Namespace) -> int:
             "for one. Drop one of them."
         )
     selection = None
+    structure = topology = None
+    if not args.dry_run:
+        setup_logging(args.outdir, args.verbose)
+        if not args.str:
+            # run owns its whole outdir (final review I1.5): a selection.json
+            # (and its .str copy) from an earlier --str run in this same
+            # outdir must not survive into a run that no longer passes --str,
+            # or report.md would describe torsions and charges this run never
+            # touched. The single stages must not do this themselves -- e.g.
+            # ``scan --str`` followed by ``mmscan`` without it is legitimate.
+            input_dir = Path(args.outdir) / STAGE_DIRS["input"]
+            stale_selection = input_dir / "selection.json"
+            if stale_selection.exists():
+                try:
+                    old_str = json.loads(stale_selection.read_text()).get("str")
+                except (OSError, json.JSONDecodeError):
+                    old_str = None
+                stale_selection.unlink()
+                if old_str:
+                    stale_copy = input_dir / Path(old_str).name
+                    if stale_copy.exists():
+                        stale_copy.unlink()
     if args.str:
-        if not args.dry_run:
-            setup_logging(args.outdir, args.verbose)
-        _, topology = _load_structure_and_topology(args)
+        structure, topology = _load_structure_and_topology(args)
         selection = _selection(args, topology)
     flagged = selection.flagged_atoms if selection else []
     wants_charges = not args.no_charges and bool(
@@ -2691,6 +2719,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         original = Path(_input_topology(args))
         topology_in = args.topology
         bonds: list[tuple[Quad, Path]] = []
+        # Marks the arguments the single-bond stages run with (final review
+        # I1.6); _bond_args copies args via copy.copy, so a per-bond
+        # stage_args carries this too. cmd_validate reads it to tell a
+        # standalone invocation from one made inside this loop.
+        args.within_run = True
         for index, quad in enumerate(quads):
             stage_args = _bond_args(args, quad, topology_in) if multi else args
             if not multi:

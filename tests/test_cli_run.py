@@ -250,3 +250,30 @@ def test_a_report_bug_does_not_mask_a_failing_stages_error(tmp_path, stages, mon
     out = tmp_path / "out"
     assert main(_pfoa(out, "--no-charges")) == 1
     assert "scan fell over" in capsys.readouterr().err
+
+
+# --- final review I1: run owns its outdir; a stale selection.json must not survive
+
+
+def test_run_without_str_removes_a_stale_selection_json(tmp_path, stages):
+    calls, _ = stages
+    out = tmp_path / "out"
+    assert main(_pfoa(out, "--no-charges")) == 0
+    selection_path = out / "00_input" / "selection.json"
+    str_copy = out / "00_input" / "pfoa.str"
+    assert selection_path.exists() and str_copy.exists()
+
+    argv = [
+        "run",
+        "-s",
+        str(PFOA / "pfoa_gmx.pdb"),
+        "-p",
+        str(PFOA / "pfoa_gmx.top"),
+        "--dihedral",
+        "1,3,4,5",
+        "--outdir",
+        str(out),
+    ]
+    assert main(argv) == 0
+    assert not selection_path.exists()
+    assert not str_copy.exists()
