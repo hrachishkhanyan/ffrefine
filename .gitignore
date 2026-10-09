@@ -5,3 +5,4 @@ __pycache__/
 ffrefine_out/
 .pytest_cache/
 fixtures/_full_ff/
+Miraz_compounds/
